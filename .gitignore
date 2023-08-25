@@ -1,1 +1,4 @@
 /.vscode
+experiment1/.ipynb_checkpoints/*
+*.pyc
+experiment1/__pycache__/*

@@ -1,20 +1,22 @@
-import ivy
+import torch
+from torch.autograd.functional import jacobian
+from functools import partial
 
 def MSE(logits, labels):
-    return ivy.mean((labels - logits)**2)
+    return torch.mean((labels - logits)**2,dim=1)
 
 def MSE_back(logits, labels):
-    return ivy.jac(MSE)(logits, labels)
+    ... # return jacobian(partial(MSE, labels=labels), logits)
 
 def CCE(logits, labels):
-    return - ivy.sum(logits * ivy.log(labels))
+    return - torch.sum(labels * torch.log(logits), dim=1)
 
 def CCE_back(logits, labels):
-    return ivy.jac(CCE)(logits, labels)
+    return  -1/logits * labels
 
 def softmax_CCE(logits, labels):
-    e_logits = ivy.exp(logits)
-    return CCE(e_logits/ivy.sum(e_logits), labels)
+    return CCE(torch.softmax(logits,dim=1), labels)
+
 
 def softmax_CCE_back(logits, labels):
-    return ivy.jac(softmax_CCE)(logits, labels)
+    return torch.softmax(logits,dim=1) - labels

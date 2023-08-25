@@ -1,4 +1,3 @@
-import ivy
 import torch
 from torchvision import datasets, transforms
 
@@ -7,47 +6,46 @@ from model import BaseModel
 import losses
 import optimizers
 
+
 def main():
     
-    ivy.set_backend("torch")
-    
-    BS = 1
+    BS = 16
     LR = 0.0001
     EPOCHS = 10
     
     model_layers = [
-        BaseDense(784,64,BS),
-        BaseDense(64,32,BS),
-        BaseDense(32,32,BS),
-        BaseDense(32,10,BS)
+        BaseDense(784,784,BS),
+        BaseDense(784,784,BS),
+        BaseDense(784,784,BS),
+        BaseDense(784,10,BS)
     ]
     model = BaseModel(*model_layers)
     
-    criterion = losses.CCE
-    criterion_back = losses.CCE_back
+    criterion = losses.softmax_CCE
+    criterion_back = losses.softmax_CCE_back
     
     optimizers.SGD(LR, model)
     
     
     transform=transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
         ])
     dataset1 = datasets.MNIST('../data', train=True, download=True, transform=transform)
     dataset2 = datasets.MNIST('../data', train=False, transform=transform)
     train_loader = torch.utils.data.DataLoader(dataset1, batch_size=BS)
     test_loader = torch.utils.data.DataLoader(dataset2, batch_size=BS)
-    
     for e in range(EPOCHS):
         print(f"Starting Epoch: {e+1}")
         for batch_idx, (data, target) in enumerate(train_loader):
-            data = ivy.flatten(data, start_dim=1)
-            target = ivy.one_hot(target,10)
+            data = torch.flatten(data, start_dim=1).to(torch.float32)
+            target = torch.nn.functional.one_hot(target, num_classes=10).to(torch.float32)
             logits = model(data)
+            #print(torch.exp(logits)/torch.sum(torch.exp(logits)))
             loss = criterion(logits, target)
-            if batch_idx % 1000 == 0 and batch_idx != 0:
-                print(f"Loss at Batch {batch_idx}: {loss}")
+            if batch_idx*16 % 10000 == 0 and batch_idx != 0:
+                print(f"Loss at Batch {batch_idx*16}: {torch.mean(loss): .4f}")
             grads = criterion_back(logits, target)
+            #print(grads)
             model.backward(grads)
             model.update()
         
@@ -55,16 +53,19 @@ def main():
         correct = 0
         
         for data, target in test_loader:
-            data = ivy.flatten(data, start_dim=1)
+            data = torch.flatten(data, start_dim=1)
+            target = torch.nn.functional.one_hot(target, num_classes=10).to(float)
             logits = model(data)
             loss = criterion(logits, target)
-            mean_loss += loss
-            correct += 1 if logits.argmax() == target.argmax() else 0
-        
+            print(loss)
+            print(mean_loss)
+            mean_loss += torch.mean(loss)
+            correct += torch.sum(logits.argmax(dim=1) == target.argmax(dim=1))
+
         mean_loss /= len(test_loader)
-        print(f"Epoch: {e} | Loss: {mean_loss} | Accuracy = {correct/len(test_loader): .2f}%")
+        print(correct, len(test_loader))
+        print(f"\n\n Epoch: {e+1} | Loss: {mean_loss: .6f} | Accuracy = {(correct/(len(test_loader)*BS))*100}% \n\n")
         
     
 if __name__ == "__main__":
     main()
-    

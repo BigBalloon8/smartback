@@ -1,12 +1,11 @@
-import ivy
+import torch
 from abc import ABC, abstractmethod
 
 class Optimizer(ABC):
     def __init__(self, lr, model):
         self.lr = lr
         self.model = model
-        for layer in self.model.layers:
-            layer.update = self.update_fn
+        self.update_fn()
 
     @abstractmethod
     def update_fn(self):
@@ -19,7 +18,8 @@ class SGD(Optimizer):
 
     def update_fn(self):
         def _update_fn(_self):
-            _self.params -= self.lr*_self.grads
+            for k in _self.params.keys():
+                _self.params[k] -= self.lr*_self.grads[k]
         for layer in self.model.layers:
             layer.update = _update_fn
 
@@ -31,18 +31,22 @@ class Adam(Optimizer):
         self.epsilon = epsilon
         for layer in model.layers:
             layer.t = 0
-            layer.m = ivy.zeros_like(layer.params)
-            layer.v = ivy.zeros_like(layer.params)
+            base_moments = {}
+            for k in layer.params.keys():
+                base_moments[k] = torch.zeros_like(layer.params[k])
+            layer.m = base_moments
+            layer.v = base_moments
         super().__init__(lr, model)
     
     def update_fn(self):
         def _update_fn(_self):
             _self.t += 1
-            _self.m = self.beta1*_self.m + (1-self.beta1)*_self.grads
-            _self.v = self.beta2*_self.v + (1-self.beta2)*(_self.grads**2)
-            m_hat = _self.m/(1-self.beta1**_self.t)
-            v_hat = _self.v/(1-self.beta2**_self.t)
-            _self.params -= self.lr*m_hat/(ivy.sqrt(v_hat) + self.epsilon)
+            for k in _self.params.keys():
+                _self.m[k] = self.beta1*_self.m[k] + (1-self.beta1)*_self.grads[k]
+                _self.v[k] = self.beta2*_self.v[k] + (1-self.beta2)*(_self.grads[k]**2)
+                m_hat = _self.m[k]/(1-self.beta1**_self.t)
+                v_hat = _self.v[k]/(1-self.beta2**_self.t)
+                _self.params[k] -= self.lr*m_hat/(torch.sqrt(v_hat) + self.epsilon)
         for layer in self.model.layers:
             layer.update = _update_fn
             

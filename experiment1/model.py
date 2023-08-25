@@ -11,15 +11,16 @@ class BaseModel:
     def forward(self, x):
         for layer in self.layers:
             x = layer(x)
+            pass
         return x
         
     def backward(self, grads):
-        for layer in self.layers:
+        for layer in self.layers[::-1]:
             grads = layer.backward(grads)
     
     def update(self):
         for layer in self.layers:
-            layer.update()
+            layer.update(layer)
 
         
         
