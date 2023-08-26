@@ -1,5 +1,5 @@
 from typing import Any
-import ivy
+
 
 class BaseModel:
     def __init__(self, *args):
@@ -22,6 +22,12 @@ class BaseModel:
         for layer in self.layers:
             layer.update(layer)
 
-        
+    def to(self, device):
+        for layer in self.layers:
+            for k in layer.params.keys():
+                layer.params[k] = layer.params[k].to(device)
+                layer.grads[k] = layer.grads[k].to(device)
+            layer.inputs = layer.inputs.to(device)
+            layer.out = layer.out.to(device)
         
 
