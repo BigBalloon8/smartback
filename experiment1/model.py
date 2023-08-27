@@ -66,7 +66,7 @@ class CustomBackModel:
             streams=[]
             for i in range(len(self.layers)):
                 s = torch.cuda.Stream()
-                with s:
+                with torch.cuda.stream(s):
                     fn(i)
                 streams.append(s)
             for stream in streams:
