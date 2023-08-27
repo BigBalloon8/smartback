@@ -1,4 +1,6 @@
 from typing import Any
+import torch
+
 
 
 class BaseModel:
@@ -43,11 +45,33 @@ class CustomBackModel:
         return x
     
     def backward(self, dL_dzout):
-        grads = [self.layers[-1].get_jac()]
-        for layer in self.layers[-2::-1]:
+        grads = [torch.eye(dL_dzout.shape[-1]).to(dL_dzout.device)]
+        
+        for layer in self.layers[:0:-1]:
             grads.append(torch.mm(grads[-1], layer.get_jac()))
-        fn = lambda layer, layer_idx: layer.backward(grads[layer_idx])
-        torch.vmap(fn)(layers, torch.arange(len(grads)))
+        
+        fn = lambda layer_idx: self.layers[layer_idx].backward(dL_dzout, grads[-(layer_idx+1)])
+        #torch.vmap(fn)(torch.arange(len(self.layers)))
+        if "cpu" in dL_dzout.device.type:
+            threads = []
+            for i in range(len(self.layers)):
+                t = threading.Thread(target=fn, args=[i])
+                t.start()
+                threads.append(t)
+            
+            for thread in threads:
+                thread.join()
+        
+        elif "cuda" in dL_dzout.device.type:
+            streams=[]
+            for i in range(len(self.layers)):
+                s = torch.cuda.Stream()
+                with s:
+                    fn(i)
+                streams.append(s)
+            for stream in streams:
+                stream.synchronize()
+                
     
     def update(self):
         for layer in self.layers:

@@ -71,7 +71,8 @@ class CustomBackDense:
     
     def backward(self, dL_dzout, dzout_dout):
         # dzout is the output of the final layer
-        dL_dout = torch.bmm(dL_dzout.unsqueeze(1), dzout_dout)
+        #dL_dout = torch.bmm(dL_dzout.unsqueeze(1), dzout_dout)
+        dL_dout = torch.vmap(torch.mm, in_dims=(0, None))(dL_dzout.unsqueeze(1), dzout_dout)
         self.grads["b"][:] = torch.mean(dL_dout, axis=0)
         self.grads["w"][:] = torch.sum(
             torch.einsum('bij,bjk->bik', 
@@ -84,4 +85,6 @@ class CustomBackDense:
         
     def get_jac(self):
         return self.params["w"].T
-        
+    
+    def __call__(self, x):
+        return self.forward(x)
