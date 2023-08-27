@@ -69,6 +69,19 @@ class CustomBackDense:
         torch.add(x, self.params["b"], out=self.out)
         return self.out
     
-    def backward(self, dL_dzout, dzout_dx, dout__dx):
-        dx_dout = torch.inverse(dout__dx)
+    def backward(self, dL_dzout, dzout_dout):
+        # dzout is the output of the final layer
+        dL_dout = torch.bmm(dL_dzout.unsqueeze(1), dzout_dout)
+        self.grads["b"][:] = torch.mean(dL_dout, axis=0)
+        self.grads["w"][:] = torch.sum(
+            torch.einsum('bij,bjk->bik', 
+                         self.inputs.view(self.b_size, self.i_size, 1), 
+                         dL_dout.view(self.b_size, 1, 
+                                    self.o_size)),
+            dim=0
+        )
+        self.grads["w"] /= self.b_size
+        
+    def get_jac(self):
+        return self.params["w"].T
         
