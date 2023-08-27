@@ -13,8 +13,8 @@ class BaseDense:
             }
         
 
-        self.inputs = torch.empty((self.b_size, self.i_size))
-        self.out = torch.empty((self.b_size, self.o_size))
+        self.inputs = torch.zeros((self.b_size, self.i_size))
+        self.out = torch.zeros((self.b_size, self.o_size))
 
         self.grads = {
             "w": torch.zeros((self.i_size, self.o_size)),
@@ -49,11 +49,26 @@ class CustomBackDense:
         self.o_size = output_size
         self.b_size = batch_size
 
-        self.w = torch.randn(shape=(self.i_size, self.o_size))
-        self.b = torch.zeros(shape=(self.o_size))
+        self.params = {
+            "w": torch.randn((self.i_size, self.o_size))*0.1,
+            "b": torch.zeros((self.o_size))
+            }
+        
 
-        self.inputs = torch.empty(shape=(self.b_size, self.i_size))
-        self.out = torch.empty(shape=(self.b_size, self.o_size))
+        self.inputs = torch.zeros((self.b_size, self.i_size))
+        self.out = torch.zeros((self.b_size, self.o_size))
 
-        self.w_g = torch.zeros(shape=(self.i_size, self.o_size))
-        self.b_g = torch.zeros(shape=(self.i_size, self.o_size))
+        self.grads = {
+            "w": torch.zeros((self.i_size, self.o_size)),
+            "b": torch.zeros((self.o_size))
+            }
+    
+    def forward(self, x):
+        self.inputs[:] = x 
+        x = torch.mm(x, self.params["w"])
+        torch.add(x, self.params["b"], out=self.out)
+        return self.out
+    
+    def backward(self, dL_dzout, dzout_dx, dout__dx):
+        dx_dout = torch.inverse(dout__dx)
+        
