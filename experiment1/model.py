@@ -54,6 +54,11 @@ class CustomBackModel:
                 t = threading.Thread(target=layer.backward, args=[dL_dzout, grads])
                 t.start()
                 threads.append(t)
+                if i != (len(self.layers)-1):
+                    grads = torch.mm(grads, layer.get_jac())
+            for thread in threads:
+                thread.join()
+                        
                 
             
         elif "cuda" in dL_dzout.device.type:
