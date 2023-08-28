@@ -10,7 +10,7 @@ import optimizers
 BS = 64
 LR = 0.0001
 EPOCHS = 10
-device = "gpu"
+device = "cuda"
 
 def trainloop1(train_dataloader, test_dataloader):
     torch.manual_seed(0)
