@@ -47,6 +47,31 @@ class CustomBackModel:
         return x
     
     def backward(self, dL_dzout):
+        if "cpu" in dL_dzout.device.type:
+            grads = torch.eye(dL_dzout.shape[-1]).to(dL_dzout.device)
+            threads = []
+            for i, layer in enumerate(self.layers):
+                t = threading.Thread(target=layer.backward, args=[dL_dzout, grads])
+                t.start()
+                threads.append(t)
+                
+            
+        elif "cuda" in dL_dzout.device.type:
+            grads = torch.eye(dL_dzout.shape[-1]).to(dL_dzout.device)
+            if not self.streams:
+                for i in range(len(self.layers)):
+                    self.streams.append(torch.cuda.Stream())
+            for i, layer in enumerate(self.layers):
+                with torch.cuda.stream(self.stream[i]):
+                    layer.backward(dL_dzout, grads)
+                if i != (len(self.streams)-1):
+                    grads = torch.mm(grads, layer.get_jac())
+            
+            for s in self.streams:
+                s.synchronize()
+                
+        
+        """
         grads = [torch.eye(dL_dzout.shape[-1]).to(dL_dzout.device)]
         
         for layer in self.layers[:0:-1]:
@@ -74,7 +99,7 @@ class CustomBackModel:
                         fn(i)
                 for stream in self.streams:
                     stream.synchronize()
-                
+        """    
     
     def update(self):
         for layer in self.layers:
