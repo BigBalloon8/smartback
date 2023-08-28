@@ -67,7 +67,7 @@ class CustomBackModel:
                 for i in range(len(self.layers)):
                     self.streams.append(torch.cuda.Stream())
             for i, layer in enumerate(self.layers):
-                with torch.cuda.stream(self.stream[i]):
+                with torch.cuda.stream(self.streams[i]):
                     layer.backward(dL_dzout, grads)
                 if i != (len(self.streams)-1):
                     grads = torch.mm(grads, layer.get_jac())
