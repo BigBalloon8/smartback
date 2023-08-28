@@ -1,5 +1,6 @@
 from typing import Any
 import torch
+import threading
 
 
 
@@ -35,6 +36,7 @@ class BaseModel:
 class CustomBackModel:
     def __init__(self, *args):
         self.layers = [*args]
+        self.streams = []
     
     def __call__(self, x):
         return self.forward(x)
@@ -63,14 +65,15 @@ class CustomBackModel:
                 thread.join()
         
         elif "cuda" in dL_dzout.device.type:
-            streams=[]
-            for i in range(len(self.layers)):
-                s = torch.cuda.Stream()
-                with torch.cuda.stream(s):
-                    fn(i)
-                streams.append(s)
-            for stream in streams:
-                stream.synchronize()
+            if not self.streams:
+                for i in range(len(self.layers)):
+                    self.streams.append(torch.cuda.Stream())
+            else:
+                for i in range(len(self.layers)):
+                    with torch.cuda.stream(self.streams[i]):
+                        fn(i)
+                for stream in self.streams:
+                    stream.synchronize()
                 
     
     def update(self):

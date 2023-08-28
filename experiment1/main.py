@@ -7,9 +7,10 @@ from model import BaseModel, CustomBackModel
 import losses
 import optimizers
 
-BS = 128
+BS = 64
 LR = 0.0001
 EPOCHS = 10
+device = "cpu"
 
 def trainloop1(train_dataloader, test_dataloader):
     torch.manual_seed(0)
@@ -21,7 +22,7 @@ def trainloop1(train_dataloader, test_dataloader):
     ]
     model = BaseModel(*model_layers)
     
-    model.to("cuda")
+    model.to(device)
     
     criterion = losses.softmax_CCE
     criterion_back = losses.softmax_CCE_back
@@ -32,8 +33,8 @@ def trainloop1(train_dataloader, test_dataloader):
         print(f"Starting Epoch: {e+1}")
         start = time.time_ns()
         for batch_idx, (data, target) in enumerate(train_dataloader):
-            data = torch.flatten(data, start_dim=1).to(torch.float32).to("cuda")
-            target = torch.nn.functional.one_hot(target, num_classes=10).to(torch.float32).to("cuda")
+            data = torch.flatten(data, start_dim=1).to(torch.float32).to(device)
+            target = torch.nn.functional.one_hot(target, num_classes=10).to(torch.float32).to(device)
             logits = model(data)
             #print(torch.exp(logits)/torch.sum(torch.exp(logits)))
             loss = criterion(logits, target)
@@ -47,8 +48,8 @@ def trainloop1(train_dataloader, test_dataloader):
         correct = 0
         
         for data, target in test_dataloader:
-            data = torch.flatten(data, start_dim=1).to(torch.float32).to("cuda")
-            target = torch.nn.functional.one_hot(target, num_classes=10).to(torch.float32).to("cuda")
+            data = torch.flatten(data, start_dim=1).to(torch.float32).to(device)
+            target = torch.nn.functional.one_hot(target, num_classes=10).to(torch.float32).to(device)
             logits = model(data)
             loss = criterion(logits, target)
             #print(loss)
@@ -70,7 +71,7 @@ def trainloop2(train_dataloader, test_dataloader):
         CustomBackDense(32,10,BS)
     ]
     model = CustomBackModel(*model_layers)
-    model.to("cuda")
+    model.to(device)
     
     criterion = losses.softmax_CCE
     criterion_back = losses.softmax_CCE_back
@@ -81,8 +82,8 @@ def trainloop2(train_dataloader, test_dataloader):
         print(f"Starting Epoch: {e+1}")
         start = time.time_ns()
         for batch_idx, (data, target) in enumerate(train_dataloader):
-            data = torch.flatten(data, start_dim=1).to(torch.float32).to("cuda")
-            target = torch.nn.functional.one_hot(target, num_classes=10).to(torch.float32).to("cuda")
+            data = torch.flatten(data, start_dim=1).to(torch.float32).to(device)
+            target = torch.nn.functional.one_hot(target, num_classes=10).to(torch.float32).to(device)
             logits = model(data)
             #print(torch.exp(logits)/torch.sum(torch.exp(logits)))
             loss = criterion(logits, target)
@@ -96,8 +97,8 @@ def trainloop2(train_dataloader, test_dataloader):
         correct = 0
         
         for data, target in test_dataloader:
-            data = torch.flatten(data, start_dim=1).to(torch.float32).to("cuda")
-            target = torch.nn.functional.one_hot(target, num_classes=10).to(torch.float32).to("cuda")
+            data = torch.flatten(data, start_dim=1).to(torch.float32).to(device)
+            target = torch.nn.functional.one_hot(target, num_classes=10).to(torch.float32).to(device)
             logits = model(data)
             loss = criterion(logits, target)
             #print(loss)
