@@ -7,7 +7,7 @@ from model import BaseModel, CustomBackModel
 import losses
 import optimizers
 
-BS = 64
+BS = 256
 LR = 0.0001
 EPOCHS = 10
 device = "cuda"
