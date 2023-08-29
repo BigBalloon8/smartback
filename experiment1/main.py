@@ -30,7 +30,6 @@ def trainloop1(train_dataloader, test_dataloader):
     optimizers.SGD(LR, model)
     
     for e in range(EPOCHS):
-        print(f"Starting Epoch: {e+1}")
         start = time.time_ns()
         for batch_idx, (data, target) in enumerate(train_dataloader):
             data = torch.flatten(data, start_dim=1).to(torch.float32).to(device)
@@ -59,7 +58,7 @@ def trainloop1(train_dataloader, test_dataloader):
 
         mean_loss /= len(test_dataloader)
         #print(correct, len(test_dataloader)*BS)
-        print(f"\n\n Epoch: {e+1} | Loss: {mean_loss: .6f} | Accuracy: {(correct/(len(test_dataloader)*BS))*100}% | Time: {(end-start)*1e-9: .2f}\n\n")
+        print(f"\n Epoch: {e+1} | Loss: {mean_loss: .6f} | Accuracy: {(correct/(len(test_dataloader)*BS))*100}% | Time: {(end-start)*1e-9: .2f}\n")
 
 
 def trainloop2(train_dataloader, test_dataloader):
@@ -79,7 +78,6 @@ def trainloop2(train_dataloader, test_dataloader):
     optimizers.SGD(LR, model)
     
     for e in range(EPOCHS):
-        print(f"Starting Epoch: {e+1}")
         start = time.time_ns()
         for batch_idx, (data, target) in enumerate(train_dataloader):
             data = torch.flatten(data, start_dim=1).to(torch.float32).to(device)
@@ -108,7 +106,7 @@ def trainloop2(train_dataloader, test_dataloader):
 
         mean_loss /= len(test_dataloader)
         #print(correct, len(test_dataloader)*BS)
-        print(f"\n\n Epoch: {e+1} | Loss: {mean_loss: .6f} | Accuracy: {(correct/(len(test_dataloader)*BS))*100}% | Time: {(end-start)*1e-9: .2f}\n\n")
+        print(f"\n Epoch: {e+1} | Loss: {mean_loss: .6f} | Accuracy: {(correct/(len(test_dataloader)*BS))*100}% | Time: {(end-start)*1e-9: .2f}\n")
     
     
 
@@ -123,6 +121,7 @@ def main():
     test_loader = torch.utils.data.DataLoader(dataset2, batch_size=BS, drop_last=True)
     
     trainloop1(train_loader, test_loader)
+    print("\n\n -------------------------------------------------------------------------------- \n\n")
     trainloop2(train_loader, test_loader)
     
         
