@@ -9,13 +9,6 @@ class Layer(ABC):
         self.training = True
         
         self.params = {}
-        
-        if params:
-            self.dL_dout = torch.zeros((self.b_size, self.o_size))
-        
-        self.inputs = torch.zeros((self.b_size, self.i_size))
-        self.out = torch.zeros((self.b_size, self.o_size))
-        
         self.grads = {}
         
         #Whether the derivative is independent of the input
@@ -37,7 +30,6 @@ class Layer(ABC):
         #p2 is for calculating param grads if theres no params can just pass
         pass
     
-    
 
 class Dense(Layer):
     def __init__(self, input_size, output_size, batch_size):
@@ -51,6 +43,11 @@ class Dense(Layer):
             "w": torch.zeros((self.i_size, self.o_size)),
             "b": torch.zeros((self.o_size))
             }
+        
+        self.dL_dout = torch.zeros((self.b_size, self.o_size))
+        
+        self.inputs = torch.zeros((self.b_size, self.i_size))
+        self.out = torch.zeros((self.b_size, self.o_size))
         
         #jacobian of dense is constant for a batch
         self.ind_der = True
@@ -79,9 +76,11 @@ class Dense(Layer):
         return self.params["w"].T
     
 class Relu(Layer):
-    def __init__(self, input_size, output_size, batch_size):
-        super().__init__(input_size, output_size, batch_size, params=False)
-    
+    def __init__(self, input_size, batch_size):
+        super().__init__(input_size, input_size, batch_size, params=False)
+        self.inputs = torch.zeros((self.b_size, self.i_size))
+        self.out = torch.zeros((self.b_size, self.o_size))
+
     def forward(self, x):
         self.inputs[:] = x
         torch.maximum(x, 0, out=self.out)
@@ -93,49 +92,111 @@ class Relu(Layer):
 
     def backward_p2(self):
         pass
-    
-class BatchNorm2D(Layer):
-    def __init__(self, input_size, batch_size, epsilon=1e-3, momentum = 0.99):
+
+
+class BatchNorm(Layer):
+    def __init__(self, input_size, batch_size, epsilon=1e-5, momentum = 0.99):
         super().__init__(input_size, input_size, batch_size, params=True)
-        self.mu = torch.zeros(1, input_size)
-        self.var = torch.ones(1, input_size)
+        self.inputs = torch.zeros((self.b_size, self.i_size))
+        self.out = torch.zeros((self.b_size, self.o_size))
+        
+        self.mu = torch.zeros(1, self.i_size)
+        self.var = torch.ones(1, self.i_size)
+        
+        self.b_mu = torch.zeros(1, self.i_size)
+        self.b_var = torch.zeros(1, self.i_size)
         
         self.eps = epsilon
         self.it_call = 0
         self.momentum = momentum
         
         self.params = {
-            "beta": torch.zeros(1, input_size),
-            "gamma": torch.ones(1, input_size)
+            "beta": torch.zeros(1, self.i_size),
+            "gamma": torch.ones(1, self.i_size)
             } 
         
+        self.x_norm = torch.zeros(self.b_size, self.i_size)
+        
+        
         self.grads = {
-            "beta": torch.zeros(1, input_size),
-            "gamma": torch.zeros(1, input_size)
+            "beta": torch.zeros(1, self.i_size),
+            "gamma": torch.zeros(1, self.i_size)
             } 
     
     def forward(self, x):
         self.it_call += 1
         self.inputs[:] = x
         if self.training:
-            b_mu = torch.mean(x, dim=0).unsqueeze(0)
-            b_var = torch.var(x, dim=0).unsqueeze(0)
+            self.b_mu = torch.mean(x, dim=0).unsqueeze(0)
+            self.b_var = torch.var(x, dim=0).unsqueeze(0)
             
-            x_norm = (x-b_mu)/torch.sqrt(b_var + self.eps)
-            self.out[:] = self.params["gamma"]*x_norm + self.params["beta"]
+            self.x_norm[:] = (x-self.b_mu)/torch.sqrt(self.b_var + self.eps)
+            self.out[:] = self.params["gamma"]*self.x_norm + self.params["beta"]
             
-            self.mu = b_mu * (self.momentum/self.it_call) + \
+            self.mu = self.b_mu * (self.momentum/self.it_call) + \
                             self.mu * (1 - (self.momentum/self.it_call))
             
-            self.var = b_var * (self.momentum/self.it_call) + \
+            self.var = self.b_var * (self.momentum/self.it_call) + \
                         self.var * (1 - (self.momentum/self.it_call))
         
         else:
-            x_norm = (x-self.mu)/torch.sqrt(self.var + self.epsilon)
-            self.out[:] = self.params["gamma"]*x_norm + self.params["beta"]
-
+            self.x_norm[:] = (x-self.mu)/torch.sqrt(self.var + self.epsilon)
+            self.out[:] = self.params["gamma"]*self.x_norm + self.params["beta"]
         return self.out
     
     def backward_p1(self, dL_dout):
-        ...
+        self.dL_dout[:] = dL_dout
         
+        X_mu = self.inputs-self.b_mu
+        var_sqrt_inv = 1./torch.sqrt(self.b_var + self.eps)
+        
+        dout_dXnorm = dL_dout * self.params["gamma"]
+        
+        return (1./self.b_size) * var_sqrt_inv * (self.b_size*dout_dXnorm - torch.sum(dout_dXnorm, dim=0) - self.x_norm*torch.sum(dout_dXnorm*self.x_norm, dim=0))
+
+    
+    def backward_p2(self):
+        self.grads["beta"][:] = torch.sum(self.dL_dout, dim=0)
+        self.grads["gamma"][:] = torch.sum(self.x_norm*self.dL_dout, dim=0)
+        
+class Conv2D(Layer):
+    def __init__(self, in_channels, out_channels, batch_size, kernal_size, stride=(1,1), padding=0):
+        super().__init__(in_channels, out_channels, batch_size)
+        self.padding = padding
+        self.stride = stride
+        self.params = {
+            "k": torch.randn((out_channels, in_channels, *kernal_size))
+            }
+        self.grads = {
+            "k": torch.zeros((out_channels, in_channels, *kernal_size))
+        }
+    
+    def forward(self, x):
+        # may have to deal with initial input having no channel dim
+        conv_kwargs = {"stride": self.stride, "padding": self.padding}
+        if hasattr(self, "inputs"):
+            self.inputs[:] = x
+        else:
+            self.inputs = x
+        return torch.nn.functional.conv2d(self.inputs, self.params["k"], **conv_kwargs)
+    
+    def backward_p1(self, dL_dout):
+        if hasattr(self, "dL_dout"):
+            self.dL_dout[:] = dL_dout
+        else:
+            self.dL_dout = dL_dout
+        
+    
+            
+        
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    x = torch.randn(8, 10)
+    dL_dx = torch.rand(8,10)
+    model = BatchNorm2D(10, 8)
+    print(model(x))
+    print(model.backward_p1(dL_dx))
+    model.backward_p2()
+    print(model.grads)
+    
