@@ -1,8 +1,9 @@
+from typing import Any
 import torch
 from abc import ABC, abstractmethod
 
 class Layer(ABC):
-    def __init__(self, input_size, output_size, batch_size, params=True):
+    def __init__(self, input_size, output_size, batch_size):
         self.i_size = input_size
         self.o_size = output_size
         self.b_size = batch_size
@@ -77,7 +78,7 @@ class Dense(Layer):
     
 class Relu(Layer):
     def __init__(self, input_size, batch_size):
-        super().__init__(input_size, input_size, batch_size, params=False)
+        super().__init__(input_size, input_size, batch_size)
         self.inputs = torch.zeros((self.b_size, self.i_size))
         self.out = torch.zeros((self.b_size, self.o_size))
 
@@ -96,7 +97,7 @@ class Relu(Layer):
 
 class BatchNorm(Layer):
     def __init__(self, input_size, batch_size, epsilon=1e-5, momentum = 0.99):
-        super().__init__(input_size, input_size, batch_size, params=True)
+        super().__init__(input_size, input_size, batch_size)
         self.inputs = torch.zeros((self.b_size, self.i_size))
         self.out = torch.zeros((self.b_size, self.o_size))
         
@@ -145,7 +146,11 @@ class BatchNorm(Layer):
         return self.out
     
     def backward_p1(self, dL_dout):
-        self.dL_dout[:] = dL_dout
+        if hasattr(self, "dL_dout"):
+            self.dL_dout[:] = dL_dout
+        else:
+            self.dL_dout = dL_dout
+
         
         X_mu = self.inputs-self.b_mu
         var_sqrt_inv = 1./torch.sqrt(self.b_var + self.eps)
@@ -160,20 +165,23 @@ class BatchNorm(Layer):
         self.grads["gamma"][:] = torch.sum(self.x_norm*self.dL_dout, dim=0)
         
 class Conv2D(Layer):
-    def __init__(self, in_channels, out_channels, batch_size, kernal_size, stride=(1,1), padding=0):
+    def __init__(self, in_channels, out_channels,  batch_size, kernal_size, stride=(1,1), padding=0):
         super().__init__(in_channels, out_channels, batch_size)
         self.padding = padding
         self.stride = stride
         self.params = {
-            "k": torch.randn((out_channels, in_channels, *kernal_size))
+            "k": torch.randn((out_channels, in_channels, *kernal_size)),
+            "b": torch.randn((out_channels))
             }
         self.grads = {
-            "k": torch.zeros((out_channels, in_channels, *kernal_size))
+            "k": torch.zeros((out_channels, in_channels, *kernal_size)),
+            "b": torch.zeros((out_channels))
+            
         }
     
     def forward(self, x):
         # may have to deal with initial input having no channel dim
-        conv_kwargs = {"stride": self.stride, "padding": self.padding}
+        conv_kwargs = {"stride": self.stride, "padding": self.padding, "bias": self.params["b"]}
         if hasattr(self, "inputs"):
             self.inputs[:] = x
         else:
@@ -185,18 +193,62 @@ class Conv2D(Layer):
             self.dL_dout[:] = dL_dout
         else:
             self.dL_dout = dL_dout
+
+        conv_kwargs = {"stride": self.stride, "padding": self.padding}#, "groups":self.o_size}
+        return torch.nn.functional.conv_transpose2d(dL_dout, self.params["k"], **conv_kwargs)
+
+    def backward_p2(self):
+        self.grads["b"] = torch.mean(torch.sum(self.dL_dout, dim=(-1,-2)), dim=0)
+        for i in range(self.params["k"].size(0)):
+            for j in range(self.params["k"].size(1)):
+                self.grads["k"][i, j] = torch.nn.functional.conv2d(self.inputs[:, j].unsqueeze(1), self.dL_dout[:, i].unsqueeze(1))
+
+class Flatten:
+    def __init__(self):
+        self.in_shape = None
+        
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        self.forward(*args, **kwargs)
+    
+    def forward(self, x, start_dim, end_dim):
+        self.in_shape = x.shape
+        return torch.flatten(x, start_dim=start_dim, end_dim=end_dim)
+    
+    def backward_p1(self, dL_dout):
+        return torch.reshape(dL_dout, self.in_shape)
+    
+    def backward_p2(self):
+        pass
+
+class MaxPool2D(Layer):
+    def __init__(self, input_size, output_size, batch_size, kernal_size=(2,2), stride=(2,2)):
+        super().__init__(input_size, output_size, batch_size)
+        self.kernal_size = kernal_size
+        self.stride = stride
+    
+    def forward(self, x):
+        if hasattr(self, "out"):
+            self.out[:], self.indices[:] = torch.nn.functional.max_pool2d(x, self.kernal_size, self.stride, return_indices=True)
+        else:
+            self.out, self.indices = torch.nn.functional.max_pool2d(x, self.kernal_size, self.stride, return_indices=True)
+        return self.out
+        
+    def backward_p1(self, dL_dout):
+        return torch.nn.functional.max_unpool2d(dL_dout, self.indices)
+    
+    def backward_p2(self):
+        pass
         
     
             
         
 
 if __name__ == "__main__":
-    torch.manual_seed(0)
-    x = torch.randn(8, 10)
-    dL_dx = torch.rand(8,10)
-    model = BatchNorm2D(10, 8)
-    print(model(x))
-    print(model.backward_p1(dL_dx))
-    model.backward_p2()
-    print(model.grads)
+    input_channels = torch.randn(1, 3, 5, 5)
+    dL_dout = torch.randn(1, 2, 3, 3)
+    conv_layer = Conv2D(3, 2, 1, (3,3))
+    conv_layer(input_channels)
+    print(conv_layer.backward_p1(dL_dout).shape)
+    conv_layer.backward_p2()
+    print(conv_layer.grads["k"].shape, conv_layer.params["k"].shape )
     
