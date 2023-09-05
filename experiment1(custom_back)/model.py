@@ -1,4 +1,3 @@
-from typing import Any
 import torch
 import threading
 
@@ -29,8 +28,10 @@ class BaseModel:
             for k in layer.params.keys():
                 layer.params[k] = layer.params[k].to(device)
                 layer.grads[k] = layer.grads[k].to(device)
-            layer.inputs = layer.inputs.to(device)
-            layer.out = layer.out.to(device)
+            if hasattr(layer, "inputs"):
+                layer.inputs = layer.inputs.to(device)
+            if hasattr(layer, "out"):
+                layer.out = layer.out.to(device)
         
 
 class CustomBackModel:

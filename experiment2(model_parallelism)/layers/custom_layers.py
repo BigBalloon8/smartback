@@ -210,7 +210,7 @@ class Flatten:
     def __call__(self, *args, **kwargs):
         self.forward(*args, **kwargs)
     
-    def forward(self, x, start_dim, end_dim):
+    def forward(self, x, start_dim=1, end_dim=-1):
         self.in_shape = x.shape
         return torch.flatten(x, start_dim=start_dim, end_dim=end_dim)
     
@@ -221,8 +221,8 @@ class Flatten:
         pass
 
 class MaxPool2D(Layer):
-    def __init__(self, input_size, output_size, batch_size, kernal_size=(2,2), stride=(2,2)):
-        super().__init__(input_size, output_size, batch_size)
+    def __init__(self, batch_size, kernal_size=(2,2), stride=(2,2)):
+        super().__init__(None, None, batch_size)
         self.kernal_size = kernal_size
         self.stride = stride
     
@@ -234,7 +234,7 @@ class MaxPool2D(Layer):
         return self.out
         
     def backward_p1(self, dL_dout):
-        return torch.nn.functional.max_unpool2d(dL_dout, self.indices)
+        return torch.nn.functional.max_unpool2d(dL_dout, self.indices,  self.kernal_size, self.stride)
     
     def backward_p2(self):
         pass

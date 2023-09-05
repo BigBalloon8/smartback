@@ -158,10 +158,14 @@ class Conv2D(Layer):
         return torch.nn.functional.conv2d(self.inputs, self.params["k"], **conv_kwargs)
     
     def backward(self, dL_dout):
-        self.grads["b"] = torch.mean(torch.sum(self.dL_dout, dim=(-1,-2)), dim=0)
-        for i in range(self.params["k"].size(0)):
-            for j in range(self.params["k"].size(1)):
-                self.grads["k"][i, j] = torch.nn.functional.conv2d(self.inputs[:, j].unsqueeze(1), self.dL_dout[:, i].unsqueeze(1))
+        self.grads["b"] = torch.mean(torch.sum(dL_dout, dim=(-1,-2)), dim=0)
+        
+        for i in range(self.params["k"].size(-1)):
+            for j in range(self.params["k"].size(-2)):
+                self.grads["k"] += self.inputs[i:i+f, w:w+f] * dH(i,w)
+                #self.grads["k"][i, j] = torch.nn.functional.conv2d(self.inputs[:, j].unsqueeze(1), dL_dout[:, i].unsqueeze(1))
+        
+        self.grads["k"] = torch.nn.functional.conv2d(self.inputs, dL_dout)
 
         conv_kwargs = {"stride": self.stride, "padding": self.padding}#, "groups":self.o_size}
         return torch.nn.functional.conv_transpose2d(dL_dout, self.params["k"], **conv_kwargs)
@@ -172,9 +176,9 @@ class Flatten:
         self.in_shape = None
         
     def __call__(self, *args, **kwargs):
-        self.forward(*args, **kwargs)
+        return self.forward(*args, **kwargs)
     
-    def forward(self, x, start_dim, end_dim):
+    def forward(self, x, start_dim=1, end_dim=-1):
         self.in_shape = x.shape
         return torch.flatten(x, start_dim=start_dim, end_dim=end_dim)
     
@@ -183,8 +187,8 @@ class Flatten:
 
 
 class MaxPool2D(Layer):
-    def __init__(self, input_size, output_size, batch_size, kernal_size=(2,2), stride=(2,2)):
-        super().__init__(input_size, output_size, batch_size)
+    def __init__(self, batch_size, kernal_size=(2,2), stride=(2,2)):
+        super().__init__(None, None, batch_size)
         self.kernal_size = kernal_size
         self.stride = stride
     
@@ -196,7 +200,12 @@ class MaxPool2D(Layer):
         return self.out
         
     def backward(self, dL_dout):
-        return torch.nn.functional.max_unpool2d(dL_dout, self.indices)
+        return torch.nn.functional.max_unpool2d(dL_dout, self.indices, self.kernal_size, self.stride)
     
 
-        
+if __name__ == "__main__":
+    input_channels = torch.randn(1, 3, 5, 5)
+    dL_dout = torch.randn(1, 2, 3, 3)
+    conv_layer = Conv2D(3, 2, 1, (3,3))
+    conv_layer(input_channels)
+    conv_layer.backward(dL_dout=dL_dout)
