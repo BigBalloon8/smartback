@@ -160,12 +160,11 @@ class Conv2D(Layer):
     def backward(self, dL_dout):
         self.grads["b"] = torch.mean(torch.sum(dL_dout, dim=(-1,-2)), dim=0)
         
-        for i in range(self.params["k"].size(-1)):
-            for j in range(self.params["k"].size(-2)):
-                self.grads["k"] += self.inputs[i:i+f, w:w+f] * dH(i,w)
-                #self.grads["k"][i, j] = torch.nn.functional.conv2d(self.inputs[:, j].unsqueeze(1), dL_dout[:, i].unsqueeze(1))
-        
-        self.grads["k"] = torch.nn.functional.conv2d(self.inputs, dL_dout)
+        for i in range(self.params["k"].size(0)):
+            for j in range(self.params["k"].size(1)):
+                self.grads["k"][i, j] = torch.nn.functional.conv2d(self.inputs[:, j].unsqueeze(1), dL_dout[:, i].unsqueeze(1))
+
+        #self.grads["k"] = torch.nn.functional.conv2d(self.inputs, dL_dout)
 
         conv_kwargs = {"stride": self.stride, "padding": self.padding}#, "groups":self.o_size}
         return torch.nn.functional.conv_transpose2d(dL_dout, self.params["k"], **conv_kwargs)
@@ -204,8 +203,8 @@ class MaxPool2D(Layer):
     
 
 if __name__ == "__main__":
-    input_channels = torch.randn(1, 3, 5, 5)
-    dL_dout = torch.randn(1, 2, 3, 3)
-    conv_layer = Conv2D(3, 2, 1, (3,3))
+    input_channels = torch.randn(16, 3, 5, 5)
+    dL_dout = torch.randn(16, 2, 3, 3)
+    conv_layer = Conv2D(3, 2, 16, (3,3))
     conv_layer(input_channels)
     conv_layer.backward(dL_dout=dL_dout)

@@ -7,7 +7,7 @@ class BaseModel:
     
     def forward(self, x):
         for layer in self.layers:
-            print(type(layer), " ", x.shape)
+            #print(type(layer), " ", x.shape)
             x = layer(x)
         return x
         

@@ -201,7 +201,7 @@ class Conv2D(Layer):
         self.grads["b"] = torch.mean(torch.sum(self.dL_dout, dim=(-1,-2)), dim=0)
         for i in range(self.params["k"].size(0)):
             for j in range(self.params["k"].size(1)):
-                self.grads["k"][i, j] = torch.nn.functional.conv2d(self.inputs[:, j].unsqueeze(1), self.dL_dout[:, i].unsqueeze(1))
+                self.grads["k"][i, j] = torch.sum(torch.nn.functional.conv2d(self.inputs[:, j].unsqueeze(1), self.dL_dout[:, i].unsqueeze(1)))
 
 class Flatten:
     def __init__(self):
@@ -242,9 +242,9 @@ class MaxPool2D(Layer):
         
 
 if __name__ == "__main__":
-    input_channels = torch.randn(1, 3, 5, 5)
-    dL_dout = torch.randn(1, 2, 3, 3)
-    conv_layer = Conv2D(3, 2, 1, (3,3))
+    input_channels = torch.randn(16, 3, 5, 5)
+    dL_dout = torch.randn(16, 2, 3, 3)
+    conv_layer = Conv2D(3, 2, 16, (3,3))
     conv_layer(input_channels)
     print(conv_layer.backward_p1(dL_dout).shape)
     conv_layer.backward_p2()
