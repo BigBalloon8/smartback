@@ -1,21 +1,22 @@
 import torch
 
+class Dense:
+    def __init__(self, in_size, out_size):
+        self.w = torch.randn(in_size, out_size, requires_grad=True)
+        self.b = torch.zeros(out_size, requires_grad=True)
+        self.input = None
+        
+    def forward(self, x):
+        self.input = x
+        return torch.mm(x, self.w) + self.b
 
-def conv_test(x):
-    k1 = torch.ones(1,1,3,3)
-    x = torch.nn.functional.conv2d(x, k1, padding="same")
-    x = torch.nn.functional.conv2d(x, k1, padding="same")
-    x = torch.nn.functional.conv2d(x, k1, padding="same")
-    x = torch.nn.functional.conv2d(x, k1, padding="same")
-    return torch.sum(x)
+    def backward_p1(self, dL_dout):
+        return torch.autograd.functional.vjp(self.forward, self.input, dL_dout)
 
-torch.manual_seed(0)
-img1 = torch.randn((1,1,5,5))
-img2 = torch.randn((1,1,5,5))
-
-#print(torch.autograd.functional.jacobian(conv_test, img1))
-#print(torch.autograd.functional.jacobian(conv_test, img2))
- 
-def fn(x):
-    return x / sum(x)
-
+if __name__ == "__main__":
+    x = torch.randn(1,32)
+    dL_dout = torch.randn(1,10)
+    model = Dense(32, 10)
+    model.forward(x)
+    dL_din = model.backward_p1(dL_dout)
+    print(dL_din)

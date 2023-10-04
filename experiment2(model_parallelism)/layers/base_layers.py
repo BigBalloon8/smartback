@@ -27,7 +27,7 @@ class Dense(Layer):
     def __init__(self, input_size, output_size, batch_size):
         super().__init__(input_size, output_size, batch_size)
         self.params = {
-            "w": torch.randn((self.i_size, self.o_size))*0.1,
+            "w": torch.randn((self.i_size, self.o_size)),
             "b": torch.zeros((self.o_size))
             }
 
@@ -40,7 +40,7 @@ class Dense(Layer):
         self.out = torch.zeros((self.b_size, self.o_size))
     
     def forward(self, x):
-        self.inputs[:] = x 
+        self.inputs[:] = x
         x = torch.mm(x, self.params["w"])
         torch.add(x, self.params["b"], out=self.out)
         return self.out
@@ -50,8 +50,7 @@ class Dense(Layer):
         self.grads["w"][:] = torch.mean(
             torch.einsum('bij,bjk->bik', 
                          self.inputs.view(self.b_size, self.i_size, 1), 
-                         dL_dout.view(self.b_size, 1, 
-                                    self.o_size)),
+                         dL_dout.view(self.b_size, 1, self.o_size)),
             axis=0
         )
         return torch.mm(dL_dout, self.params["w"].T)
@@ -162,8 +161,8 @@ class Conv2D(Layer):
         
         for i in range(self.params["k"].size(0)):
             for j in range(self.params["k"].size(1)):
-                self.grads["k"][i, j] = torch.nn.functional.conv2d(self.inputs[:, j].unsqueeze(1), dL_dout[:, i].unsqueeze(1))
-
+                self.grads["k"][i, j] = torch.sum(torch.vmap(torch.nn.functional.conv2d)(self.inputs[:,j].unsqueeze(1).unsqueeze(1), dL_dout[:,i].unsqueeze(1).unsqueeze(1)), dim=0)
+                
         #self.grads["k"] = torch.nn.functional.conv2d(self.inputs, dL_dout)
 
         conv_kwargs = {"stride": self.stride, "padding": self.padding}#, "groups":self.o_size}

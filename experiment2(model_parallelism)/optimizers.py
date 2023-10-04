@@ -18,6 +18,8 @@ class SGD(Optimizer):
 
     def update_fn(self):
         def _update_fn(_self):
+            if not hasattr(_self, "params"):
+                return
             for k in _self.params.keys():
                 _self.params[k] -= self.lr*_self.grads[k]
         for layer in self.model.layers:
@@ -40,6 +42,8 @@ class Adam(Optimizer):
     
     def update_fn(self):
         def _update_fn(_self):
+            if not hasattr(_self, "params"):
+                return
             _self.t += 1
             for k in _self.params.keys():
                 _self.m[k] = self.beta1*_self.m[k] + (1-self.beta1)*_self.grads[k]

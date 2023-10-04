@@ -199,9 +199,15 @@ class Conv2D(Layer):
 
     def backward_p2(self):
         self.grads["b"] = torch.mean(torch.sum(self.dL_dout, dim=(-1,-2)), dim=0)
+        #self.grads["k"] = torch.mean(torch.nn.functional.conv2d(self.inputs, self.dL_dout))
+        
         for i in range(self.params["k"].size(0)):
             for j in range(self.params["k"].size(1)):
-                self.grads["k"][i, j] = torch.sum(torch.nn.functional.conv2d(self.inputs[:, j].unsqueeze(1), self.dL_dout[:, i].unsqueeze(1)))
+                print(self.inputs[:,j].shape, self.dL_dout[:,i].shape)
+                #torch.vmap(torch.nn.functional.conv2d)(self.inputs[:,j].unsqueeze(1).unsqueeze(1), self.dL_dout[:,i].unsqueeze(1).unsqueeze(1))
+                #torch.nn.functional.conv2d(self.inputs[:,j].unsqueeze(1), self.dL_dout[:,i].unsqueeze(1).unsqueeze(1)[0]) 
+                self.grads["k"][i, j] = torch.sum(torch.vmap(torch.nn.functional.conv2d)(self.inputs[:,j].unsqueeze(1).unsqueeze(1), self.dL_dout[:,i].unsqueeze(1).unsqueeze(1)), dim=0)
+                #torch.sum(torch.nn.functional.conv2d(self.inputs[:, j].unsqueeze(1), self.dL_dout[:,i].unsqueeze(1), padding="same"), dim=0)
 
 class Flatten:
     def __init__(self):
