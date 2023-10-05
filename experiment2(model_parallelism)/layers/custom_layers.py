@@ -203,7 +203,7 @@ class Conv2D(Layer):
         
         for i in range(self.params["k"].size(0)):
             for j in range(self.params["k"].size(1)):
-                print(self.inputs[:,j].shape, self.dL_dout[:,i].shape)
+                #print(self.inputs[:,j].shape, self.dL_dout[:,i].shape)
                 #torch.vmap(torch.nn.functional.conv2d)(self.inputs[:,j].unsqueeze(1).unsqueeze(1), self.dL_dout[:,i].unsqueeze(1).unsqueeze(1))
                 #torch.nn.functional.conv2d(self.inputs[:,j].unsqueeze(1), self.dL_dout[:,i].unsqueeze(1).unsqueeze(1)[0]) 
                 self.grads["k"][i, j] = torch.sum(torch.vmap(torch.nn.functional.conv2d)(self.inputs[:,j].unsqueeze(1).unsqueeze(1), self.dL_dout[:,i].unsqueeze(1).unsqueeze(1)), dim=0)

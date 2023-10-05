@@ -161,7 +161,7 @@ class Conv2D(Layer):
         
         for i in range(self.params["k"].size(0)):
             for j in range(self.params["k"].size(1)):
-                self.grads["k"][i, j] = torch.sum(torch.vmap(torch.nn.functional.conv2d)(self.inputs[:,j].unsqueeze(1).unsqueeze(1), dL_dout[:,i].unsqueeze(1).unsqueeze(1)), dim=0)
+                self.grads["k"][i, j] = torch.mean(torch.vmap(torch.nn.functional.conv2d)(self.inputs[:,j].unsqueeze(1).unsqueeze(1), dL_dout[:,i].unsqueeze(1).unsqueeze(1)), dim=0)
                 
         #self.grads["k"] = torch.nn.functional.conv2d(self.inputs, dL_dout)
 

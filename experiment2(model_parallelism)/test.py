@@ -39,11 +39,12 @@ def trainloop1(train_dataloader, test_dataloader):
         start = time.time_ns()
         for batch_idx, (data, target) in enumerate(train_dataloader):
             data = data.to(torch.float32).to(device)
-            print(data.shape)
+            #print(data.shape)
             target = torch.nn.functional.one_hot(target, num_classes=10).to(torch.float32).to(device)
             logits = model(data)
             #print(torch.exp(logits)/torch.sum(torch.exp(logits)))
             loss = criterion(logits, target)
+            print(loss)
             grads = criterion_back(logits, target)
             #print(grads)
             model.backward(grads)

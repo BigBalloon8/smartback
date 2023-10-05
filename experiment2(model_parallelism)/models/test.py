@@ -13,7 +13,7 @@ class BaseModel:
         
     def backward(self, grads):
         for layer in self.layers[::-1]:
-            print(type(layer), " ", grads.shape)
+            #print(type(layer), " ", grads.shape)
             grads = layer.backward(grads)
     
     def update(self):
