@@ -7,13 +7,13 @@ from models.test import BaseModel
 import losses
 import optimizers
 
-BS = 32
-LR = 0.0001
+BS = 128
+LR = 0.00001
 EPOCHS = 10
-device = "cpu"
+device = "cuda"
 
 def trainloop1(train_dataloader, test_dataloader):
-    torch.manual_seed(0)
+    torch.manual_seed(1)
     model_layers = [
         Conv2D(1, 6, BS, (5,5)),
         Conv2D(6, 16, BS, (5,5)),
@@ -25,7 +25,6 @@ def trainloop1(train_dataloader, test_dataloader):
         Dense(120,84,BS),
         Dense(84,10,BS)
     ]
-
     model = BaseModel(*model_layers)
     
     model.to(device)
@@ -36,15 +35,22 @@ def trainloop1(train_dataloader, test_dataloader):
     optimizers.SGD(LR, model)
     
     for e in range(EPOCHS):
+        print(f"Starting Epoch {e+1}\n")
         start = time.time_ns()
+        b_ref = 10000
         for batch_idx, (data, target) in enumerate(train_dataloader):
+            if batch_idx*BS>=b_ref>(batch_idx-1)*BS:
+                print(batch_idx*BS)
+                b_ref += 10000
+            
+            print(model.layers[0].params["k"][0])
             data = data.to(torch.float32).to(device)
             #print(data.shape)
             target = torch.nn.functional.one_hot(target, num_classes=10).to(torch.float32).to(device)
             logits = model(data)
             #print(torch.exp(logits)/torch.sum(torch.exp(logits)))
             loss = criterion(logits, target)
-            print(loss)
+            #print(loss)
             grads = criterion_back(logits, target)
             #print(grads)
             model.backward(grads)

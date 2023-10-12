@@ -172,6 +172,8 @@ class Conv2D(Layer):
 class Flatten:
     def __init__(self):
         self.in_shape = None
+        self.params = {}
+        self.grads = {}
         
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)

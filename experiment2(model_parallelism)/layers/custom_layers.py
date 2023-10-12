@@ -170,8 +170,8 @@ class Conv2D(Layer):
         self.padding = padding
         self.stride = stride
         self.params = {
-            "k": torch.randn((out_channels, in_channels, *kernal_size)),
-            "b": torch.randn((out_channels))
+            "k": torch.randn((out_channels, in_channels, *kernal_size))*0.1,
+            "b": torch.zeros((out_channels))
             }
         self.grads = {
             "k": torch.zeros((out_channels, in_channels, *kernal_size)),
@@ -206,12 +206,14 @@ class Conv2D(Layer):
                 #print(self.inputs[:,j].shape, self.dL_dout[:,i].shape)
                 #torch.vmap(torch.nn.functional.conv2d)(self.inputs[:,j].unsqueeze(1).unsqueeze(1), self.dL_dout[:,i].unsqueeze(1).unsqueeze(1))
                 #torch.nn.functional.conv2d(self.inputs[:,j].unsqueeze(1), self.dL_dout[:,i].unsqueeze(1).unsqueeze(1)[0]) 
-                self.grads["k"][i, j] = torch.sum(torch.vmap(torch.nn.functional.conv2d)(self.inputs[:,j].unsqueeze(1).unsqueeze(1), self.dL_dout[:,i].unsqueeze(1).unsqueeze(1)), dim=0)
+                self.grads["k"][i, j] = torch.mean(torch.vmap(torch.nn.functional.conv2d)(self.inputs[:,j].unsqueeze(1).unsqueeze(1), self.dL_dout[:,i].unsqueeze(1).unsqueeze(1)), dim=0)
                 #torch.sum(torch.nn.functional.conv2d(self.inputs[:, j].unsqueeze(1), self.dL_dout[:,i].unsqueeze(1), padding="same"), dim=0)
 
 class Flatten:
     def __init__(self):
         self.in_shape = None
+        self.params = {}
+        self.grads = {}
         
     def __call__(self, *args, **kwargs):
         self.forward(*args, **kwargs)

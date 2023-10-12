@@ -9,6 +9,7 @@ class BaseModel:
         for layer in self.layers:
             #print(type(layer), " ", x.shape)
             x = layer(x)
+            #print(x)
         return x
         
     def backward(self, grads):
@@ -22,11 +23,10 @@ class BaseModel:
 
     def to(self, device):
         for layer in self.layers:
-            if not hasattr(layer, "params"):
-                return
-            for k in layer.params.keys():
-                layer.params[k] = layer.params[k].to(device)
-                layer.grads[k] = layer.grads[k].to(device)
+            if hasattr(layer, "params"):
+                for k in layer.params.keys():
+                    layer.params[k] = layer.params[k].to(device)
+                    layer.grads[k] = layer.grads[k].to(device)
             if hasattr(layer, "inputs"):
                 layer.inputs = layer.inputs.to(device)
             if hasattr(layer, "out"):
