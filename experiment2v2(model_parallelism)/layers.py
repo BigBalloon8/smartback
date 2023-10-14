@@ -173,11 +173,11 @@ class MultiHeadAttention(Layer):
         lK = torch.cat(self.linears["K"].out.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         lQ = torch.cat(self.linears["Q"].out.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         
-        print(dL_dAtt.shape, lV.shape)
+        print(dL_dAtt.shape, self.sQK_T.shape)
         # TODO verifiy this section
         dL_dlQ = vmap(lambda dl_dqkt, k: torch.bmm(dl_dqkt, k), in_dims=-2, out_dims=-2)(dL_dQKT, lK)  # k.T not necessary as its k.T.T  
         dL_dlKT = vmap(lambda dl_dqkt, q: torch.bmm(torch.transpose(q, -1,-2), dl_dqkt), in_dims=-2, out_dims=-2)(dL_dQKT, lQ)  
-        dL_dlV = vmap(lambda dl_datt, v: torch.bmm(torch.transpose(v, -1,-2), dl_datt), in_dims=-2, out_dims=-2)(dL_dAtt, lV)  # TODO fix thsi to get correct shape
+        dL_dlV = vmap(lambda dl_datt, sqkt: torch.bmm(torch.transpose(sqkt, -2, -1), dl_datt), in_dims=-2, out_dims=-2)(dL_dAtt, self.sQK_T)  # TODO fix thsi to get correct shape
          
         print(dL_dlQ.shape, dL_dlKT.shape, dL_dlV.shape)
         dL_dQ = self.linears["Q"].backward_p1(torch.flatten(dL_dlQ, -2, -1))
@@ -205,6 +205,7 @@ if __name__ == "__main__":
     print(layer.initial_pass(x,x,x).shape)
     layer.forward(x,x,x)
     layer.backward_p1(dL_dout)
+    # have to fix layer.backward_p2()
         
         
     
