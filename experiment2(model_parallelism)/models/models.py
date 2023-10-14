@@ -122,7 +122,7 @@ class CustomModelMP:
             dL_dout = self.dL_dout
             for i, layer in enumerate(self.layers[::-1]):
                 dL_dout = layer.backward_p1(dL_dout)
-                with torch.cuad.stream(self.streams[i]):
+                with torch.cuda.stream(self.streams[i]):
                     dL_dout = layer.backward_p2()
             dist.barrier()
         else:
