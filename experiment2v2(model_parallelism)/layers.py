@@ -57,11 +57,42 @@ class Dense(Layer):
         return vmap(lambda dl_dout: torch.mm(dl_dout, self.weights.T))(dL_dout)
     
     def backward_p2(self):
-        self.bias_g = torch.sum(self.dL_dout, dim=0)
-        self.weights_g[:] = torch.sum(
-            torch.bmm(self.inputs.unsqueeze(2), 
-                     self.dL_dout.unsqueeze(1)),
+        self.bias_g[:] = torch.sum(self.dL_dout, dim=tuple(range(self.dL_dout.ndim)[:-1]))
+        
+        
+        if self.dL_dout.ndim == 2:
+            self.weights_g[:] = torch.sum(
+                torch.bmm(self.inputs.unsqueeze(2), 
+                            self.dL_dout.unsqueeze(1)
+                    ),
             dim=0)
+        elif self.dL_dout.ndim == 3:
+            self.weights_g[:] = torch.sum(
+                torch.bmm(
+                    torch.transpose(self.inputs, -2, -1),
+                    self.dL_dout
+                ),
+            dim=tuple(range(self.dL_dout.ndim)[:-2]))
+        else:
+            raise Exception("ndim of input to Dense not supported")
+
+
+class Relu(Layer):
+    def initial_pass(self, x):
+        self.inputs = torch.zeros_like(x)
+        return  torch.maximum(x, 0)
+    
+    def forward(self, x):
+        self.inputs[:] = x
+        out = torch.maximum(x, 0.0)
+        return out
+    
+    def backward_p1(self, dL_dout):
+        dout_din = torch.where(self.inputs>0, 1.0, 0.0)
+        return torch.bmm(dL_dout, dout_din)
+
+    def backward_p2(self):
+        pass
 
 
 class MultiHeadAttention(Layer):
@@ -173,13 +204,11 @@ class MultiHeadAttention(Layer):
         lK = torch.cat(self.linears["K"].out.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         lQ = torch.cat(self.linears["Q"].out.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         
-        print(dL_dAtt.shape, self.sQK_T.shape)
         # TODO verifiy this section
         dL_dlQ = vmap(lambda dl_dqkt, k: torch.bmm(dl_dqkt, k), in_dims=-2, out_dims=-2)(dL_dQKT, lK)  # k.T not necessary as its k.T.T  
         dL_dlKT = vmap(lambda dl_dqkt, q: torch.bmm(torch.transpose(q, -1,-2), dl_dqkt), in_dims=-2, out_dims=-2)(dL_dQKT, lQ)  
-        dL_dlV = vmap(lambda dl_datt, sqkt: torch.bmm(torch.transpose(sqkt, -2, -1), dl_datt), in_dims=-2, out_dims=-2)(dL_dAtt, self.sQK_T)  # TODO fix thsi to get correct shape
+        dL_dlV = vmap(lambda dl_datt, sqkt: torch.bmm(torch.transpose(sqkt, -2, -1), dl_datt), in_dims=-2, out_dims=-2)(dL_dAtt, self.sQK_T) 
          
-        print(dL_dlQ.shape, dL_dlKT.shape, dL_dlV.shape)
         dL_dQ = self.linears["Q"].backward_p1(torch.flatten(dL_dlQ, -2, -1))
         dL_dK = self.linears["K"].backward_p1(torch.flatten(torch.vmap(lambda dl_dlkt: torch.transpose(dl_dlkt, -1, -2), in_dims=-2, out_dims=-2)(dL_dlKT), -2, -1))
         dL_dV = self.linears["V"].backward_p1(torch.flatten(dL_dlV, -2, -1))
@@ -196,7 +225,131 @@ class MultiHeadAttention(Layer):
             for k in self.linears.keys():
                 self.linears[k].backward_p2()
                     
+class BatchNorm(Layer):
+    #TODO update for new layer abstract
+    def __init__(self, input_size, batch_size, epsilon=1e-5, momentum = 0.99):
+        super().__init__(input_size, input_size, batch_size)
+        self.inputs = torch.zeros((self.b_size, self.i_size))
+        self.out = torch.zeros((self.b_size, self.o_size))
+        
+        self.mu = torch.zeros(1, self.i_size)
+        self.var = torch.ones(1, self.i_size)
+        
+        self.b_mu = torch.zeros(1, self.i_size)
+        self.b_var = torch.zeros(1, self.i_size)
+        
+        self.eps = epsilon
+        self.it_call = 0
+        self.momentum = momentum
+        
+        self.params = {
+            "beta": torch.zeros(1, self.i_size),
+            "gamma": torch.ones(1, self.i_size)
+            } 
+        
+        self.x_norm = torch.zeros(self.b_size, self.i_size)
+        
+        
+        self.grads = {
+            "beta": torch.zeros(1, self.i_size),
+            "gamma": torch.zeros(1, self.i_size)
+            } 
     
+    def forward(self, x):
+        self.it_call += 1
+        self.inputs[:] = x
+        if self.training:
+            self.b_mu = torch.mean(x, dim=0).unsqueeze(0)
+            self.b_var = torch.var(x, dim=0).unsqueeze(0)
+            
+            self.x_norm[:] = (x-self.b_mu)/torch.sqrt(self.b_var + self.eps)
+            self.out[:] = self.params["gamma"]*self.x_norm + self.params["beta"]
+            
+            self.mu = self.b_mu * (self.momentum/self.it_call) + \
+                            self.mu * (1 - (self.momentum/self.it_call))
+            
+            self.var = self.b_var * (self.momentum/self.it_call) + \
+                        self.var * (1 - (self.momentum/self.it_call))
+        
+        else:
+            self.x_norm[:] = (x-self.mu)/torch.sqrt(self.var + self.epsilon)
+            self.out[:] = self.params["gamma"]*self.x_norm + self.params["beta"]
+        return self.out
+    
+    def backward_p1(self, dL_dout):
+        if hasattr(self, "dL_dout"):
+            self.dL_dout[:] = dL_dout
+        else:
+            self.dL_dout = dL_dout
+
+        
+        #X_mu = self.inputs-self.b_mu
+        var_sqrt_inv = 1./torch.sqrt(self.b_var + self.eps)
+        
+        dout_dXnorm = dL_dout * self.params["gamma"]
+        
+        return (1./self.b_size) * var_sqrt_inv * (self.b_size*dout_dXnorm - torch.sum(dout_dXnorm, dim=0) - self.x_norm*torch.sum(dout_dXnorm*self.x_norm, dim=0))
+
+    
+    def backward_p2(self):
+        self.grads["beta"][:] = torch.sum(self.dL_dout, dim=0)
+        self.grads["gamma"][:] = torch.sum(self.x_norm*self.dL_dout, dim=0)
+
+class NLPLayerNorm(Layer):
+    def __init__(self, dim, dim_size, eps=1e-05):
+        self.dim = dim #seqdim for nlp
+        self.dim_size = dim
+        self.eps = eps
+        
+        self.gamma = torch.randn(dim_size)
+        self.bias = torch.zeros(dim_size)
+        
+        self.gamma_g = torch.zeros(dim_size)
+        self.bias_g = torch.zeros(dim_size)
+    
+    def forward(self, x):
+        self.inputs[:] = x
+        self.mean[:] = torch.mean(x, dim=self.dim, keepdim=True)
+        self.x_sub_mean[:] = x-self.mean
+        self.var[:] = torch.mean(torch.square(self.x_sub_mean), dim=self.dim, keepdim=True) + self.eps
+        self.norm_x[:] = (self.x_sub_mean)/torch.sqrt(self.var)
+        return self.norm_x*self.gamma + self.bias
+    
+    def _norm_jacobian(self):
+        # F_Jij is pass vectors x,z and scalars u,v of vector x
+        def _F_Jij(x, z, u, v):
+            const_n2 = self.dim_size**2
+            f = lambda __x, __z: ((-torch.sqrt(v)/self.dim_size)-__z*((__x-u)/const_n2))/v
+            def i_for_j(_x, _z):
+                return vmap(f, in_dims=(None, 0))(_x, _z)
+            return vmap(i_for_j, in_dims=(0,None))(x, z)
+
+        def _F_Jii(x, z, u, v):
+            const_n2 = self.dim_size**2
+            f = lambda __x, __z: (((1-1/self.dim_size)*torch.sqrt(v))-__z*((__x-u)/const_n2))/v
+            return vmap(f)(x, z)
+            
+        def _diag_set(jac, diag):
+            jac[torch.arange(self.dim_size), torch.arange(self.dim_size)] = diag
+            return jac
+        jac_base = vmap(vmap(_F_Jij, in_dims=(0,0,None,None)))(self.inputs, self.norm_x, self.mean, self.var)
+        diag = vmap(vmap(_F_Jii, in_dims=(0,0,None,None)))(self.inputs, self.norm_x, self.mean, self.var)
+        return vmap(vmap(_diag_set))(jac_base, diag)
+        
+        
+        
+    def backward_p1(self, dL_dout):
+        self.dL_dout[:] = dL_dout #dL_dout.shape = NxCxE
+        
+        
+class TransformerEncoderBlock(Layer):
+    def __init__(self, seq_dim, num_heads, dim_ff, activation=Relu):
+        self.multihead = MultiHeadAttention(seq_dim=seq_dim, num_heads=num_heads)
+        self.linears = {1: Dense(seq_dim, dim_ff),
+                        2: Dense(dim_ff, seq_dim)}
+        self.ff_act = activation()
+        
+        
         
 if __name__ == "__main__":
     layer = MultiHeadAttention(80, 8)
@@ -205,6 +358,7 @@ if __name__ == "__main__":
     print(layer.initial_pass(x,x,x).shape)
     layer.forward(x,x,x)
     layer.backward_p1(dL_dout)
+    layer.backward_p2()
     # have to fix layer.backward_p2()
         
         
