@@ -59,7 +59,6 @@ class Dense(Layer):
     def backward_p2(self):
         self.bias_g[:] = torch.sum(self.dL_dout, dim=tuple(range(self.dL_dout.ndim)[:-1]))
         
-        
         if self.dL_dout.ndim == 2:
             self.weights_g[:] = torch.sum(
                 torch.bmm(self.inputs.unsqueeze(2), 
@@ -80,16 +79,16 @@ class Dense(Layer):
 class Relu(Layer):
     def initial_pass(self, x):
         self.inputs = torch.zeros_like(x)
-        return  torch.maximum(x, 0)
+        return  torch.maximum(x, torch.tensor(0.0, dtype=x.dtype))
     
     def forward(self, x):
         self.inputs[:] = x
-        out = torch.maximum(x, 0.0)
+        out = torch.maximum(x, torch.tensor(0.0, dtype=x.dtype))
         return out
     
     def backward_p1(self, dL_dout):
         dout_din = torch.where(self.inputs>0, 1.0, 0.0)
-        return torch.bmm(dL_dout, dout_din)
+        return dL_dout*dout_din
 
     def backward_p2(self):
         pass
@@ -225,76 +224,6 @@ class MultiHeadAttention(Layer):
             for k in self.linears.keys():
                 self.linears[k].backward_p2()
                     
-class BatchNorm(Layer):
-    #TODO update for new layer abstract
-    def __init__(self, input_size, batch_size, epsilon=1e-5, momentum = 0.99):
-        super().__init__(input_size, input_size, batch_size)
-        self.inputs = torch.zeros((self.b_size, self.i_size))
-        self.out = torch.zeros((self.b_size, self.o_size))
-        
-        self.mu = torch.zeros(1, self.i_size)
-        self.var = torch.ones(1, self.i_size)
-        
-        self.b_mu = torch.zeros(1, self.i_size)
-        self.b_var = torch.zeros(1, self.i_size)
-        
-        self.eps = epsilon
-        self.it_call = 0
-        self.momentum = momentum
-        
-        self.params = {
-            "beta": torch.zeros(1, self.i_size),
-            "gamma": torch.ones(1, self.i_size)
-            } 
-        
-        self.x_norm = torch.zeros(self.b_size, self.i_size)
-        
-        
-        self.grads = {
-            "beta": torch.zeros(1, self.i_size),
-            "gamma": torch.zeros(1, self.i_size)
-            } 
-    
-    def forward(self, x):
-        self.it_call += 1
-        self.inputs[:] = x
-        if self.training:
-            self.b_mu = torch.mean(x, dim=0).unsqueeze(0)
-            self.b_var = torch.var(x, dim=0).unsqueeze(0)
-            
-            self.x_norm[:] = (x-self.b_mu)/torch.sqrt(self.b_var + self.eps)
-            self.out[:] = self.params["gamma"]*self.x_norm + self.params["beta"]
-            
-            self.mu = self.b_mu * (self.momentum/self.it_call) + \
-                            self.mu * (1 - (self.momentum/self.it_call))
-            
-            self.var = self.b_var * (self.momentum/self.it_call) + \
-                        self.var * (1 - (self.momentum/self.it_call))
-        
-        else:
-            self.x_norm[:] = (x-self.mu)/torch.sqrt(self.var + self.epsilon)
-            self.out[:] = self.params["gamma"]*self.x_norm + self.params["beta"]
-        return self.out
-    
-    def backward_p1(self, dL_dout):
-        if hasattr(self, "dL_dout"):
-            self.dL_dout[:] = dL_dout
-        else:
-            self.dL_dout = dL_dout
-
-        
-        #X_mu = self.inputs-self.b_mu
-        var_sqrt_inv = 1./torch.sqrt(self.b_var + self.eps)
-        
-        dout_dXnorm = dL_dout * self.params["gamma"]
-        
-        return (1./self.b_size) * var_sqrt_inv * (self.b_size*dout_dXnorm - torch.sum(dout_dXnorm, dim=0) - self.x_norm*torch.sum(dout_dXnorm*self.x_norm, dim=0))
-
-    
-    def backward_p2(self):
-        self.grads["beta"][:] = torch.sum(self.dL_dout, dim=0)
-        self.grads["gamma"][:] = torch.sum(self.x_norm*self.dL_dout, dim=0)
-
 class NLPLayerNorm(Layer):
     def __init__(self, dim, dim_size, eps=1e-05):
         self.dim = dim #seqdim for nlp
@@ -307,59 +236,131 @@ class NLPLayerNorm(Layer):
         self.gamma_g = torch.zeros(dim_size)
         self.bias_g = torch.zeros(dim_size)
     
+    def initial_pass(self, x):
+        mean = torch.mean(x, dim=self.dim, keepdim=True)
+        x_sub_mean = x-mean
+        self.x_sub_mean = torch.zeros_like(x_sub_mean)
+        var = torch.mean(torch.square(x_sub_mean), dim=self.dim, keepdim=True) + self.eps
+        self.var = torch.zeros_like(var)
+        norm_x = (x_sub_mean)/torch.sqrt(var)
+        self.norm_x = torch.zeros_like(norm_x)
+        self.dL_dout = torch.zeros_like(norm_x)
+        return norm_x*self.gamma + self.bias
+        
     def forward(self, x):
-        self.inputs[:] = x
-        self.mean[:] = torch.mean(x, dim=self.dim, keepdim=True)
-        self.x_sub_mean[:] = x-self.mean
+        mean = torch.mean(x, dim=self.dim, keepdim=True)
+        self.x_sub_mean[:] = x-mean
         self.var[:] = torch.mean(torch.square(self.x_sub_mean), dim=self.dim, keepdim=True) + self.eps
         self.norm_x[:] = (self.x_sub_mean)/torch.sqrt(self.var)
         return self.norm_x*self.gamma + self.bias
     
     def _norm_jacobian(self):
         # F_Jij is pass vectors x,z and scalars u,v of vector x
-        def _F_Jij(x, z, u, v):
+        def _F_Jij(x, z, v):
             const_n2 = self.dim_size**2
-            f = lambda __x, __z: ((-torch.sqrt(v)/self.dim_size)-__z*((__x-u)/const_n2))/v
+            f = lambda __x, __z, _v, g: g*((-torch.sqrt(_v)/self.dim_size)-__z*((__x)/const_n2))/_v
             def i_for_j(_x, _z):
-                return vmap(f, in_dims=(None, 0))(_x, _z)
+                return vmap(f, in_dims=(None, 0, None, 0))(_x, _z, v, self.gamma)
             return vmap(i_for_j, in_dims=(0,None))(x, z)
 
-        def _F_Jii(x, z, u, v):
+        def _F_Jii(x, z, v):
             const_n2 = self.dim_size**2
-            f = lambda __x, __z: (((1-1/self.dim_size)*torch.sqrt(v))-__z*((__x-u)/const_n2))/v
-            return vmap(f)(x, z)
-            
-        def _diag_set(jac, diag):
-            jac[torch.arange(self.dim_size), torch.arange(self.dim_size)] = diag
+            f = lambda __x, __z, _v, g: g*(((1-1/self.dim_size)*torch.sqrt(_v))-__z*((__x)/const_n2))/_v
+            return vmap(f, in_dims=(0,0,None,0))(x, z, v, self.gamma)
+        
+        def _diag_set(jac, _diag):
+            jac.diagonal()[:]= _diag
             return jac
-        jac_base = vmap(vmap(_F_Jij, in_dims=(0,0,None,None)))(self.inputs, self.norm_x, self.mean, self.var)
-        diag = vmap(vmap(_F_Jii, in_dims=(0,0,None,None)))(self.inputs, self.norm_x, self.mean, self.var)
+        
+        jac_base = vmap(vmap(_F_Jij))(self.x_sub_mean, self.norm_x,  self.var).squeeze()
+        diag = vmap(vmap(_F_Jii))(self.x_sub_mean, self.norm_x, self.var).squeeze()
         return vmap(vmap(_diag_set))(jac_base, diag)
         
         
-        
     def backward_p1(self, dL_dout):
-        self.dL_dout[:] = dL_dout #dL_dout.shape = NxCxE
+        self.dL_dout[:] = dL_dout
+        J = self._norm_jacobian()
+        return vmap(vmap(torch.mm))(dL_dout.unsqueeze(-2), J).squeeze()
+
+        
+    def backward_p2(self):
+        self.bias_g[:] = torch.sum(dL_dout, dim=tuple(range(self.dL_dout.ndim)[:-1]))
+        self.gamma_g[:] = torch.sum(dL_dout*self.norm_x, dim=tuple(range(self.dL_dout.ndim)[:-1]))
+        
         
         
 class TransformerEncoderBlock(Layer):
-    def __init__(self, seq_dim, num_heads, dim_ff, activation=Relu):
+    def __init__(self, seq_dim, num_heads, dim_ff, activation=Relu, eps=1e-05):
         self.multihead = MultiHeadAttention(seq_dim=seq_dim, num_heads=num_heads)
-        self.linears = {1: Dense(seq_dim, dim_ff),
-                        2: Dense(dim_ff, seq_dim)}
+        self.linears = {0: Dense(seq_dim, dim_ff),
+                        1: Dense(dim_ff, seq_dim)}
         self.ff_act = activation()
+        self.norms = {"multi_head": NLPLayerNorm(-1, seq_dim, eps=eps),
+                      "ff": NLPLayerNorm(-1, seq_dim, eps=eps)}
+    
+    def initial_pass(self, x):
+        if "cuda" in str(x.device):
+            self.device = "cuda"
+            self.streams = []
+            for _ in range(5):  # 5 Layers with parameters
+                self.streams.append(torch.cuda.Stream())
+        else:
+            self.device = "cpu"
+
+        mh_out = self.multihead.initial_pass(x, x, x) + x
+        norm_mh_out = self.norms["multi_head"].initial_pass(mh_out)
+        ff1 = self.linears[0].initial_pass(norm_mh_out)
+        a = self.ff_act.initial_pass(ff1)
+        ff2 = self.linears[1].initial_pass(a) + norm_mh_out
+        return self.norms["ff"].initial_pass(ff2)
+        
+    def forward(self, x):
+        mh_out = self.multihead.forward(x, x, x) + x
+        norm_mh_out = self.norms["multi_head"].forward(mh_out)
+        ff1 = self.linears[0].forward(norm_mh_out)
+        a = self.ff_act.forward(ff1)
+        ff2 = self.linears[1].forward(a) + norm_mh_out
+        return self.norms["ff"].forward(ff2)
+    
+    def backward_p1(self, dL_dout):
+        dL_dff2 = self.norms["ff"].backward_p1(dL_dout)
+        dL_da = self.linears[1].backward_p1(dL_dff2)
+        dL_dff1 = self.ff_act.backward_p1(dL_da)
+        dL_dnormmhout = self.linears[0].backward_p1(dL_dff1) + dL_dout
+        dL_dmhout = self.norms["multi_head"].backward_p1(dL_dnormmhout)
+        dL_din1 = torch.sum(torch.stack(self.multihead.backward_p1(dL_dmhout)),dim=0)
+        return dL_din1 + dL_dmhout  # dLdmhout == dL_din2
+    
+    def backward_p2(self):
+        if "cuda" in str(x.device):
+            with torch.cuda.stream(self.streams[0]):
+                self.multihead.backward_p2()
+                
+            for i, s in zip(range(2), self.streams[1:3]):
+                with torch.cuda.stream(s):
+                    self.linears[i].backward_p2()
+            
+            for k, s in zip(self.norms.keys(), self.streams[3:]):
+                with torch.cuda.stream(s):
+                    self.norms[k].backward_p2()
+        else:
+            self.multihead.backward_p2()
+            for i in range(2):
+                self.linears[i].backward_p2()
+            for k in self.norms.keys():
+                self.norms[k].backward_p2()
+            
         
         
         
 if __name__ == "__main__":
-    layer = MultiHeadAttention(80, 8)
     x = torch.randn(16, 24, 80)
     dL_dout = torch.randn(16, 24, 80)
-    print(layer.initial_pass(x,x,x).shape)
-    layer.forward(x,x,x)
+    layer = TransformerEncoderBlock(80, 8, 160)
+    layer.initial_pass(x)
+    layer.forward(x)
     layer.backward_p1(dL_dout)
     layer.backward_p2()
-    # have to fix layer.backward_p2()
         
         
     
