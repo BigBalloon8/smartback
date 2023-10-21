@@ -42,15 +42,14 @@ class Dense(Layer):
         self.inputs = torch.zeros_like(x)
         x = vmap(lambda x_: torch.mm(x_, self.weights))(x)
         out = torch.add(x, self.bias)
-        self.out = torch.zeros_like(out)
         self.dL_dout = torch.zeros_like(out)
         return out
     
     def forward(self, x):
         self.inputs[:] = x
         x =  vmap(lambda x_: torch.mm(x_, self.weights))(x)
-        torch.add(x, self.bias, out=self.out)
-        return self.out
+        out = torch.add(x, self.bias)
+        return out
     
     def backward_p1(self, dL_dout):
         self.dL_dout[:] = dL_dout
@@ -92,16 +91,48 @@ class Relu(Layer):
 
     def backward_p2(self):
         pass
+    
+class Dropout(Layer):
+    def __init__(self, p=0.1):
+        self.p = p
+        self.training = True
+    
+    def initial_pass(self, x):
+        self.p_mask = torch.bernoulli(torch.ones_like(x) - self.p)
+        return x*self.p_mask
+    
+    def forward(self, x):
+        if not self.training or self.p==0:
+            return x
+        if self.p==1:
+            return torch.zeros_like(x)
+        self.p_mask[:] = torch.bernoulli(torch.ones_like(x) -self.p)
+        return x*self.p_mask
+    
+    def backward_p1(self, dL_dout):
+        if self.p==0:
+            return dL_dout
+        if self.p==1:
+            return torch.zeros_like(dL_dout)
+        return dL_dout*self.p_mask
+    
+    def backward_p2(self):
+        pass
 
-
+    
 class MultiHeadAttention(Layer):
-    def __init__(self, seq_dim, num_heads):
+    #TODO self is the first layer in the model you can cache the linear outputs of the first 3 linears
+    def __init__(self, seq_dim, num_heads, p=0.1):
         self.num_heads = num_heads
         self.seq_dim = seq_dim
         self.linears = {"Q": Dense(self.seq_dim, self.seq_dim),
                         "K": Dense(self.seq_dim, self.seq_dim),
                         "V": Dense(self.seq_dim, self.seq_dim),
                         "O": Dense(self.seq_dim, self.seq_dim)
+                        }
+        self.dropouts = {"Q": Dropout(p=p),
+                         "K": Dropout(p=p),
+                         "V": Dropout(p=p)
                         }
     
     def initial_pass(self, Q, K, V, mask=None):
@@ -119,9 +150,13 @@ class MultiHeadAttention(Layer):
                        "V": torch.zeros_like(V),
         }
         
-        lQ = self.linears["Q"].initial_pass(Q)
-        lK = self.linears["K"].initial_pass(K)
-        lV = self.linears["V"].initial_pass(V)
+        lQ = self.dropouts["Q"].initial_pass(self.linears["Q"].initial_pass(Q))
+        lK = self.dropouts["K"].initial_pass(self.linears["K"].initial_pass(K))
+        lV = self.dropouts["V"].initial_pass(self.linears["V"].initial_pass(V))
+        
+        self.lQ = torch.zeros_like(lQ)
+        self.lK = torch.zeros_like(lK)
+        self.lV = torch.zeros_like(lV)
     
         lQ = torch.cat(lQ.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         lK = torch.cat(lK.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
@@ -144,13 +179,13 @@ class MultiHeadAttention(Layer):
         self.inputs["K"][:] = K
         self.inputs["V"][:] = V
         
-        lQ = self.linears["Q"](Q)
-        lK = self.linears["K"](K)
-        lV = self.linears["V"](V)
+        self.lQ[:] = self.dropouts["Q"](self.linears["Q"](Q))
+        self.lK[:] = self.dropouts["K"](self.linears["K"](K))
+        self.lV[:] = self.dropouts["V"](self.linears["V"](V))
         
-        lQ = torch.cat(lQ.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
-        lK = torch.cat(lK.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
-        lV = torch.cat(lV.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        lQ = torch.cat(self.lQ.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        lK = torch.cat(self.lK.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        lV = torch.cat(self.lV.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         
         QK_T = vmap(lambda q, k: torch.bmm(q, torch.transpose(k, -1, -2)), in_dims=-2, out_dims=-2)(lQ, lK)
         if mask:
@@ -193,29 +228,30 @@ class MultiHeadAttention(Layer):
         
         dL_dAtt = torch.cat(dL_dAtt.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         
-        lV = torch.cat(self.linears["V"].out.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        lV = torch.cat(self.lV.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         dL_dsQKT = vmap(lambda dl_dout, v: torch.bmm(dl_dout, torch.transpose(v, -1,-2)), in_dims=-2, out_dims=-2)(dL_dAtt, lV)
         
         # vmap across 3 dims BxCxH 
         J_sQKT = vmap(vmap(vmap(self._softmax_jacobian)))(self.sQK_T)  # sQK_T.shape -> BxCxHxC 
         dL_dQKT = torch.squeeze(vmap(vmap(vmap(torch.mm)))(dL_dsQKT.unsqueeze(-2), J_sQKT))
         
-        lK = torch.cat(self.linears["K"].out.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
-        lQ = torch.cat(self.linears["Q"].out.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        lK = torch.cat(self.lK.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        lQ = torch.cat(self.lQ.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         
         # TODO verifiy this section
         dL_dlQ = vmap(lambda dl_dqkt, k: torch.bmm(dl_dqkt, k), in_dims=-2, out_dims=-2)(dL_dQKT, lK)  # k.T not necessary as its k.T.T  
         dL_dlKT = vmap(lambda dl_dqkt, q: torch.bmm(torch.transpose(q, -1,-2), dl_dqkt), in_dims=-2, out_dims=-2)(dL_dQKT, lQ)  
         dL_dlV = vmap(lambda dl_datt, sqkt: torch.bmm(torch.transpose(sqkt, -2, -1), dl_datt), in_dims=-2, out_dims=-2)(dL_dAtt, self.sQK_T) 
-         
-        dL_dQ = self.linears["Q"].backward_p1(torch.flatten(dL_dlQ, -2, -1))
-        dL_dK = self.linears["K"].backward_p1(torch.flatten(torch.vmap(lambda dl_dlkt: torch.transpose(dl_dlkt, -1, -2), in_dims=-2, out_dims=-2)(dL_dlKT), -2, -1))
-        dL_dV = self.linears["V"].backward_p1(torch.flatten(dL_dlV, -2, -1))
+        
+        dL_dQ = self.linears["Q"].backward_p1(self.dropouts["Q"].backward_p1(torch.flatten(dL_dlQ, -2, -1)))
+        dL_dK = self.linears["K"].backward_p1(self.dropouts["K"].backward_p1(torch.flatten(torch.vmap(lambda dl_dlkt: torch.transpose(dl_dlkt, -1, -2), in_dims=-2, out_dims=-2)(dL_dlKT), -2, -1)))
+        dL_dV = self.linears["V"].backward_p1(self.dropouts["V"].backward_p1(torch.flatten(dL_dlV, -2, -1)))
         
         return dL_dQ, dL_dK, dL_dV
         
         
-    def backward_p2(self):
+    def backward_p2(self): 
+        #TODO add sychronize streams within model
         if self.device == "cuda":
             for k, s in zip(self.linears.keys(), self.streams):
                 with torch.cuda.stream(s):
@@ -289,14 +325,16 @@ class NLPLayerNorm(Layer):
         
         
         
-class TransformerEncoderBlock(Layer):
-    def __init__(self, seq_dim, num_heads, dim_ff, activation=Relu, eps=1e-05):
+class BertBlock(Layer):
+    def __init__(self, seq_dim, num_heads, dim_ff, activation=Relu, eps=1e-05, p=0.1):
         self.multihead = MultiHeadAttention(seq_dim=seq_dim, num_heads=num_heads)
         self.linears = {0: Dense(seq_dim, dim_ff),
                         1: Dense(dim_ff, seq_dim)}
         self.ff_act = activation()
         self.norms = {"multi_head": NLPLayerNorm(-1, seq_dim, eps=eps),
                       "ff": NLPLayerNorm(-1, seq_dim, eps=eps)}
+        self.dropouts = {"multi_head": Dropout(p=p),
+                         "ff": Dropout(p=p)}
     
     def initial_pass(self, x):
         if "cuda" in str(x.device):
@@ -309,24 +347,33 @@ class TransformerEncoderBlock(Layer):
 
         mh_out = self.multihead.initial_pass(x, x, x) + x
         norm_mh_out = self.norms["multi_head"].initial_pass(mh_out)
+        norm_mh_out = self.dropouts["multi_head"].initial_pass(norm_mh_out)
+        
         ff1 = self.linears[0].initial_pass(norm_mh_out)
         a = self.ff_act.initial_pass(ff1)
         ff2 = self.linears[1].initial_pass(a) + norm_mh_out
-        return self.norms["ff"].initial_pass(ff2)
+        ff2_norm = self.norms["ff"].initial_pass(ff2)
+        return self.dropouts["ff"].initial_pass(ff2_norm)
         
     def forward(self, x):
-        mh_out = self.multihead.forward(x, x, x) + x
-        norm_mh_out = self.norms["multi_head"].forward(mh_out)
-        ff1 = self.linears[0].forward(norm_mh_out)
-        a = self.ff_act.forward(ff1)
-        ff2 = self.linears[1].forward(a) + norm_mh_out
-        return self.norms["ff"].forward(ff2)
+        mh_out = self.multihead(x, x, x) + x
+        norm_mh_out = self.norms["multi_head"](mh_out)
+        norm_mh_out = self.dropouts["multi_head"](norm_mh_out)
+        
+        ff1 = self.linears[0](norm_mh_out)
+        a = self.ff_act(ff1)
+        ff2 = self.linears[1](a) + norm_mh_out
+        ff2_norm = self.norms["ff"](ff2)
+        return self.dropouts["ff"](ff2_norm)
     
     def backward_p1(self, dL_dout):
-        dL_dff2 = self.norms["ff"].backward_p1(dL_dout)
+        dL_dff2norm = self.dropouts["ff"].backward_p1(dL_dout)
+        dL_dff2 = self.norms["ff"].backward_p1(dL_dff2norm)
         dL_da = self.linears[1].backward_p1(dL_dff2)
         dL_dff1 = self.ff_act.backward_p1(dL_da)
         dL_dnormmhout = self.linears[0].backward_p1(dL_dff1) + dL_dout
+        
+        dL_dnormmhout = self.dropouts["multi_head"].backward_p1(dL_dnormmhout)
         dL_dmhout = self.norms["multi_head"].backward_p1(dL_dnormmhout)
         dL_din1 = torch.sum(torch.stack(self.multihead.backward_p1(dL_dmhout)),dim=0)
         return dL_din1 + dL_dmhout  # dLdmhout == dL_din2
@@ -356,7 +403,7 @@ class TransformerEncoderBlock(Layer):
 if __name__ == "__main__":
     x = torch.randn(16, 24, 80)
     dL_dout = torch.randn(16, 24, 80)
-    layer = TransformerEncoderBlock(80, 8, 160)
+    layer = BertBlock(80, 8, 160)
     layer.initial_pass(x)
     layer.forward(x)
     layer.backward_p1(dL_dout)
