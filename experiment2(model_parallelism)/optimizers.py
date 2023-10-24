@@ -52,7 +52,3 @@ class Adam(Optimizer):
         for layer in self.model.layers:
             layer.update = _update_fn
             
-            
-        
-        
-

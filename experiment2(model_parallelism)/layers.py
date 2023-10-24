@@ -261,7 +261,7 @@ class MultiHeadAttention(Layer):
                 self.linears[k].backward_p2()
                     
 class NLPLayerNorm(Layer):
-    def __init__(self, dim, dim_size, eps=1e-05):
+    def __init__(self, dim, dim_size, eps=1e-08):
         self.dim = dim #seqdim for nlp
         self.dim_size = dim
         self.eps = eps
@@ -303,7 +303,7 @@ class NLPLayerNorm(Layer):
             const_n2 = self.dim_size**2
             f = lambda __x, __z, _v, g: g*(((1-1/self.dim_size)*torch.sqrt(_v))-__z*((__x)/const_n2))/_v
             return vmap(f, in_dims=(0,0,None,0))(x, z, v, self.gamma)
-        
+
         def _diag_set(jac, _diag):
             jac.diagonal()[:]= _diag
             return jac
@@ -322,8 +322,13 @@ class NLPLayerNorm(Layer):
     def backward_p2(self):
         self.bias_g[:] = torch.sum(dL_dout, dim=tuple(range(self.dL_dout.ndim)[:-1]))
         self.gamma_g[:] = torch.sum(dL_dout*self.norm_x, dim=tuple(range(self.dL_dout.ndim)[:-1]))
+      
         
-        
+class NLPRMSNorm(Layer):
+    def __init__(self) -> None:
+        super().__init__()
+
+
         
 class BertBlock(Layer):
     def __init__(self, seq_dim, num_heads, dim_ff, activation=Relu, eps=1e-05, p=0.1):
@@ -397,8 +402,7 @@ class BertBlock(Layer):
             for k in self.norms.keys():
                 self.norms[k].backward_p2()
             
-        
-        
+
         
 if __name__ == "__main__":
     x = torch.randn(16, 24, 80)
