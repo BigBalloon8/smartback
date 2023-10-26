@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Dict, Optional, Union, Sequence
 from abc import ABC, abstractmethod
 
 import torch
@@ -776,7 +776,25 @@ class BertBlock(Layer):
             for k in self.norms.keys():
                 self.norms[k].backward_p2()
             
-
+class Conv(Layer):
+    def __init__(self, in_channels: int, out_channels: int, k_size: Union[Sequence[int], int], padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1):
+        if isinstance(k_size, int):
+            k_size = (k_size, k_size)
+        self.kernel = torch.randn(out_channels, in_channels, *k_size)
+        self.bias = torch.zeros(out_channels)
+        
+        self.kernel_g = torch.zeros_like(self.kernel)
+        self.bias_g = torch.zeros_like(self.bias)
+        
+        if isinstance(padding, bool):
+            self.padding = 1 if padding else 0
+        else:
+            self.padding = padding
+        
+        in_channels_stride_pos = []
+        
+        if out_channels:
+            out_channels_stride_pos = []
         
 if __name__ == "__main__":
     x = torch.randn(16, 24, 80)
