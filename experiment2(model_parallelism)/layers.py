@@ -539,8 +539,8 @@ class NLPLayerNorm(Layer):
         """
         Computes the gradients of the parameter in the NLP layer norm
         """
-        self.bias_g[:] = torch.sum(dL_dout, dim=tuple(range(self.dL_dout.ndim)[:-1]))
-        self.gamma_g[:] = torch.sum(dL_dout*self.norm_x, dim=tuple(range(self.dL_dout.ndim)[:-1]))
+        self.bias_g[:] = torch.sum(self.dL_dout, dim=tuple(range(self.dL_dout.ndim)[:-1]))
+        self.gamma_g[:] = torch.sum(self.dL_dout*self.norm_x, dim=tuple(range(self.dL_dout.ndim)[:-1]))
       
         
 class NLPRMSNorm(Layer):
@@ -649,7 +649,7 @@ class NLPRMSNorm(Layer):
         """
         Computes the gradients of the parameter in the NLP layer norm
         """
-        self.weights_g[:] = torch.sum(dL_dout*self.rms_norm_x, dim=tuple(range(self.dL_dout.ndim)[:-1]))
+        self.weights_g[:] = torch.sum(self.dL_dout*self.rms_norm_x, dim=tuple(range(self.dL_dout.ndim)[:-1]))
 
         
 class BertBlock(Layer):
@@ -758,7 +758,7 @@ class BertBlock(Layer):
         """
         Computes the gradients of the parameter in the BERT block
         """
-        if "cuda" in str(x.device):
+        if "cuda" in str(self.device):
             with torch.cuda.stream(self.streams[0]):
                 self.multihead.backward_p2()
                 
@@ -776,7 +776,7 @@ class BertBlock(Layer):
             for k in self.norms.keys():
                 self.norms[k].backward_p2()
             
-class Conv(Layer):
+class Conv2D(Layer):
     def __init__(self, in_channels: int, out_channels: int, k_size: Union[Sequence[int], int], padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1):
         if isinstance(k_size, int):
             k_size = (k_size, k_size)
@@ -790,20 +790,69 @@ class Conv(Layer):
             self.padding = 1 if padding else 0
         else:
             self.padding = padding
+
+        if isinstance(stride, int):
+            self.stride = (stride, stride)
+        else:
+            self.stride = stride
+            
+        if self.stride[0] != 1 or self.stride[1] != 1:
+            pass  # raise NotImplementedError("Only stride 1 is supported")
+    
+    def initial_pass(self, x:torch.Tensor):
+        self.inputs = torch.zeros_like(x)
+        out = torch.nn.functional.conv2d(x, self.kernel, self.bias, self.stride, self.padding)
+        self.dL_dout = torch.zeros_like(out)
+        return out
         
-        in_channels_stride_pos = []
+    def forward(self, x:torch.Tensor):
+        self.inputs[:] = x
+        return torch.nn.functional.conv2d(x, self.kernel, self.bias, stride=self.stride, padding=self.padding)
+    
+    def backward_p1(self, dL_dout):
+        self.dL_dout[:] = dL_dout
         
-        if out_channels:
-            out_channels_stride_pos = []
+        batch_size, _, in_height, in_width = self.inputs.shape
+        out_height, out_width = dL_dout.shape[-2:]
+
+        # Compute the padding values for the transpose convolution
+        pad_h = in_height + (out_height - 1) * self.stride[0] - dL_dout.shape[-2]
+        pad_w = in_width + (out_width - 1) * self.stride[1] - dL_dout.shape[-1]
+
+        grad_input = torch.nn.functional.conv_transpose2d(dL_dout, self.kernel, stride=self.stride, padding=(pad_h, pad_w))
+        return grad_input
+        
+        dL_din = torch.nn.functional.conv_transpose2d(dL_dout, self.kernel, stride=self.stride, output_padding=self.padding)
+        batch_size, out_channels, out_height, out_width = dL_dout.size()
+        in_channels, in_height, in_width = self.inputs.size()[1:]
+        dL_din = dL_din[:, :, :in_height, :in_width]
+        return dL_din
+    
+    def backward_p2(self):
+        self.bias_g[:] = torch.sum(dL_dout, dim=(0, 2, 3))
+        
         
 if __name__ == "__main__":
-    x = torch.randn(16, 24, 80)
-    dL_dout = torch.randn(16, 24, 80)
-    layer = BertBlock(80, 8, 160)
-    layer.initial_pass(x)
-    layer.forward(x)
-    layer.backward_p1(dL_dout)
-    layer.backward_p2()
-        
+    
+    def test_bert():
+        x = torch.randn(16, 24, 80)
+        dL_dout = torch.randn(16, 24, 80)
+        layer = BertBlock(80, 8, 160)
+        layer.initial_pass(x)
+        layer.forward(x)
+        layer.backward_p1(dL_dout)
+        layer.backward_p2()
+    
+    image = torch.randn(16, 3, 80, 80)
+    conv = Conv2D(3, 16, 3, stride=2)
+    conv.initial_pass(image)
+    with torch.no_grad():
+        dL_dout = torch.ones_like(conv.forward(image))
+        my_back = conv.backward_p1(dL_dout)
+    true_back = torch.autograd.functional.vjp(conv.forward, image, dL_dout)[1]
+    print(my_back.shape)
+    print(true_back.shape)
+    print(torch.all(my_back == true_back))
+    #print(torch.autograd.functional.jvp(conv.forward, image, dL_dout)[1].shape)
         
     
