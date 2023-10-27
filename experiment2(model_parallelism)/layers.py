@@ -426,7 +426,13 @@ class MultiHeadAttention(Layer):
         else:
             for k in self.linears.keys():
                 self.linears[k].backward_p2()          
-                    
+
+
+#TODO will have to update for 3D parallelism (DP)
+class BatchNorm(Layer):
+    def __init__(self, ):
+
+      
 class NLPLayerNorm(Layer):
     def __init__(self, dim: int, dim_size: int, eps:Optional[float]=1e-08):
         """
