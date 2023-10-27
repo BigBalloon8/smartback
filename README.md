@@ -30,12 +30,19 @@ The best way to explain is with an example:
 Our model Is a basic MLP and it’s spilt across 2 devices via model parallelism:
 
 $$\textcolor{red}{z^0=w^0 x+b^0}$$
+
 $$\textcolor{red}{a^0=\text{ReLU}(z^0)}$$
+
 $$\textcolor{red}{z^1=w^1 a^0+b^1}$$
+
 $$\textcolor{red}{a^1=\text{ReLU}(z^1)}$$
+
 $$\textcolor{cyan}{z^2=w^2 a^1+b^2}$$
+
 $$\textcolor{cyan}{a^2=\text{ReLU}(z^2)}$$
+
 $$\textcolor{cyan}{z^3=w^3 a^2+b^3 \qquad z^3=\hat{y}}$$
+
 $$\textcolor{cyan}{L(\hat{y}, y)}$$
 
 Where $\textcolor{red}{\text{red}}$ is processed on $\textcolor{red}{\text{rank 0}}$ and $\textcolor{cyan}{\text{cyan}}$ is processed on $\textcolor{cyan}{\text{rank 1}}$ and Where $x$ is the input values, $\hat{y}$ is the predicted values and $y$ is the true value used to compare with the predicted values.
