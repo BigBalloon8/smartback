@@ -2,6 +2,7 @@ from typing import Dict, Optional, Union, Sequence
 from abc import ABC, abstractmethod
 
 import torch
+import torch.nn.functional as F
 from torch import vmap as vmap
 import numpy as np
 
@@ -25,6 +26,9 @@ class Layer(ABC):
     def backward_p2(self):
         #p2 is for calculating param grads if theres no params can just pass
         pass
+
+class Activation(Layer):
+    pass
     
 
 
@@ -119,7 +123,7 @@ class Dense(Layer):
             raise Exception("ndim of input to Dense not supported")
 
 
-class Relu(Layer):
+class Relu(Activation):
     def initial_pass(self, x: torch.Tensor):
         """
         Performs an initial forward pass to initialize intermediate tensors
@@ -421,7 +425,7 @@ class MultiHeadAttention(Layer):
                     self.linears[k].backward_p2()
         else:
             for k in self.linears.keys():
-                self.linears[k].backward_p2()
+                self.linears[k].backward_p2()          
                     
 class NLPLayerNorm(Layer):
     def __init__(self, dim: int, dim_size: int, eps:Optional[float]=1e-08):
@@ -777,14 +781,41 @@ class BertBlock(Layer):
                 self.norms[k].backward_p2()
             
 class Conv2D(Layer):
-    def __init__(self, in_channels: int, out_channels: int, k_size: Union[Sequence[int], int], padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1):
+    def __init__(self, in_channels: int, out_channels: int, k_size: Union[Sequence[int], int], bias: bool=True,  padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1):
+        """
+        Initializes Conv2D layer
+
+        Args:
+            in_channels (int): number of input channels
+            out_channels (int): number of output channels
+            k_size (Union[Sequence[int], int]): size of kernel
+            bias (bool): whether the conv2d layer has bias. Defaults to True.
+            padding (Union[bool, int]): the padding either side of the input feature. Defaults to False.
+            stride (Union[Sequence[int], int], optional): the stride pattern followed by the kernel. Defaults to 1.
+
+        Raises:
+            NotImplementedError: There is a Bug in the backward pass when the stride is greater than 3
+            
+        Attributes:
+            kernel (torch.Tensor): the kernel of the conv2d layer
+            bias (torch.Tensor): the bias of the conv2d layer
+            kernel_g (torch.Tensor): the gradient of the kernel of the conv2d layer
+            bias_g (torch.Tensor): the gradient of the bias of the conv2d layer
+            padding (int): the padding either side of the input feature
+            stride (Tuple[int]): the stride pattern followed by the kernel
+            inputs (torch.Tensor): the input tensor
+        """
         if isinstance(k_size, int):
             k_size = (k_size, k_size)
         self.kernel = torch.randn(out_channels, in_channels, *k_size)
-        self.bias = torch.zeros(out_channels)
+        if bias:
+            self.bias = torch.zeros(out_channels)
+        else:
+            self.bias = None
         
         self.kernel_g = torch.zeros_like(self.kernel)
-        self.bias_g = torch.zeros_like(self.bias)
+        if bias:
+            self.bias_g = torch.zeros_like(self.bias)
         
         if isinstance(padding, bool):
             self.padding = 1 if padding else 0
@@ -796,42 +827,204 @@ class Conv2D(Layer):
         else:
             self.stride = stride
             
-        if self.stride[0] != 1 or self.stride[1] != 1:
-            pass  # raise NotImplementedError("Only stride 1 is supported")
+        if self.stride[0] > 3 or self.stride[1] > 3:
+            raise NotImplementedError("Stride larger than 3 not implemented")
     
     def initial_pass(self, x:torch.Tensor):
+        """
+        Performs an initial pass through the Conv2D layer and generates all intermediates
+
+        Args:
+            x (torch.Tensor): Input Tensor
+
+        Returns:
+            torch.Tensor: Output Tensor
+        """
         self.inputs = torch.zeros_like(x)
-        out = torch.nn.functional.conv2d(x, self.kernel, self.bias, self.stride, self.padding)
+        out = F.conv2d(x, self.kernel, self.bias, self.stride, self.padding)
         self.dL_dout = torch.zeros_like(out)
         return out
         
     def forward(self, x:torch.Tensor):
+        """
+        Preforms a forward pass through the Conv2D layer
+
+        Args:
+            x (torch.Tensor): Input Tensor
+
+        Returns:
+            torch.Tensor: Output Tensor
+        """
         self.inputs[:] = x
-        return torch.nn.functional.conv2d(x, self.kernel, self.bias, stride=self.stride, padding=self.padding)
+        return F.conv2d(x, self.kernel, self.bias, stride=self.stride, padding=self.padding)
     
-    def backward_p1(self, dL_dout):
+    def backward_p1(self, dL_dout: torch.Tensor):
+        """
+        Takes the derivative of the loss with respect to the Conv2D Layer's output and returns the derivative of the loss with respect to the Conv2D Layer's input
+
+        Args:
+            dL_dout (torch.Tensor): derivative of the loss with respect to the Conv2D Layer's output
+
+        Returns:
+            torch.Tensor: derivative of the loss with respect to the Conv2D Layer's input
+        """
         self.dL_dout[:] = dL_dout
-        
-        batch_size, _, in_height, in_width = self.inputs.shape
-        out_height, out_width = dL_dout.shape[-2:]
-
-        # Compute the padding values for the transpose convolution
-        pad_h = in_height + (out_height - 1) * self.stride[0] - dL_dout.shape[-2]
-        pad_w = in_width + (out_width - 1) * self.stride[1] - dL_dout.shape[-1]
-
-        grad_input = torch.nn.functional.conv_transpose2d(dL_dout, self.kernel, stride=self.stride, padding=(pad_h, pad_w))
-        return grad_input
-        
-        dL_din = torch.nn.functional.conv_transpose2d(dL_dout, self.kernel, stride=self.stride, output_padding=self.padding)
-        batch_size, out_channels, out_height, out_width = dL_dout.size()
-        in_channels, in_height, in_width = self.inputs.size()[1:]
-        dL_din = dL_din[:, :, :in_height, :in_width]
+        #TODO fix bug when stride is greater than 3
+        dL_din = F.conv_transpose2d(dL_dout, self.kernel, stride=self.stride, padding=self.padding, output_padding=(self.stride[0]-1,self.stride[1]-1))
         return dL_din
+        
+    def backward_p2(self):
+        """
+        Computes the gradients of the parameter within the Conv2D layer
+        """
+        if isinstance(self.bias, torch.Tensor):
+            self.bias_g[:] = torch.sum(dL_dout, dim=(0, 2, 3))
+        def _dL_dk_fn(feature, kernal, stride, padding):
+            return F.conv2d(feature, kernal, stride=stride, padding=padding).squeeze(0)
+        self.kernel_g[:] = torch.sum(vmap(vmap(vmap(_dL_dk_fn, in_dims=(0, None)), in_dims=(None, 0)))(self.inputs.unsqueeze(-3), self.dL_dout.unsqueeze(-3).unsqueeze(-3), stride=self.stride, padding=self.padding),dim=0)
+    
+class MaxPool2D(Layer):
+    def __init__(self, k_size: Union[Sequence[int], int], padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1):
+        """
+        Initializes a MaxPool2D layer
+
+        Args:
+            k_size (Union[Sequence[int], int]): Size of pool kernel
+            padding (Union[bool, int]): the padding either side of the input feature. Defaults to False.
+            stride (Union[Sequence[int], int], optional): the stride pattern followed by the kernel. Defaults to 1.
+        
+        Attributes:
+            k_size (Tuple[int]): Size of pool kernel)
+            padding (int): the padding either side of the input feature
+            stride (Tuple[int]): the stride pattern followed by the kernel
+            indices (torch.Tensor): the indices of the max pool
+        """
+        if isinstance(k_size, int):
+            self.k_size = (k_size, k_size)
+        
+        if isinstance(padding, bool):
+            self.padding = 1 if padding else 0
+        else:
+            self.padding = padding
+
+        if isinstance(stride, int):
+            self.stride = (stride, stride)
+        else:
+            self.stride = stride
+        
+    
+    def initial_pass(self, x: torch.Tensor):
+        """
+        Performs an initial pass through the MaxPool2D layer and generates all intermediates
+
+        Args:
+            x (torch.Tensor): Input tensor
+
+        Returns:
+            torch.Tensor: Output tensor
+        """
+        out, self.indices = F.max_pool2d(x, kernel_size=self.k_size, stride=self.stride, padding=self.padding, return_indices=True)
+        return out
+    
+    def forward(self, x: torch.Tensor):
+        """
+        Preforms a forward pass through the MaxPool2D layer
+
+        Args:
+            x (torch.Tensor): Input tensor
+
+        Returns:
+            torch.Tensor: Output tensor
+        """
+        out, self.indices[:] = F.max_pool2d(x, kernel_size=self.k_size, stride=self.stride, padding=self.padding, return_indices=True)
+        return out
+    
+    def backward_p1(self, dL_dout: torch.Tensor):
+        """
+        Takes the derivative of the loss with respect to the MaxPool2D Layer's output and returns the derivative of the loss with respect to the MaxPool2D Layer's input
+
+        Args:
+            dL_dout (torch.Tensor): derivative of the loss with respect to the MaxPool2D Layer's output
+
+        Returns:
+            torch.Tensor: derivative of the loss with respect to the MaxPool2D Layer's input
+        """
+        return F.max_unpool2d(dL_dout, self.indices, kernel_size=self.k_size, stride=self.stride, padding=self.padding)
     
     def backward_p2(self):
-        self.bias_g[:] = torch.sum(dL_dout, dim=(0, 2, 3))
+        pass
+
+
+class AvgPool2D(Layer):
+    def __init__(self, k_size: Union[Sequence[int], int], padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1):
+        """
+        Initializes a AvgPool2D layer
+
+        Args:
+            k_size (Union[Sequence[int], int]): Size of pool kernel
+            padding (Union[bool, int]): the padding either side of the input feature. Defaults to False.
+            stride (Union[Sequence[int], int], optional): the stride pattern followed by the kernel. Defaults to 1.
         
+        Attributes:
+            k_size (Tuple[int]): Size of pool kernel)
+            padding (int): the padding either side of the input feature
+            stride (Tuple[int]): the stride pattern followed by the kernel
+            indices (torch.Tensor): the indices of the max pool
+        """
+        if isinstance(k_size, int):
+            self.k_size = (k_size, k_size)
         
+        if isinstance(padding, bool):
+            self.padding = 1 if padding else 0
+        else:
+            self.padding = padding
+
+        if isinstance(stride, int):
+            self.stride = (stride, stride)
+        else:
+            self.stride = stride
+        
+    
+    def initial_pass(self, x: torch.Tensor):
+        """
+        Performs an initial pass through the AvgPool2D layer
+
+        Args:
+            x (torch.Tensor): Input tensor
+
+        Returns:
+            torch.Tensor: Output tensor
+        """
+        return self.forward(x)
+    
+    def forward(self, x: torch.Tensor):
+        """
+        Preforms a forward pass through the AvgPool2D layer
+
+        Args:
+            x (torch.Tensor): Input tensor
+
+        Returns:
+            torch.Tensor: Output tensor
+        """
+        return F.avg_pool2d(x, kernel_size=self.k_size, stride=self.stride, padding=self.padding)
+    
+    def backward_p1(self, dL_dout: torch.Tensor):
+        """
+        Takes the derivative of the loss with respect to the AvgPool2D Layer's output and returns the derivative of the loss with respect to the AvgPool2D Layer's input
+
+        Args:
+            dL_dout (torch.Tensor): derivative of the loss with respect to the AvgPool2D Layer's output
+
+        Returns:
+            torch.Tensor: derivative of the loss with respect to the AvgPool2D Layer's input
+        """
+        return dL_dout * (1/(self.k_size[0]*self.k_size[1]))
+    
+    def backward_p2(self):
+        pass
+        
+
 if __name__ == "__main__":
     
     def test_bert():
@@ -844,11 +1037,12 @@ if __name__ == "__main__":
         layer.backward_p2()
     
     image = torch.randn(16, 3, 80, 80)
-    conv = Conv2D(3, 16, 3, stride=2)
+    conv = Conv2D(3, 16, 3)
     conv.initial_pass(image)
     with torch.no_grad():
         dL_dout = torch.ones_like(conv.forward(image))
         my_back = conv.backward_p1(dL_dout)
+        conv.backward_p2()
     true_back = torch.autograd.functional.vjp(conv.forward, image, dL_dout)[1]
     print(my_back.shape)
     print(true_back.shape)
