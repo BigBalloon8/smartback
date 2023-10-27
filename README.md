@@ -67,7 +67,7 @@ For the backward pass, rank 1 computes $\frac{\partial L}{\partial z^{3}}$ to $\
 Then each rank can upgrade its local parameters in parallel.
 
 Visually this looks like this:
-![Alt text](image.png)
+![Alt text](base_mp.png)
 
 As you can see there is no compute overlap. The goal of out technique is to start the compute of the backward pass on rank 0 as fast as possible.
 
