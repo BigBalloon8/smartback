@@ -429,9 +429,105 @@ class MultiHeadAttention(Layer):
 
 
 #TODO will have to update for 3D parallelism (DP)
-class BatchNorm(Layer):
-    def __init__(self, ):
+class BatchNorm2D(Layer):
+    def __init__(self, in_channels: int, eps: float=1e-05, momentum =0.1):
+        self.eps = eps
+        self.momentum = momentum
+        self.in_channels = in_channels
+        
+        self.gamma = torch.ones(in_channels)
+        self.beta = torch.zeros(in_channels)
+        
+        self.gamma_g = torch.zeros(in_channels)
+        self.beta_g = torch.zeros(in_channels)
+        
+        self.r_mean = torch.zeros(1, in_channels, 1, 1)
+        self.r_var = torch.ones(1, in_channels, 1, 1)
+        
+        self.training = True
+        
+    def initial_pass(self, x:torch.Tensor):
+        if self.training:
+            mean = x.mean(dim=[0,2,3], keepdim=True)
+            var = ((x-mean)**2).mean(dim=[0,2,3], keepdim=True)
+            self.r_mean = (1 - self.momentum) * self.r_mean + self.momentum * mean
+            self.r_var = (1 - self.momentum) * self.r_var + self.momentum * var
+        else:
+            mean, var = self.r_mean, self.r_var
+        
+        x_sub_mean = x - mean
+        self.x_sub_mean = torch.zeros_like(x_sub_mean)
+        self.var = var + self.eps
+        self.norm_x = (x_sub_mean)/torch.sqrt(self.var)
+        out = self.gamma.view(1, self.in_channels, 1, 1)*self.norm_x + self.beta.view(1, self.in_channels, 1, 1)
+        self.dL_dout = torch.zeros_like(out)
+        return out
+    
+    def forward(self, x: torch.Tensor):
+        if self.training:
+            mean = x.mean(dim=[0,2,3], keepdim=True)
+            var = ((x-mean)**2).mean(dim=[0,2,3], keepdim=True)
+            self.r_mean = (1 - self.momentum) * self.r_mean + self.momentum * mean
+            self.r_var = (1 - self.momentum) * self.r_var + self.momentum * var
+        else:
+            mean, var = self.r_mean, self.r_var
+        
+        self.x_sub_mean[:] = x - mean
+        self.var[:] = var + self.eps
+        self.norm_x[:] = (self.x_sub_mean)/torch.sqrt(self.var)
+        out = self.gamma.view(1, self.in_channels, 1, 1)*self.norm_x + self.beta.view(1, self.in_channels, 1, 1)
+        return out
+    
+    def _flattened_bnorm_jacobian(self, n):
+        
+        def _F_Jij(x, z, v, g):
+            n2 = n**2
+            sqrt_v = torch.sqrt(v)
+            # lambda potentially optimizable with sqrt v
+            f = lambda __x, __z: g*(-(sqrt_v/n)-__z*((__x)/n2))/v
+            def i_for_j(_x, _z):
+                return vmap(f, in_dims=(None, 0))(_x, _z)
+            return vmap(i_for_j, in_dims=(0,None))(x, z)
+        
+        def _F_Jii(x, z, v, g):
+            n2 = n**2
+            sqrt_v = torch.sqrt(v)
+            f = lambda __x, __z: g*(1-(sqrt_v/n)-__z*((__x)/n2))/v
+            return vmap(f, in_dims=(0,0))(x, z)
 
+        def _diag_set(jac, _diag):
+            jac.diagonal()[:]= _diag
+            return jac
+        
+        jac_base = vmap(_F_Jij)(self.x_sub_mean, self.norm_x, self.var.squeeze(), self.gamma)
+        diag = vmap(_F_Jii)(self.x_sub_mean, self.norm_x, self.var.squeeze(), self.gamma)
+        return vmap(_diag_set)(jac_base, diag)
+    
+    def _back_pass_flatten(self, x):
+        return torch.stack(torch.chunk(x, x.shape[1], dim= 1)).squeeze().flatten(1, -1)
+        
+    def _back_pass_unflatten(self, x, in_shape):
+        unflatten_shape = (in_shape[1], in_shape[0], in_shape[2], in_shape[3])
+        return torch.cat(torch.chunk(x.reshape(*unflatten_shape), in_shape[1], dim=0), dim=1)
+    
+    def backward_p1(self, dL_dout: torch.Tensor):
+        in_shape = dL_dout.shape
+        self.dL_dout[:] = dL_dout
+        
+        dL_dout = self._back_pass_flatten(dL_dout)
+        self.x_sub_mean = self._back_pass_flatten(self.x_sub_mean)
+        self.norm_x = self._back_pass_flatten(self.norm_x)
+        
+        J = self._flattened_bnorm_jacobian()
+        dL_din = torch.bmm(dL_dout.unsqueeze(1), J)
+        self.x_sub_mean = self._back_pass_unflatten(self.x_sub_mean, in_shape)
+        self.norm_x = self._back_pass_unflatten(self.norm_x, in_shape)
+        return self._back_pass_unflatten(dL_din, in_shape)
+    
+    def backward_p2(self):
+        self.gamma_g[:] = torch.sum(self.dL_dout*self.norm_x, dim=[0,2,3])
+        self.beta_g[:] = torch.sum(self.dL_dout, dim=[0,2,3])
+        
       
 class NLPLayerNorm(Layer):
     def __init__(self, dim: int, dim_size: int, eps:Optional[float]=1e-08):
