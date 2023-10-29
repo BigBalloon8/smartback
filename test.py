@@ -1,22 +1,21 @@
 import torch
+import time
 
-class Dense:
-    def __init__(self, in_size, out_size):
-        self.w = torch.randn(in_size, out_size, requires_grad=True)
-        self.b = torch.zeros(out_size, requires_grad=True)
-        self.input = None
-        
-    def forward(self, x):
-        self.input = x
-        return torch.mm(x, self.w) + self.b
+def f(x,z, n):
+    n2 = n**2
+    return n2*x*z - 1/n
 
-    def backward_p1(self, dL_dout):
-        return torch.autograd.functional.vjp(self.forward, self.input, dL_dout)
+def g(x,z,n,n2):
+    return n2*x*z - 1/n
 
-if __name__ == "__main__":
-    x = torch.randn(1,32)
-    dL_dout = torch.randn(1,10)
-    model = Dense(32, 10)
-    model.forward(x)
-    dL_din = model.backward_p1(dL_dout)
-    print(dL_din)
+s = 1000000
+x, z, n, n2 = torch.randn(s), torch.randn(s), torch.tensor(s), torch.tensor(s)**2
+
+start = time.time_ns()
+torch.vmap(f, in_dims=(0,0,None))(x,z,n)
+int = time.time_ns()
+torch.vmap(g, in_dims=(0,0,None, None))(x, z, n, n2)
+end = time.time_ns()
+
+print((int - start)*10**-9)
+print((end - int)*10**-9)
