@@ -479,8 +479,9 @@ class BatchNorm2D(Layer):
         return out
     
     def _flattened_bnorm_jacobian(self, n):
-        
+        # Jacobian approach is incredibly compute inefficient 
         def _F_Jij(x, z, v, g):
+            print(x.shape, z.shape)
             n2 = n**2
             sqrt_v = torch.sqrt(v)
             # lambda potentially optimizable with sqrt v
@@ -514,15 +515,25 @@ class BatchNorm2D(Layer):
         in_shape = dL_dout.shape
         self.dL_dout[:] = dL_dout
         
-        dL_dout = self._back_pass_flatten(dL_dout)
-        self.x_sub_mean = self._back_pass_flatten(self.x_sub_mean)
-        self.norm_x = self._back_pass_flatten(self.norm_x)
+        #dL_dout = self._back_pass_flatten(dL_dout)
+        #self.x_sub_mean = self._back_pass_flatten(self.x_sub_mean)
+        #self.norm_x = self._back_pass_flatten(self.norm_x)
         
-        J = self._flattened_bnorm_jacobian()
-        dL_din = torch.bmm(dL_dout.unsqueeze(1), J)
-        self.x_sub_mean = self._back_pass_unflatten(self.x_sub_mean, in_shape)
-        self.norm_x = self._back_pass_unflatten(self.norm_x, in_shape)
-        return self._back_pass_unflatten(dL_din, in_shape)
+        #J = self._flattened_bnorm_jacobian(in_shape[0]*in_shape[2]*in_shape[3])
+        #dL_din = torch.bmm(dL_dout.unsqueeze(1), J)
+        #self.x_sub_mean = self._back_pass_unflatten(self.x_sub_mean, in_shape)
+        #self.norm_x = self._back_pass_unflatten(self.norm_x, in_shape)
+        #return self._back_pass_unflatten(dL_din, in_shape)
+        
+        # https://stackoverflow.com/questions/67968913/derivative-of-batchnorm2d-in-pytorch
+        
+        B = in_shape[0]*in_shape[2]*in_shape[3]
+        
+        dL_dxnorm = dL_dout * self.gamma.view(1, -1, 1, 1)
+        dL_dvar = (-0.5 * dL_dxnorm * (self.x_sub_mean)).sum((0, 2, 3), keepdim=True)  * ((self.var) ** -1.5)
+        dL_dmean = (-1.0 / torch.sqrt(self.var) * dL_dxnorm).sum((0, 2, 3), keepdim=True) + (dL_dvar * (-2.0 * (self.x_sub_mean)).sum((0, 2, 3), keepdim=True) / (in_shape[0]*in_shape[2]*in_shape[3]))
+        return (dL_dxnorm / torch.sqrt(self.var)) + (2.0 * dL_dvar * (self.x_sub_mean) / B) + (dL_dmean / B) 
+        
     
     def backward_p2(self):
         self.gamma_g[:] = torch.sum(self.dL_dout*self.norm_x, dim=[0,2,3])
@@ -1138,17 +1149,23 @@ if __name__ == "__main__":
         layer.backward_p1(dL_dout)
         layer.backward_p2()
     
+    def test_conv2D():
+        image = torch.randn(16, 3, 80, 80)
+        conv = Conv2D(3, 16, 3)
+        conv.initial_pass(image)
+        with torch.no_grad():
+            dL_dout = torch.ones_like(conv.forward(image))
+            my_back = conv.backward_p1(dL_dout)
+            conv.backward_p2()
+        true_back = torch.autograd.functional.vjp(conv.forward, image, dL_dout)[1]
+        print(my_back.shape)
+        print(true_back.shape)
+        print(torch.all(my_back == true_back))
+    
     image = torch.randn(16, 3, 80, 80)
-    conv = Conv2D(3, 16, 3)
-    conv.initial_pass(image)
-    with torch.no_grad():
-        dL_dout = torch.ones_like(conv.forward(image))
-        my_back = conv.backward_p1(dL_dout)
-        conv.backward_p2()
-    true_back = torch.autograd.functional.vjp(conv.forward, image, dL_dout)[1]
-    print(my_back.shape)
-    print(true_back.shape)
-    print(torch.all(my_back == true_back))
-    #print(torch.autograd.functional.jvp(conv.forward, image, dL_dout)[1].shape)
+    bn = BatchNorm2D(3)
+    bn.initial_pass(image)
+    bn.backward_p1(torch.ones_like(bn.forward(image)))
+    bn.backward_p2()
         
     
