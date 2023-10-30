@@ -2,7 +2,7 @@ import torch.distributed as dist
 import torch
 from layers import Layer
 
-class BaseModelMP:
+class BaseSequentialMP:
     def __init__(self, *args):
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
@@ -66,7 +66,7 @@ class BaseModelMP:
     def to(self):
         ...
 
-class CustomModelMP:
+class CustomMSequentialMP:
     def __init__(self, *args: Layer):
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()

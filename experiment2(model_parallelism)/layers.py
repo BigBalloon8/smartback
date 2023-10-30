@@ -1,10 +1,10 @@
-from typing import Dict, Optional, Union, Sequence
+from typing import Any, Dict, Optional, Union, Sequence
 from abc import ABC, abstractmethod
 
 import torch
 import torch.nn.functional as F
 from torch import vmap as vmap
-import numpy as np
+
 
 class Layer(ABC):
     def __call__(self, *args, **kwargs):
@@ -28,12 +28,24 @@ class Layer(ABC):
         pass
 
 class Activation(Layer):
+    """
+    Used for Activation functions that dont have parameters
+    """
     def backward_p2(self):
         pass
 
 class Sequential:
     def __init__(self, layers: Sequence[Layer]):
+        """
+        
+
+        Args:
+            layers (Sequence[Layer]): The layers given in order to be executed sequentially
+        """
         self.layers = layers
+        
+    def __call__(self, *args: Any, **kwargs: Any):
+        return self.forward(*args, **kwargs)
     
     def initial_pass(self, x: torch.Tensor):
         if "cuda" in str(x.device):
@@ -105,7 +117,7 @@ class Dense(Layer):
             torch.Tensor: Output tensor after applying the initial pass of the dense layer
         """
         self.inputs = torch.zeros_like(x)
-        x = vmap(lambda x_: torch.mm(x_, self.weights))(x)
+        x = vmap(lambda x_: torch.matmul(x_, self.weights))(x)
         out = torch.add(x, self.bias)
         self.dL_dout = torch.zeros_like(out)
         return out
@@ -121,7 +133,7 @@ class Dense(Layer):
             torch.Tensor: Output tensor after applying dense layer
         """
         self.inputs[:] = x
-        x =  vmap(lambda x_: torch.mm(x_, self.weights))(x)
+        x =  vmap(lambda x_: torch.matmul(x_, self.weights))(x)
         out = torch.add(x, self.bias)
         return out
     
@@ -136,7 +148,7 @@ class Dense(Layer):
             torch.Tensor: Derivative of the loss with respect to the dense layers input
         """
         self.dL_dout[:] = dL_dout
-        return vmap(lambda dl_dout: torch.mm(dl_dout, self.weights.T))(dL_dout)
+        return vmap(lambda dl_dout: torch.matmul(dl_dout, self.weights.T))(dL_dout)
     
     def backward_p2(self):
         """
@@ -324,7 +336,7 @@ class MultiHeadAttention(Layer):
         """
         #TODO change for multihead
         if "cuda" in str(Q.device):
-            self.device = "cuda"
+            self.device = "cuda" 
             self.streams = []
             for _ in range(len(self.linears)):
                 self.streams.append(torch.cuda.Stream())
@@ -344,11 +356,12 @@ class MultiHeadAttention(Layer):
         self.lK = torch.zeros_like(lK)
         self.lV = torch.zeros_like(lV)
     
-        lQ = torch.cat(lQ.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        lQ = torch.cat(lQ.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)  # should use view
         lK = torch.cat(lK.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         lV = torch.cat(lV.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        self.inv_sqrt_d = lK.shape[-1]**(-1/2)
+        QK_T = vmap(lambda q, k: torch.bmm(q, torch.transpose(k, -1, -2)), in_dims=-2, out_dims=-2)(lQ, lK) * self.inv_sqrt_d
         
-        QK_T = vmap(lambda q, k: torch.bmm(q, torch.transpose(k, -1, -2)), in_dims=-2, out_dims=-2)(lQ, lK)
         if mask:
             QK_T = vmap(lambda x: x + mask, in_dims=-2, out_dims=-2)(QK_T)
         sQK_T = torch.softmax(QK_T, dim=-1)
@@ -385,7 +398,7 @@ class MultiHeadAttention(Layer):
         lK = torch.cat(self.lK.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         lV = torch.cat(self.lV.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         
-        QK_T = vmap(lambda q, k: torch.bmm(q, torch.transpose(k, -1, -2)), in_dims=-2, out_dims=-2)(lQ, lK)
+        QK_T = vmap(lambda q, k: torch.bmm(q, torch.transpose(k, -1, -2)), in_dims=-2, out_dims=-2)(lQ, lK) * self.inv_sqrt_d
         if mask:
             QK_T = vmap(lambda x: x + mask, in_dims=-2, out_dims=-2)(QK_T)
         torch.softmax(QK_T, dim=-1, out=self.sQK_T) #TODO add inplace update
@@ -435,7 +448,7 @@ class MultiHeadAttention(Layer):
         
         # vmap across 3 dims BxCxH 
         J_sQKT = vmap(vmap(vmap(self._softmax_jacobian)))(self.sQK_T)  # sQK_T.shape -> BxCxHxC 
-        dL_dQKT = torch.squeeze(vmap(vmap(vmap(torch.mm)))(dL_dsQKT.unsqueeze(-2), J_sQKT))
+        dL_dQKT = torch.squeeze(vmap(vmap(vmap(torch.mm)))(dL_dsQKT.unsqueeze(-2), J_sQKT)) * self.inv_sqrt_d
         
         lK = torch.cat(self.lK.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         lQ = torch.cat(self.lQ.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
@@ -469,6 +482,29 @@ class MultiHeadAttention(Layer):
 #TODO will have to update for 3D parallelism (DP)
 class BatchNorm2D(Layer):
     def __init__(self, in_channels: int, eps: float=1e-05, momentum =0.1):
+        """
+        Initializes a BatchNorm2D layer
+
+        Args:
+            in_channels (int): the number of input channels of the forward input 
+            eps (float, optional): eps used to prevent div by 0. Defaults to 1e-05.
+            momentum (float, optional): the value used for the running_mean and running_var computation. Defaults to 0.1.
+        
+        Attributes:
+            in_channels (int): the number of input channels of the forward input 
+            eps (float, optional): eps used to prevent div by 0. Defaults to 1e-05.
+            momentum (float, optional): the value used for the running_mean and running_var computation. Defaults to 0.1.
+            gamma (torch.Tensor): the scaling factor of the input
+            beta (torch.Tensor): the bias of the input
+            gamma_g (torch.Tensor): the gradient of the scaling factor of the input
+            beta_g (torch.Tensor): the gradient of the bias of the input
+            r_mean (torch.Tensor): the running mean of the input
+            r_var (torch.Tensor): the running variance of the input
+            training (bool): whether the layer is in training mode or not
+            x_sub_mean (torch.Tensor): the input minus the running mean
+            var (torch.Tensor): the variance of the input
+            norm_x (torch.Tensor): the normalized input\
+        """
         self.eps = eps
         self.momentum = momentum
         self.in_channels = in_channels
@@ -485,6 +521,15 @@ class BatchNorm2D(Layer):
         self.training = True
         
     def initial_pass(self, x:torch.Tensor):
+        """
+        Performs an initial forward pass to initialize intermediate tensors
+
+        Args:
+            x (torch.Tensor): Input Tensor
+
+        Returns:
+            torch.Tensor: The output of the BAtchNorm2D Layer
+        """
         if self.training:
             mean = x.mean(dim=[0,2,3], keepdim=True)
             var = ((x-mean)**2).mean(dim=[0,2,3], keepdim=True)
@@ -502,6 +547,15 @@ class BatchNorm2D(Layer):
         return out
     
     def forward(self, x: torch.Tensor):
+        """
+        Performs a forward pass through the batchNorm2D
+
+        Args:
+            x (torch.Tensor): Input tensor
+
+        Returns:
+            torch.Tensor: The output of the BAtchNorm2D Layer
+        """
         if self.training:
             mean = x.mean(dim=[0,2,3], keepdim=True)
             var = ((x-mean)**2).mean(dim=[0,2,3], keepdim=True)
@@ -516,53 +570,19 @@ class BatchNorm2D(Layer):
         out = self.gamma.view(1, self.in_channels, 1, 1)*self.norm_x + self.beta.view(1, self.in_channels, 1, 1)
         return out
     
-    def _flattened_bnorm_jacobian(self, n):
-        # Jacobian approach is incredibly compute inefficient 
-        def _F_Jij(x, z, v, g):
-            print(x.shape, z.shape)
-            n2 = n**2
-            sqrt_v = torch.sqrt(v)
-            # lambda potentially optimizable with sqrt v
-            f = lambda __x, __z: g*(-(sqrt_v/n)-__z*((__x)/n2))/v
-            def i_for_j(_x, _z):
-                return vmap(f, in_dims=(None, 0))(_x, _z)
-            return vmap(i_for_j, in_dims=(0,None))(x, z)
-        
-        def _F_Jii(x, z, v, g):
-            n2 = n**2
-            sqrt_v = torch.sqrt(v)
-            f = lambda __x, __z: g*(1-(sqrt_v/n)-__z*((__x)/n2))/v
-            return vmap(f, in_dims=(0,0))(x, z)
-
-        def _diag_set(jac, _diag):
-            jac.diagonal()[:]= _diag
-            return jac
-        
-        jac_base = vmap(_F_Jij)(self.x_sub_mean, self.norm_x, self.var.squeeze(), self.gamma)
-        diag = vmap(_F_Jii)(self.x_sub_mean, self.norm_x, self.var.squeeze(), self.gamma)
-        return vmap(_diag_set)(jac_base, diag)
-    
-    def _back_pass_flatten(self, x):
-        return torch.stack(torch.chunk(x, x.shape[1], dim= 1)).squeeze().flatten(1, -1)
-        
-    def _back_pass_unflatten(self, x, in_shape):
-        unflatten_shape = (in_shape[1], in_shape[0], in_shape[2], in_shape[3])
-        return torch.cat(torch.chunk(x.reshape(*unflatten_shape), in_shape[1], dim=0), dim=1)
     
     def backward_p1(self, dL_dout: torch.Tensor):
+        """
+        Takes the derivative of the loss with respect to the BatchNorm2D output and returns the derivative of the loss with respect to the BatchNorm2D input
+
+        Args:
+            dL_dout (torch.Tensor): The derivative of the loss with respect to the BatchNorm2D output
+
+        Returns:
+            torch.Tensor: The derivatives of the loss with respect to the BatchNorm2D inputs
+        """
         in_shape = dL_dout.shape
         self.dL_dout[:] = dL_dout
-        
-        #dL_dout = self._back_pass_flatten(dL_dout)
-        #self.x_sub_mean = self._back_pass_flatten(self.x_sub_mean)
-        #self.norm_x = self._back_pass_flatten(self.norm_x)
-        
-        #J = self._flattened_bnorm_jacobian(in_shape[0]*in_shape[2]*in_shape[3])
-        #dL_din = torch.bmm(dL_dout.unsqueeze(1), J)
-        #self.x_sub_mean = self._back_pass_unflatten(self.x_sub_mean, in_shape)
-        #self.norm_x = self._back_pass_unflatten(self.norm_x, in_shape)
-        #return self._back_pass_unflatten(dL_din, in_shape)
-        
         # https://stackoverflow.com/questions/67968913/derivative-of-batchnorm2d-in-pytorch
         
         B = in_shape[0]*in_shape[2]*in_shape[3]
@@ -574,6 +594,9 @@ class BatchNorm2D(Layer):
         
     
     def backward_p2(self):
+        """
+        Calculates the gradients of the parameters in the BatchNorm2D
+        """
         self.gamma_g[:] = torch.sum(self.dL_dout*self.norm_x, dim=[0,2,3])
         self.beta_g[:] = torch.sum(self.dL_dout, dim=[0,2,3])
         
@@ -1176,9 +1199,24 @@ class AvgPool2D(Layer):
         pass
 
 class BasicResNetBlock(Layer):
-    # For Reference https://github.com/henryqin1997/CIFAR10-ResNet50-PyTorch/blob/master/models/resnet.py
     expansion = 1
     def __init__(self, in_channels: int, out_channels: int, stride: int=1):
+        """
+        Initializes a Basic ResNet Block.
+
+        Args:
+            in_channels (int): Number of input channels
+            out_channels (int): Number of output channels
+            stride (int, optional): he stride pattern followed by the kernel of the first conv layer. Defaults to 1.
+        
+        Attributes:
+            convs (List[Conv2D]): List of Conv2D layers
+            batchnorms (List[BatchNorm2D]): List of BatchNorm2D layers)
+            relus (List[ReLU]): List of ReLU layers])
+            shortcut (List[Layer]): List of layers that are used to connect the input and output of the Basic ResNet Block
+            streams (List[torch.cuda.Stream]): List of streams used to parallelize the execution of the Basic ResNet Block
+            device (str): Device used to parallelize the execution of the Basic ResNet Block
+        """
         self.convs = [Conv2D(in_channels, out_channels, 3, stride=stride, padding=1, bias=False),
                       Conv2D(out_channels, out_channels, 3, stride=1, padding=1, bias=False)
                       ]
@@ -1194,24 +1232,42 @@ class BasicResNetBlock(Layer):
             self.shortcut = []
     
     def initial_pass(self, x: torch.Tensor):
+        """
+        Performs an initial pass through the BasicResNetBlock and generates all intermediates 
+
+        Args:
+            x (torch.Tensor): Input tensor
+
+        Returns:
+            torch.Tensor: Output tensor
+        """
         if "cuda" in x.device.type:
             self.streams = []
             self.device = "cuda"
             for _ in range(len(self.convs) + len(self.batchnorms) + len(self.shortcut)):
                 self.streams.append(torch.cuda.Stream())
         else:
-            pass
-        out = self.convs[0](x)
-        out = self.batchnorms[0](out)
-        out = self.relus[0](out)
-        out = self.convs[1](out)
-        out = self.batchnorms[1](out)
+            self.device = "cpu"
+        out = self.convs[0].initial_pass(x)
+        out = self.batchnorms[0].initial_pass(out)
+        out = self.relus[0].initial_pass(out)
+        out = self.convs[1].initial_pass(out)
+        out = self.batchnorms[1].initial_pass(out)
         if self.shortcut:
             for layer in self.shortcut:
-                x = layer(x)
-        return self.relus[1](out + x)
+                x = layer.initial_pass(x)
+        return self.relus[1].initial_pass(out + x)
     
     def forward(self, x: torch.Tensor):
+        """
+        Preforms a forward pass through the BasicResNetBlock
+
+        Args:
+            x (torch.Tensor): Input tensor
+
+        Returns:
+            torch.Tensor: Output tensor
+        """
         out = self.convs[0](x)
         out = self.batchnorms[0](out)
         out = self.relus[0](out)
@@ -1223,6 +1279,15 @@ class BasicResNetBlock(Layer):
         return self.relus[1](out + x)
     
     def backward_p1(self, dL_dout: torch.Tensor):
+        """
+        Takes the derivative of the loss with respect to the BasicResNetBlock's output and returns the derivative of the loss with respect to the BasicResNetBlock's input
+
+        Args:
+            dL_dout (torch.Tensor): derivative of the loss with respect to theBasicResNetBlock's output
+
+        Returns:
+            torch.Tensor: derivative of the loss with respect to the BasicResNetBlock's input
+        """
         dL_dshortcut = self.relus[1].backward_p1(dL_dout)
         dL_dconv1 = self.batchnorms[1].backward_p1(dL_dshortcut)
         dL_drelu0 = self.convs[1].backward_p1(dL_dconv1)
@@ -1237,11 +1302,47 @@ class BasicResNetBlock(Layer):
         return dL_din1 + dL_din2
         
     def backward_p2(self):
-        ...
+        """
+        calcualtes the gardients of the parameter within the BasicResNetBlock
+        """
+        if self.device == "cuda":
+            for i, layer in enumerate(self.convs):
+                with torch.cuda.stream(self.streams[i]):
+                    layer.backward_p2()
+            for i, layer in enumerate(self.batchnorms):
+                with torch.cuda.stream(self.streams[i+len(self.convs)]):
+                    layer.backward_p2()
+            for i, layer in enumerate(self.shortcut):
+                with torch.cuda.stream(self.streams[i+len(self.convs)+len(self.batchnorms)]):
+                    layer.backward_p2()
+        else:
+            for i, layer in enumerate(self.convs):
+                layer.backward_p2()
+            for i, layer in enumerate(self.batchnorms):
+                layer.backward_p2()
+            for i, layer in enumerate(self.shortcut):
+                layer.backward_p2()
+            
 
 class ResNetBottleneck(Layer):
     expansion = 4
     def __init__(self, in_channels: int, out_channels: int, stride: int=1):
+        """
+        Initializes a Basic ResNet Block.
+
+        Args:
+            in_channels (int): Number of input channels
+            out_channels (int): Number of output channels
+            stride (int, optional): he stride pattern followed by the kernel of the first conv layer. Defaults to 1.
+        
+        Attributes:
+            convs (List[Conv2D]): List of Conv2D layers
+            batchnorms (List[BatchNorm2D]): List of BatchNorm2D layers)
+            relus (List[ReLU]): List of ReLU layers])
+            shortcut (List[Layer]): List of layers that are used to connect the input and output of the Basic ResNet Block
+            streams (List[torch.cuda.Stream]): List of streams used to parallelize the execution of the Basic ResNet Block
+            device (str): Device used to parallelize the execution of the Basic ResNet Block
+        """
         self.convs = [Conv2D(in_channels, out_channels, 1, bias=False),
                       Conv2D(out_channels, out_channels, 3, stride=stride, padding=1, bias=False),
                       Conv2D(out_channels, self.expansion*out_channels, 1, bias=False)
@@ -1257,8 +1358,50 @@ class ResNetBottleneck(Layer):
                              ]
         else:
             self.shortcut = []
+    
+    def initial_pass(self, x:torch.Tensor):
+        """
+        Performs an initial pass through the ResNetBottleneck and generates all intermediates 
+
+        Args:
+            x (torch.Tensor): Input tensor
+
+        Returns:
+            torch.Tensor: Output tensor
+        """
+        if "cuda" in x.device.type:
+            self.streams = []
+            self.device = "cuda"
+            for _ in range(len(self.convs) + len(self.batchnorms) + len(self.shortcut)):
+                self.streams.append(torch.cuda.Stream())
+        else:
+            self.device = "cpu"
+        
+        out = self.convs[0].initial_pass(x)
+        out = self.batchnorms[0].initial_pass(out)
+        out = self.relus[0].initial_pass(out)
+        out = self.convs[1].initial_pass(out)
+        out = self.batchnorms[1].initial_pass(out)
+        out = self.relus[1].initial_pass(out)
+        out = self.convs[2].initial_pass(out)
+        out = self.batchnorms[2].initial_pass(out)
+        
+        if self.shortcut:
+            for layer in self.shortcut:
+                x = layer.initial_pass(x)
+                
+        return self.relus[2].initial_pass(out + x)
             
     def forward(self, x: torch.Tensor):
+        """
+        Preforms a forward pass through the ResNetBottleneck
+
+        Args:
+            x (torch.Tensor): Input tensor
+
+        Returns:
+            torch.Tensor: Output tensor
+        """
         out = self.convs[0](x)
         out = self.batchnorms[0](out)
         out = self.relus[0](out)
@@ -1275,6 +1418,15 @@ class ResNetBottleneck(Layer):
         return self.relus[2](out + x)
     
     def backward_p1(self, dL_dout):
+        """
+        Takes the derivative of the loss with respect to the ResNetBottleneck's output and returns the derivative of the loss with respect to the ResNetBottleneck's input
+
+        Args:
+            dL_dout (torch.Tensor): derivative of the loss with respect to the ResNetBottleneck's output
+
+        Returns:
+            torch.Tensor: derivative of the loss with respect to the ResNetBottleneck's input
+        """
         dL_dshortcut = self.relus[2].backward_p1(dL_dout)
         dL_dconv2 = self.batchnorms[2].backward_p1(dL_dshortcut)
         dL_drelu1 = self.convs[2].backward_p1(dL_dconv2)
@@ -1290,9 +1442,33 @@ class ResNetBottleneck(Layer):
             dL_din2 = layer.backward_p1(dL_din2)
         
         return dL_din1 + dL_din2
+
+    def backward_p2(self):
+        """
+        Calculaes the gradients of the parameters within the ResNetBottleneck
+        """
+        if self.device == "cuda":
+            for i, layer in enumerate(self.convs):
+                with torch.cuda.stream(self.streams[i]):
+                    layer.backward_p2()
+            for i, layer in enumerate(self.batchnorms):
+                with torch.cuda.stream(self.streams[i+len(self.convs)]):
+                    layer.backward_p2()
+            for i, layer in enumerate(self.shortcut):
+                with torch.cuda.stream(self.streams[i+len(self.convs)+len(self.batchnorms)]):
+                    layer.backward_p2()
+        
+        if self.device == "cpu":
+            for layer in self.convs:
+                layer.backward_p2()
+            for layer in self.batchnorms:
+                layer.backward_p2()
+            for layer in self.shortcut:
+                layer.backward_p2()
         
 class ResNet(Layer):
-    # needs to be parallised just for testing
+    # For Reference https://github.com/henryqin1997/CIFAR10-ResNet50-PyTorch/blob/master/models/resnet.py
+    # Needs to be parallised just for testing
     def __init__(self, block: Union[BasicResNetBlock , ResNetBottleneck], num_blocks: list, num_classes: int=10):
         self.in_planes = 64
         
@@ -1317,18 +1493,27 @@ class ResNet(Layer):
             self.in_planes = planes * block.expansion
         return Sequential(layers)
     
-    def initial_pass(self):
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-        out = self.layers1(out)
-        out = self.layers2(out)
-        out = self.layers3(out)
-        out = self.layers4(out)
-        out = self.avgpool(out)
+    def initial_pass(self, x:torch.Tensor):
+        self.streams = []
+        if "cuda" in x.device.type:
+            self.device = "cuda"
+            for _ in range(3):  # conv1, bn1, dense
+                self.streams.append(torch.cuda.Stream())
+            for _ in range(4):  # layers
+                self.streams.append(torch.cuda.Stream())
+        else:
+            self.device = "cpu"
+        out = self.conv1.initial_pass(x)
+        out = self.bn1.initial_pass(out)
+        out = self.relu.initial_pass(out)
+        out = self.layers1.initial_pass(out)
+        out = self.layers2.initial_pass(out)
+        out = self.layers3.initial_pass(out)
+        out = self.layers4.initial_pass(out)
+        out = self.avgpool.initial_pass(out)
         self.preflattened = out.shape
         out = out.view(out.size(0), -1)
-        out = self.linear(out)
+        out = self.linear.initial_pass(out)
         return out
         
     def forward(self, x: torch.Tensor):
@@ -1345,7 +1530,7 @@ class ResNet(Layer):
         return out
     
     def backward_p1(self, dL_dout):
-        dL_davgpool = self.avgpool.backward_p1(dL_dout)
+        dL_davgpool = self.linear.backward_p1(dL_dout)
         dL_davgpool = dL_davgpool.view(*self.preflattened)
         dL_dl4 = self.avgpool.backward_p1(dL_davgpool)
         dL_dl3 = self.layers4.backward_p1(dL_dl4)
@@ -1357,7 +1542,26 @@ class ResNet(Layer):
         return self.conv1.backward_p1(dL_dconv)
     
     def backward_p2(self):
-        ...
+        with self.streams[0]:
+            self.conv1.backward_p2()
+        with self.streams[1]:
+            self.bn1.backward_p2()
+        with self.streams[2]:
+            self.linear.backward_p2()
+        with self.streams[3]:
+            self.layers1.backward_p2()
+        with self.streams[4]:
+            self.layers2.backward_p2()
+        with self.streams[5]:
+            self.layers3.backward_p2()
+        with self.streams[6]:
+            self.layers4.backward_p2()
+    
+    
+class llamaFF(Layer):
+    def __init__(self, dim, hidden_dim, multiple_of, ffn_dim__multiplier = None):
+        hidden_dim = int(2 * hidden_dim / 3)
+        
         
         
 
@@ -1387,12 +1591,17 @@ if __name__ == "__main__":
     
     
     def test_resnet():
-        image = torch.randn(16, 3, 80, 80)
-        resnet18 = ResNet(ResNetBottleneck, [3, 4, 6, 3])
+        image = torch.randn(16, 3, 32, 32)
+        resnet18 = ResNet(BasicResNetBlock, [2, 2, 2, 2])
         with torch.no_grad():
             resnet18.initial_pass(image)
             res = resnet18.forward(image)
             dL_dout = torch.ones_like(res)
-            resnet18.backward_p1(dL_dout)
+            my_back = resnet18.backward_p1(dL_dout)
+        true_back = torch.autograd.functional.vjp(resnet18.forward, image, dL_dout)[1]
+        #print(my_back == true_back)
+        print(my_back[0,0,0])
+        print(true_back[0,0,0])
         
+    test_resnet()
     
