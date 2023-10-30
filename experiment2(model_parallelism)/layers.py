@@ -1556,11 +1556,82 @@ class ResNet(Layer):
             self.layers3.backward_p2()
         with self.streams[6]:
             self.layers4.backward_p2()
+
+
+class SiLU(Activation):
+    def initial_pass(self, x:torch.Tensor):
+        self.inputs = x
+        return x / (1+torch.exp(-x))
+        
+    def forward(self, x: torch.Tensor):
+        self.inputs[:] = x
+        return x * torch.sigmoid(x)
+
+    def backward_p1(self, dL_dout: torch.Tensor):
+        e_x = torch.exp(-self.inputs)
+        return dL_dout * ((1+e_x) + self.inputs*e_x)/((1+e_x)**2)
     
-    
+    def backward_p2(self):
+        pass
+
+
 class llamaFF(Layer):
-    def __init__(self, dim, hidden_dim, multiple_of, ffn_dim__multiplier = None):
+    def __init__(self, dim, hidden_dim, multiple_of, ffn_dim_multiplier = None):
         hidden_dim = int(2 * hidden_dim / 3)
+        
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+        
+        self.linears = [
+            Dense(dim, hidden_dim),
+            Dense(hidden_dim, dim),
+            Dense(dim, hidden_dim)
+        ]
+        
+        self.silu = SiLU()
+        
+    def initial_pass(self, x:torch.Tensor):
+        if "cuda" in x.device.type:
+            self.device = "cuda"
+            for _ in range(3):  # 3 dense
+                self.streams.append(torch.cuda.Stream())
+        else:
+            self.device = "cpu"
+        l0 = self.linears[0].initial_pass(x)
+        l2 = self.linears[2].initial_pass(x)
+        self.l2 = l2
+        silu_out = self.silu.initial_pass(l0)
+        self.silu_out = silu_out
+        return self.linears[1].initial_pass(silu_out*l2)
+    
+    def forward(self, x: torch.Tensor):
+        l0 = self.linears[0](x)
+        l2 = self.linears[2](x)
+        self.l2[:] = l2
+        silu_out = self.silu.initial_pass(l0)
+        self.silu_out[:] = silu_out
+        return self.linears[1](self.silu(l0)*l2)
+    
+    def backward_p1(self, dL_dout:torch.Tensor):
+        dL_dl2in = self.linears[1].backward_p1(dL_dout)
+        dL_dl0 = self.silu.backward_p1(dL_dl2in)
+        dL_dx1 = self.linears[0].backward_p1(dL_dl0) * self.l2
+        dL_dx2 = self.linears[2].backward_p1(dL_dl0) * self.silu_out
+        return dL_dx1 + dL_dx2
+    
+    def backward_p2(self):
+        if self.device == "cuda":  
+            for l, s in zip(self.linears, self.streams):
+                with s:
+                    l.backward_p2()
+        else:
+            for l in self.linears:
+                l.backward_p2()
+        
+        
+        
+        
         
         
         
@@ -1588,7 +1659,6 @@ if __name__ == "__main__":
         print(my_back.shape)
         print(true_back.shape)
         print(torch.all(my_back == true_back))
-    
     
     def test_resnet():
         image = torch.randn(16, 3, 32, 32)
