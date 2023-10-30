@@ -28,7 +28,45 @@ class Layer(ABC):
         pass
 
 class Activation(Layer):
-    pass
+    def backward_p2(self):
+        pass
+
+class Sequential:
+    def __init__(self, layers: Sequence[Layer]):
+        self.layers = layers
+    
+    def initial_pass(self, x: torch.Tensor):
+        if "cuda" in str(x.device):
+            self.device = "cuda"
+            self.streams = []
+            for layer in self.layers:
+                self.streams.append(torch.cuda.Stream())
+        else:
+            self.device = "cpu"
+        
+        for layer in self.layers:
+            x = layer.initial_pass(x)
+        
+        return x
+    
+    def forward(self, x: torch.Tensor):
+        for layer in self.layers:
+            x = layer.forward(x)
+        return x
+    
+    def backward_p1(self, dL_dout: torch.Tensor):
+        for layer in self.layers[::-1]:
+            dL_dout = layer.backward_p1(dL_dout)
+        return dL_dout
+    
+    def backward_p2(self):
+        if self.device == "cuda":
+            for i, layer in enumerate(self.layers):
+                with torch.cuda.stream(self.streams[i]):
+                    layer.backward_p2()
+        else:
+            for layer in self.layers:
+                layer.backward_p2()
     
 
 
@@ -123,7 +161,7 @@ class Dense(Layer):
             raise Exception("ndim of input to Dense not supported")
 
 
-class Relu(Activation):
+class ReLU(Activation):
     def initial_pass(self, x: torch.Tensor):
         """
         Performs an initial forward pass to initialize intermediate tensors
@@ -770,7 +808,7 @@ class NLPRMSNorm(Layer):
 
         
 class BertBlock(Layer):
-    def __init__(self, emb_dim: int, num_heads: int, dim_ff:int, activation:Layer=Relu, eps:float=1e-08, p:float=0.1):
+    def __init__(self, emb_dim: int, num_heads: int, dim_ff:int, activation:Layer=ReLU, eps:float=1e-08, p:float=0.1):
         """
         Initialize BERT block
 
@@ -778,7 +816,7 @@ class BertBlock(Layer):
             emb_dim (int): size of the embedding dim
             num_heads (int): number of heads in the multihead attention
             dim_ff (int): size of hidden dim in the ffn
-            activation (Layer, optional): activation function used on hidden layer in ffn. Defaults to Relu.
+            activation (Layer, optional): activation function used on hidden layer in ffn. Defaults to ReLU.
             eps (float, optional): the eps used in the layer norms. Defaults to 1e-08.
             p (float, optional): the probability used in the dropouts. Defaults to 0.1.
         
@@ -991,7 +1029,7 @@ class Conv2D(Layer):
         Computes the gradients of the parameter within the Conv2D layer
         """
         if isinstance(self.bias, torch.Tensor):
-            self.bias_g[:] = torch.sum(dL_dout, dim=(0, 2, 3))
+            self.bias_g[:] = torch.sum(self.dL_dout, dim=(0, 2, 3))
         def _dL_dk_fn(feature, kernal, stride, padding):
             return F.conv2d(feature, kernal, stride=stride, padding=padding).squeeze(0)
         self.kernel_g[:] = torch.sum(vmap(vmap(vmap(_dL_dk_fn, in_dims=(0, None)), in_dims=(None, 0)))(self.inputs.unsqueeze(-3), self.dL_dout.unsqueeze(-3).unsqueeze(-3), stride=self.stride, padding=self.padding),dim=0)
@@ -1136,6 +1174,191 @@ class AvgPool2D(Layer):
     
     def backward_p2(self):
         pass
+
+class BasicResNetBlock(Layer):
+    # For Reference https://github.com/henryqin1997/CIFAR10-ResNet50-PyTorch/blob/master/models/resnet.py
+    expansion = 1
+    def __init__(self, in_channels: int, out_channels: int, stride: int=1):
+        self.convs = [Conv2D(in_channels, out_channels, 3, stride=stride, padding=1, bias=False),
+                      Conv2D(out_channels, out_channels, 3, stride=1, padding=1, bias=False)
+                      ]
+        self.batchnorms = [BatchNorm2D(out_channels),
+                           BatchNorm2D(out_channels)
+                           ]
+        self.relus = [ReLU(), ReLU()]
+        if stride != 1 or in_channels != out_channels*self.expansion:
+            self.shortcut = [Conv2D(in_channels, out_channels*self.expansion, 1, stride=stride, bias=False),
+                             BatchNorm2D(out_channels*self.expansion)
+                             ]
+        else:
+            self.shortcut = []
+    
+    def initial_pass(self, x: torch.Tensor):
+        if "cuda" in x.device.type:
+            self.streams = []
+            self.device = "cuda"
+            for _ in range(len(self.convs) + len(self.batchnorms) + len(self.shortcut)):
+                self.streams.append(torch.cuda.Stream())
+        else:
+            pass
+        out = self.convs[0](x)
+        out = self.batchnorms[0](out)
+        out = self.relus[0](out)
+        out = self.convs[1](out)
+        out = self.batchnorms[1](out)
+        if self.shortcut:
+            for layer in self.shortcut:
+                x = layer(x)
+        return self.relus[1](out + x)
+    
+    def forward(self, x: torch.Tensor):
+        out = self.convs[0](x)
+        out = self.batchnorms[0](out)
+        out = self.relus[0](out)
+        out = self.convs[1](out)
+        out = self.batchnorms[1](out)
+        if self.shortcut:
+            for layer in self.shortcut:
+                x = layer(x)
+        return self.relus[1](out + x)
+    
+    def backward_p1(self, dL_dout: torch.Tensor):
+        dL_dshortcut = self.relus[1].backward_p1(dL_dout)
+        dL_dconv1 = self.batchnorms[1].backward_p1(dL_dshortcut)
+        dL_drelu0 = self.convs[1].backward_p1(dL_dconv1)
+        dL_dbn0 = self.relus[0].backward_p1(dL_drelu0)
+        dL_dconv0 = self.batchnorms[0].backward_p1(dL_dbn0)
+        dL_din1 = self.convs[0].backward_p1(dL_dconv0)
+        
+        dL_din2 = dL_dshortcut
+        for layer in self.shortcut[::-1]:
+            dL_din2 = layer.backward_p1(dL_din2)
+        
+        return dL_din1 + dL_din2
+        
+    def backward_p2(self):
+        ...
+
+class ResNetBottleneck(Layer):
+    expansion = 4
+    def __init__(self, in_channels: int, out_channels: int, stride: int=1):
+        self.convs = [Conv2D(in_channels, out_channels, 1, bias=False),
+                      Conv2D(out_channels, out_channels, 3, stride=stride, padding=1, bias=False),
+                      Conv2D(out_channels, self.expansion*out_channels, 1, bias=False)
+                      ]
+        self.batchnorms = [BatchNorm2D(out_channels),
+                           BatchNorm2D(out_channels),
+                           BatchNorm2D(self.expansion*out_channels)
+                           ]
+        self.relus = [ReLU(), ReLU(), ReLU()]
+        if stride != 1 or in_channels != out_channels*self.expansion:
+            self.shortcut = [Conv2D(in_channels, out_channels*self.expansion, 1, stride=stride, bias=False),
+                             BatchNorm2D(out_channels*self.expansion)
+                             ]
+        else:
+            self.shortcut = []
+            
+    def forward(self, x: torch.Tensor):
+        out = self.convs[0](x)
+        out = self.batchnorms[0](out)
+        out = self.relus[0](out)
+        out = self.convs[1](out)
+        out = self.batchnorms[1](out)
+        out = self.relus[1](out)
+        out = self.convs[2](out)
+        out = self.batchnorms[2](out)
+        
+        if self.shortcut:
+            for layer in self.shortcut:
+                x = layer(x)
+                
+        return self.relus[2](out + x)
+    
+    def backward_p1(self, dL_dout):
+        dL_dshortcut = self.relus[2].backward_p1(dL_dout)
+        dL_dconv2 = self.batchnorms[2].backward_p1(dL_dshortcut)
+        dL_drelu1 = self.convs[2].backward_p1(dL_dconv2)
+        dL_dbn1 = self.relus[1].backward_p1(dL_drelu1)
+        dL_dconv1 = self.batchnorms[1].backward_p1(dL_dbn1)
+        dL_drelu0 = self.convs[1].backward_p1(dL_dconv1)
+        dL_dbn0 = self.relus[0].backward_p1(dL_drelu0)
+        dL_dconv0 = self.batchnorms[0].backward_p1(dL_dbn0)
+        dL_din1 = self.convs[0].backward_p1(dL_dconv0)
+        
+        dL_din2 = dL_dshortcut
+        for layer in self.shortcut[::-1]:
+            dL_din2 = layer.backward_p1(dL_din2)
+        
+        return dL_din1 + dL_din2
+        
+class ResNet(Layer):
+    # needs to be parallised just for testing
+    def __init__(self, block: Union[BasicResNetBlock , ResNetBottleneck], num_blocks: list, num_classes: int=10):
+        self.in_planes = 64
+        
+        self.conv1 = Conv2D(3, 64, 3, stride=1, padding=1, bias=False)
+        self.bn1 = BatchNorm2D(64)
+        
+        self.layers1 = self._make_layer(block, 64, num_blocks[0], stride=1)
+        self.layers2 = self._make_layer(block, 128, num_blocks[1], stride=2)
+        self.layers3 = self._make_layer(block, 256, num_blocks[2], stride=2)
+        self.layers4 = self._make_layer(block, 512, num_blocks[3], stride=2)
+        
+        self.linear = Dense(512*block.expansion, num_classes)
+        
+        self.relu = ReLU()
+        self.avgpool = AvgPool2D(4)
+    
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1]*(num_blocks-1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return Sequential(layers)
+    
+    def initial_pass(self):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.layers1(out)
+        out = self.layers2(out)
+        out = self.layers3(out)
+        out = self.layers4(out)
+        out = self.avgpool(out)
+        self.preflattened = out.shape
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+        
+    def forward(self, x: torch.Tensor):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.layers1(out)
+        out = self.layers2(out)
+        out = self.layers3(out)
+        out = self.layers4(out)
+        out = self.avgpool(out)
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
+    
+    def backward_p1(self, dL_dout):
+        dL_davgpool = self.avgpool.backward_p1(dL_dout)
+        dL_davgpool = dL_davgpool.view(*self.preflattened)
+        dL_dl4 = self.avgpool.backward_p1(dL_davgpool)
+        dL_dl3 = self.layers4.backward_p1(dL_dl4)
+        dL_dl2 = self.layers3.backward_p1(dL_dl3)
+        dL_dl1 = self.layers2.backward_p1(dL_dl2)
+        dL_drelu = self.layers1.backward_p1(dL_dl1)
+        dL_dbn = self.relu.backward_p1(dL_drelu)
+        dL_dconv = self.bn1.backward_p1(dL_dbn)
+        return self.conv1.backward_p1(dL_dconv)
+    
+    def backward_p2(self):
+        ...
+        
         
 
 if __name__ == "__main__":
@@ -1162,10 +1385,14 @@ if __name__ == "__main__":
         print(true_back.shape)
         print(torch.all(my_back == true_back))
     
-    image = torch.randn(16, 3, 80, 80)
-    bn = BatchNorm2D(3)
-    bn.initial_pass(image)
-    bn.backward_p1(torch.ones_like(bn.forward(image)))
-    bn.backward_p2()
+    
+    def test_resnet():
+        image = torch.randn(16, 3, 80, 80)
+        resnet18 = ResNet(ResNetBottleneck, [3, 4, 6, 3])
+        with torch.no_grad():
+            resnet18.initial_pass(image)
+            res = resnet18.forward(image)
+            dL_dout = torch.ones_like(res)
+            resnet18.backward_p1(dL_dout)
         
     
