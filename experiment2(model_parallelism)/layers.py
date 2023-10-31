@@ -401,7 +401,11 @@ class MultiHeadAttention(Layer):
         QK_T = vmap(lambda q, k: torch.bmm(q, torch.transpose(k, -1, -2)), in_dims=-2, out_dims=-2)(lQ, lK) * self.inv_sqrt_d
         if mask:
             QK_T = vmap(lambda x: x + mask, in_dims=-2, out_dims=-2)(QK_T)
-        torch.softmax(QK_T, dim=-1, out=self.sQK_T) #TODO add inplace update
+        def _softmax(x):
+            e_x = torch.exp(x)
+            return e_x / torch.sum(e_x)
+        self.sQK_T[:] = vmap(vmap(_softmax))(QK_T)
+        #torch.softmax(QK_T, dim=-1, out=self.sQK_T) #TODO add inplace update
         
         out = vmap(lambda qk_t, v: torch.bmm(qk_t, v), in_dims=-2, out_dims=-2)(self.sQK_T, lV)
         out = torch.flatten(out, -2, -1)
@@ -449,7 +453,6 @@ class MultiHeadAttention(Layer):
         # vmap across 3 dims BxCxH 
         J_sQKT = vmap(vmap(vmap(self._softmax_jacobian)))(self.sQK_T)  # sQK_T.shape -> BxCxHxC 
         dL_dQKT = torch.squeeze(vmap(vmap(vmap(torch.mm)))(dL_dsQKT.unsqueeze(-2), J_sQKT)) * self.inv_sqrt_d
-        
         lK = torch.cat(self.lK.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         lQ = torch.cat(self.lQ.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         
@@ -1631,22 +1634,48 @@ class llamaFF(Layer):
                 l.backward_p2()
         
         
-        
-        
-        
-        
-        
 
 if __name__ == "__main__":
     
+    def test_dropout():
+        x = torch.randn(16, 24, 80)
+        dL_dout = torch.ones(16,24,80)
+        layer = Dropout(p=0)
+        layer.initial_pass(x)
+        with torch.no_grad():
+            layer.forward(x)
+            my_back = layer.backward_p1(dL_dout)
+            layer.backward_p2()
+        true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
+        print(my_back[0,0,:3])
+        print(true_back[0,0,:3])
+        print(torch.all(my_back==true_back))
+    
+    def test_multihead():
+        x = torch.randn(16, 24, 80)
+        dL_dout = torch.ones(16,24,80)
+        layer = MultiHeadAttention(80, 8, p=0)
+        layer.initial_pass(x, x, x)
+        with torch.no_grad():
+            layer.forward(x, x, x)
+            my_back = torch.sum(torch.stack(layer.backward_p1(dL_dout)), dim=0)
+            layer.backward_p2()
+        true_back = torch.autograd.functional.vjp(lambda _x: layer.forward(_x, _x, _x), x, dL_dout)[1]
+        print(my_back[0,0,0])
+        print(true_back[0,0,0])
+    
     def test_bert():
         x = torch.randn(16, 24, 80)
-        dL_dout = torch.randn(16, 24, 80)
+        dL_dout = torch.ones(16, 24, 80)
         layer = BertBlock(80, 8, 160)
         layer.initial_pass(x)
-        layer.forward(x)
-        layer.backward_p1(dL_dout)
-        layer.backward_p2()
+        with torch.no_grad():
+            layer.forward(x)
+            my_back = layer.backward_p1(dL_dout)
+            layer.backward_p2()
+        true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
+        print(my_back[0,0,0])
+        print(true_back[0,0,0])
     
     def test_conv2D():
         image = torch.randn(16, 3, 80, 80)
@@ -1674,5 +1703,5 @@ if __name__ == "__main__":
         print(my_back[0,0,0])
         print(true_back[0,0,0])
         
-    test_resnet()
+    test_multihead()
     
