@@ -1592,6 +1592,7 @@ class llamaFF(Layer):
         self.silu = SiLU()
         
     def initial_pass(self, x:torch.Tensor):
+        self.streams = []
         if "cuda" in x.device.type:
             self.device = "cuda"
             for _ in range(3):  # 3 dense
@@ -1617,7 +1618,7 @@ class llamaFF(Layer):
         dL_dl2in = self.linears[1].backward_p1(dL_dout)
         dL_dl0 = self.silu.backward_p1(dL_dl2in)
         dL_dx1 = self.linears[0].backward_p1(dL_dl0) * self.l2
-        dL_dx2 = self.linears[2].backward_p1(dL_dl0) * self.silu_out
+        dL_dx2 = self.linears[2].backward_p1(dL_dl2in) * self.silu_out
         return dL_dx1 + dL_dx2
     
     def backward_p2(self):
