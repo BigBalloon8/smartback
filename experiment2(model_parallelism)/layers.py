@@ -100,8 +100,9 @@ class Dense(Layer):
             dL_dout (torch.Tensor): derivative of the loss with respect to the dense layers output
         
         """
-        self.weights = torch.randn(input_size, output_size)
-        self.bias = torch.randn(output_size)
+        m = torch.distributions.normal.Normal(0, 0.01)
+        self.weights = m.sample(torch.Size([input_size, output_size]))
+        self.bias = torch.zeros(output_size)
         
         self.weights_g = torch.zeros_like(self.weights)
         self.bias_g = torch.zeros_like(self.bias)
@@ -255,6 +256,7 @@ class Dropout(Layer):
         Returns:
             torch.Tensor: Output tensor after applying the dropout
         """
+        torch.manual_seed(0)
         if not self.training or self.p==0:
             return x
         if self.p==1:
@@ -506,7 +508,7 @@ class BatchNorm2D(Layer):
             training (bool): whether the layer is in training mode or not
             x_sub_mean (torch.Tensor): the input minus the running mean
             var (torch.Tensor): the variance of the input
-            norm_x (torch.Tensor): the normalized input\
+            norm_x (torch.Tensor): the normalized input
         """
         self.eps = eps
         self.momentum = momentum
@@ -592,7 +594,7 @@ class BatchNorm2D(Layer):
         
         dL_dxnorm = dL_dout * self.gamma.view(1, -1, 1, 1)
         dL_dvar = (-0.5 * dL_dxnorm * (self.x_sub_mean)).sum((0, 2, 3), keepdim=True)  * ((self.var) ** -1.5)
-        dL_dmean = (-1.0 / torch.sqrt(self.var) * dL_dxnorm).sum((0, 2, 3), keepdim=True) + (dL_dvar * (-2.0 * (self.x_sub_mean)).sum((0, 2, 3), keepdim=True) / (in_shape[0]*in_shape[2]*in_shape[3]))
+        dL_dmean = (-1.0 / torch.sqrt(self.var) * dL_dxnorm).sum((0, 2, 3), keepdim=True) + (dL_dvar * (-2.0 * (self.x_sub_mean)).sum((0, 2, 3), keepdim=True) / B)
         return (dL_dxnorm / torch.sqrt(self.var)) + (2.0 * dL_dvar * (self.x_sub_mean) / B) + (dL_dmean / B) 
         
     
@@ -631,7 +633,7 @@ class NLPLayerNorm(Layer):
         self.dim_size = dim_size
         self.eps = eps
         
-        self.gamma = torch.randn(dim_size)
+        self.gamma = torch.ones(dim_size)
         self.bias = torch.zeros(dim_size)
         
         self.gamma_g = torch.zeros(dim_size)
@@ -655,7 +657,7 @@ class NLPLayerNorm(Layer):
         norm_x = (x_sub_mean)/torch.sqrt(var)
         self.norm_x = torch.zeros_like(norm_x)
         self.dL_dout = torch.zeros_like(norm_x)
-        return norm_x*self.gamma + self.bias
+        return norm_x*self.gamma.view(1,1, self.dim_size) + self.bias.view(1,1, self.dim_size)
         
     def forward(self, x: torch.Tensor):
         """
@@ -667,11 +669,12 @@ class NLPLayerNorm(Layer):
         Returns:
             torch.Tensor: The output of the NLP layer norm
         """
+
         mean = torch.mean(x, dim=self.dim, keepdim=True)
         self.x_sub_mean[:] = x-mean
         self.var[:] = torch.mean(torch.square(self.x_sub_mean), dim=self.dim, keepdim=True) + self.eps
         self.norm_x[:] = (self.x_sub_mean)/torch.sqrt(self.var)
-        return self.norm_x*self.gamma + self.bias
+        return self.norm_x*self.gamma.view(1,1,-1) + self.bias.view(1,1,-1)
     
     def _norm_jacobian(self):
         """Returns the Jacobian of the NLP layer norm
@@ -681,14 +684,14 @@ class NLPLayerNorm(Layer):
         """
         # F_Jij is pass vectors x,z and scalar v of vector x
         def _F_Jij(x, z, v):
-            const_n2 = self.dim_size**2
+            const_n2 = self.dim_size
             f = lambda __x, __z, _v, g: g*((-torch.sqrt(_v)/self.dim_size)-__z*((__x)/const_n2))/_v
             def i_for_j(_x, _z):
                 return vmap(f, in_dims=(None, 0, None, 0))(_x, _z, v, self.gamma)
             return vmap(i_for_j, in_dims=(0,None))(x, z)
 
         def _F_Jii(x, z, v):
-            const_n2 = self.dim_size**2
+            const_n2 = self.dim_size
             f = lambda __x, __z, _v, g: g*(((1-1/self.dim_size)*torch.sqrt(_v))-__z*((__x)/const_n2))/_v
             return vmap(f, in_dims=(0,0,None,0))(x, z, v, self.gamma)
 
@@ -749,7 +752,7 @@ class NLPRMSNorm(Layer):
         self.dim_size = dim_size
         self.eps = eps
         
-        self.weights = torch.randn(dim_size)
+        self.weights = torch.ones(dim_size)
         
         self.weights_g = torch.zeros(dim_size)
     
@@ -1661,21 +1664,37 @@ if __name__ == "__main__":
             my_back = torch.sum(torch.stack(layer.backward_p1(dL_dout)), dim=0)
             layer.backward_p2()
         true_back = torch.autograd.functional.vjp(lambda _x: layer.forward(_x, _x, _x), x, dL_dout)[1]
-        print(my_back[0,0,0])
-        print(true_back[0,0,0])
+        print(my_back[0,0])
+        print(true_back[0,0])
     
-    def test_bert():
-        x = torch.randn(16, 24, 80)
-        dL_dout = torch.ones(16, 24, 80)
-        layer = BertBlock(80, 8, 160)
+    def test_layernorm():
+        m = torch.distributions.Uniform(1, 3)
+        
+        x = m.sample((16,24,80))
+        dL_dout = torch.ones(16,24,80)
+        layer = NLPLayerNorm(-1, 80)
         layer.initial_pass(x)
         with torch.no_grad():
             layer.forward(x)
             my_back = layer.backward_p1(dL_dout)
             layer.backward_p2()
         true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
-        print(my_back[0,0,0])
-        print(true_back[0,0,0])
+        print(my_back[:2,:10,:1])
+        print(true_back[:2,:10,:1])
+        print(torch.all(my_back==true_back))
+    
+    def test_bert():
+        x = torch.randn(16, 24, 80)
+        dL_dout = torch.ones(16, 24, 80)
+        layer = BertBlock(80, 8, 160, p=0)
+        layer.initial_pass(x)
+        with torch.no_grad():
+            layer.forward(x)
+            my_back = layer.backward_p1(dL_dout)
+            layer.backward_p2()
+        true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
+        print(my_back[0,0])
+        print(true_back[0,0])
     
     def test_conv2D():
         image = torch.randn(16, 3, 80, 80)
@@ -1690,6 +1709,21 @@ if __name__ == "__main__":
         print(true_back.shape)
         print(torch.all(my_back == true_back))
     
+    def test_batchnorm():
+        m = torch.distributions.Uniform(1, 3)
+        image = m.sample((16, 3, 80, 80))
+        #image = torch.randn(16, 3, 80, 80)
+        bn = BatchNorm2D(3)
+        bn.initial_pass(image)
+        with torch.no_grad():
+            dL_dout = torch.ones_like(bn.forward(image))
+            my_back = bn.backward_p1(dL_dout)
+            bn.backward_p2()
+        true_back = torch.autograd.functional.vjp(bn.forward, image, dL_dout)[1]
+        print(my_back[:2,0,:10,0])
+        print(true_back[:2,0,:10, 0])
+        print(torch.all(my_back == true_back))
+    
     def test_resnet():
         image = torch.randn(16, 3, 32, 32)
         resnet18 = ResNet(BasicResNetBlock, [2, 2, 2, 2])
@@ -1700,8 +1734,8 @@ if __name__ == "__main__":
             my_back = resnet18.backward_p1(dL_dout)
         true_back = torch.autograd.functional.vjp(resnet18.forward, image, dL_dout)[1]
         #print(my_back == true_back)
-        print(my_back[0,0,0])
-        print(true_back[0,0,0])
+        print(my_back[0,:,0, 0])
+        print(true_back[0,:,0, 0])
         
-    test_multihead()
+    test_layernorm()
     
