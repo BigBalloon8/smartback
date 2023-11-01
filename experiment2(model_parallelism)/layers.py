@@ -715,6 +715,12 @@ class NLPLayerNorm(Layer):
             torch.Tensor: The derivatives of the loss with respect to the NLP layer norm inputs
         """
         self.dL_dout[:] = dL_dout
+        
+        dx_hat = dL_dout * self.gamma.view(1,1,-1)  
+        dL_dvar = torch.sum(dx_hat * self.x_sub_mean, dim=-1, keepdim=True) * -.5 * self.var**(-1.5)
+        dL_dmean = torch.sum(dx_hat/-torch.sqrt(self.var), dim=-1, keepdim=True) + dL_dvar * torch.mean(-2. * self.x_sub_mean, dim=-1, keepdim=True)
+        return dx_hat / torch.sqrt(self.var) + dL_dvar * 2. * self.x_sub_mean /self.dim_size + dL_dmean / self.dim_size
+        
         J = self._norm_jacobian()
         return vmap(vmap(torch.mm))(dL_dout.unsqueeze(-2), J).squeeze()
 
@@ -826,7 +832,7 @@ class NLPRMSNorm(Layer):
             torch.Tensor: The derivatives of the loss with respect to the NLP RMS norm inputs
         """
         self.dL_dout[:] = dL_dout
-        J = self._norm_jacobian()
+        J = self._rmsnorm_jacobian()
         return vmap(vmap(torch.mm))(dL_dout.unsqueeze(-2), J).squeeze()
     
     def backward_p2(self):
@@ -862,8 +868,8 @@ class BertBlock(Layer):
         self.linears = {0: Dense(emb_dim, dim_ff),
                         1: Dense(dim_ff, emb_dim)}
         self.ff_act = activation()
-        self.norms = {"multi_head": NLPLayerNorm(-1, emb_dim, eps=eps),
-                      "ff": NLPLayerNorm(-1, emb_dim, eps=eps)}
+        self.norms = {"multi_head": NLPRMSNorm(-1, emb_dim, eps=eps),
+                      "ff": NLPRMSNorm(-1, emb_dim, eps=eps)}
         self.dropouts = {"multi_head": Dropout(p=p),
                          "ff": Dropout(p=p)}
     
@@ -931,7 +937,7 @@ class BertBlock(Layer):
         dL_dff2 = self.norms["ff"].backward_p1(dL_dff2norm)
         dL_da = self.linears[1].backward_p1(dL_dff2)
         dL_dff1 = self.ff_act.backward_p1(dL_da)
-        dL_dnormmhout = self.linears[0].backward_p1(dL_dff1) + dL_dout
+        dL_dnormmhout = self.linears[0].backward_p1(dL_dff1) + dL_dff2
         
         dL_dnormmhout = self.dropouts["multi_head"].backward_p1(dL_dnormmhout)
         dL_dmhout = self.norms["multi_head"].backward_p1(dL_dnormmhout)
@@ -1684,7 +1690,9 @@ if __name__ == "__main__":
         print(torch.all(my_back==true_back))
     
     def test_bert():
+        m = torch.distributions.Uniform(1, 3)
         x = torch.randn(16, 24, 80)
+        x = m.sample(x.shape)
         dL_dout = torch.ones(16, 24, 80)
         layer = BertBlock(80, 8, 160, p=0)
         layer.initial_pass(x)
@@ -1733,9 +1741,24 @@ if __name__ == "__main__":
             dL_dout = torch.ones_like(res)
             my_back = resnet18.backward_p1(dL_dout)
         true_back = torch.autograd.functional.vjp(resnet18.forward, image, dL_dout)[1]
-        #print(my_back == true_back)
-        print(my_back[0,:,0, 0])
-        print(true_back[0,:,0, 0])
-        
-    test_layernorm()
+        print(torch.all(my_back == true_back))
+        print(my_back[:,0,0, 0])
+        print(true_back[:,0,0, 0])
+    
+    def test_rmsnorm():
+        m = torch.distributions.Uniform(1, 3)
+        x = m.sample((16,24,80))
+        dL_dout = torch.ones(16,24,80)
+        layer = NLPRMSNorm(-1,80)
+        layer.initial_pass(x)
+        with torch.no_grad():
+            layer.forward(x)
+            my_back = layer.backward_p1(dL_dout)
+            layer.backward_p2()
+        true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
+        print(my_back[0,0])
+        print(true_back[0,0])
+        print(torch.all(my_back==true_back))
+    
+    test_bert()
     
