@@ -9,10 +9,6 @@ from torch import vmap as vmap
 class Layer(ABC):
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
-    
-    @abstractmethod
-    def initial_pass(self):
-        pass
         
     @abstractmethod
     def forward(self):
@@ -108,25 +104,6 @@ class Dense(Layer):
         self.weights_g = torch.zeros_like(self.weights)
         self.bias_g = torch.zeros_like(self.bias) if bias else None
     
-    def initial_pass(self, x: torch.Tensor):
-        """
-        Performs an initial forward pass to initialize intermediate tensors
-
-        Args:
-            x (torch.Tensor): Input tensor
-
-        Returns:
-            torch.Tensor: Output tensor after applying the initial pass of the dense layer
-        """
-        self.inputs = torch.zeros_like(x)
-        x = vmap(lambda x_: torch.matmul(x_, self.weights))(x)
-        if self.bias is not None:
-            out = torch.add(x, self.bias)
-        else:
-            out = x
-        self.dL_dout = torch.zeros_like(out)
-        return out
-    
     def forward(self, x: torch.Tensor):
         """
         Performs a forward pass through the dense layer
@@ -137,7 +114,7 @@ class Dense(Layer):
         Returns:
             torch.Tensor: Output tensor after applying dense layer
         """
-        self.inputs[:] = x
+        self.inputs = x
         x =  vmap(lambda x_: torch.matmul(x_, self.weights))(x)
         if self.bias is not None: 
             out = torch.add(x, self.bias)
@@ -155,16 +132,13 @@ class Dense(Layer):
         Returns:
             torch.Tensor: Derivative of the loss with respect to the dense layers input
         """
-        self.dL_dout[:] = dL_dout
+        self.dL_dout = dL_dout
         return vmap(lambda dl_dout: torch.matmul(dl_dout, self.weights.T))(dL_dout)
     
     def backward_p2(self):
         """
         Calculates the gradients of the dense layer's parameters
         """
-        if self.bias is not None:
-            self.bias_g[:] = torch.sum(self.dL_dout, dim=tuple(range(self.dL_dout.ndim)[:-1]))
-        
         if self.dL_dout.ndim == 2:
             self.weights_g[:] = torch.sum(
                 torch.bmm(self.inputs.unsqueeze(2), 
@@ -180,22 +154,15 @@ class Dense(Layer):
             dim=tuple(range(self.dL_dout.ndim)[:-2]))
         else:
             raise Exception("ndim of input to Dense not supported")
+        self.inputs = None
+        
+        if self.bias is not None:
+            self.bias_g[:] = torch.sum(self.dL_dout, dim=tuple(range(self.dL_dout.ndim)[:-1]))
+        
+        self.dL_dout = None
 
 
 class ReLU(Activation):
-    def initial_pass(self, x: torch.Tensor):
-        """
-        Performs an initial forward pass to initialize intermediate tensors
-
-        Args:
-            x (torch.Tensor): Input tensor
-
-        Returns:
-            torch.Tensor: Output tensor after applying the initial pass of the dense layer
-        """
-        self.inputs = torch.zeros_like(x)
-        return  torch.maximum(x, torch.tensor(0.0, dtype=x.dtype))
-    
     def forward(self, x: torch.Tensor):
         """
         Performs a forward pass through the relu
@@ -206,7 +173,7 @@ class ReLU(Activation):
         Returns:
             torch.Tensor: Output tensor after applying relu
         """
-        self.inputs[:] = x
+        self.inputs = x
         out = torch.maximum(x, torch.tensor(0.0, dtype=x.dtype))
         return out
     
@@ -221,6 +188,7 @@ class ReLU(Activation):
             torch.Tensor: Derivative of the loss with respect to the dense layers input
         """
         dout_din = torch.where(self.inputs>0, 1.0, 0.0)
+        self.inputs = None
         return dL_dout*dout_din
 
     def backward_p2(self):
@@ -242,19 +210,6 @@ class Dropout(Layer):
         self.p = p
         self.training = True
     
-    def initial_pass(self, x: torch.Tensor):
-        """
-        Performs an initial forward pass to initialize intermediate tensors
-
-        Args:
-            x (torch.Tensor): Input tensor
-
-        Returns:
-            torch.Tensor: Output tensor after applying the initial pass of the dropout
-        """
-        self.p_mask = torch.bernoulli(torch.ones_like(x) - self.p)
-        return x*self.p_mask
-    
     def forward(self, x: torch.Tensor):
         """
         Performs a forward pass through the dropout layer. 
@@ -269,7 +224,7 @@ class Dropout(Layer):
             return x
         if self.p==1:
             return torch.zeros_like(x)
-        self.p_mask[:] = torch.bernoulli(torch.ones_like(x) -self.p)
+        self.p_mask = torch.bernoulli(torch.ones_like(x) -self.p)
         return x*self.p_mask
     
     def backward_p1(self, dL_dout: torch.Tensor):
@@ -286,7 +241,9 @@ class Dropout(Layer):
             return dL_dout
         if self.p==1:
             return torch.zeros_like(dL_dout)
-        return dL_dout*self.p_mask
+        out= dL_dout*self.p_mask
+        self.p_mask = None
+        return out
     
     def backward_p2(self):
         pass
@@ -294,7 +251,7 @@ class Dropout(Layer):
     
 class MultiHeadAttention(Layer):
     #TODO self is the first layer in the model you can cache the linear outputs of the first 3 linears
-    def __init__(self, emb_dim: int, num_heads: int, p: Optional[float]=0.1):
+    def __init__(self, emb_dim: int, num_heads: int, p: Optional[float]=0.1, device="cuda"):
         """
         Initializes the multihead attention
 
@@ -321,6 +278,7 @@ class MultiHeadAttention(Layer):
         """
         self.num_heads = num_heads
         self.emb_dim = emb_dim
+        self.inv_sqrt_d = (emb_dim / num_heads)**(-1/2)
         self.linears = {"Q": Dense(self.emb_dim, self.emb_dim),
                         "K": Dense(self.emb_dim, self.emb_dim),
                         "V": Dense(self.emb_dim, self.emb_dim),
@@ -330,58 +288,16 @@ class MultiHeadAttention(Layer):
                          "K": Dropout(p=p),
                          "V": Dropout(p=p)
                         }
-    
-    def initial_pass(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: Optional[torch.Tensor]=None):
-        """
-        Performs an initial forward pass to initialize intermediate tensors
-
-        Args:
-            Q (torch.Tensor): Query tensor
-            K (torch.Tensor): Key tensor
-            V (torch.Tensor): Value tensor
-            mask (Optional[torch.Tensor]): Attention mask. Defaults to None.
-
-        Returns:
-            torch.Tensor: Output tensor of multihead attention
-        """
-        #TODO change for multihead
-        if "cuda" in str(Q.device):
+        
+        self.inputs = {"Q": None, "K": None, "V": None}
+        
+        if "cuda" in device:
             self.device = "cuda" 
             self.streams = []
             for _ in range(len(self.linears)):
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
-        
-        self.inputs = {"Q": torch.zeros_like(Q),
-                       "K": torch.zeros_like(K),
-                       "V": torch.zeros_like(V),
-        }
-        
-        lQ = self.dropouts["Q"].initial_pass(self.linears["Q"].initial_pass(Q))
-        lK = self.dropouts["K"].initial_pass(self.linears["K"].initial_pass(K))
-        lV = self.dropouts["V"].initial_pass(self.linears["V"].initial_pass(V))
-        
-        self.lQ = torch.zeros_like(lQ)
-        self.lK = torch.zeros_like(lK)
-        self.lV = torch.zeros_like(lV)
-    
-        lQ = torch.cat(lQ.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)  # should use view
-        lK = torch.cat(lK.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
-        lV = torch.cat(lV.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
-        self.inv_sqrt_d = lK.shape[-1]**(-1/2)
-        QK_T = vmap(lambda q, k: torch.bmm(q, torch.transpose(k, -1, -2)), in_dims=-2, out_dims=-2)(lQ, lK) * self.inv_sqrt_d
-        
-        if mask is not None:
-            QK_T = vmap(lambda x: x + mask, in_dims=-2, out_dims=-2)(QK_T)
-        sQK_T = torch.softmax(QK_T, dim=-1)
-        
-        self.sQK_T = torch.zeros_like(sQK_T)
-        out = vmap(lambda qk_t, v: torch.bmm(qk_t, v), in_dims=-2, out_dims=-2)(sQK_T, lV)
-        
-        out = torch.flatten(out, -2, -1)
-        return self.linears["O"].initial_pass(out)
-
     
     def forward(self, Q, K, V, mask = None):
         """
@@ -396,28 +312,28 @@ class MultiHeadAttention(Layer):
         Returns:
             torch.Tensor: Output tensor of multihead attention
         """
-        self.inputs["Q"][:] = Q
-        self.inputs["K"][:] = K
-        self.inputs["V"][:] = V
+        self.inputs["Q"] = Q
+        self.inputs["K"] = K
+        self.inputs["V"] = V
         
-        self.lQ[:] = self.dropouts["Q"](self.linears["Q"](Q))
-        self.lK[:] = self.dropouts["K"](self.linears["K"](K))
-        self.lV[:] = self.dropouts["V"](self.linears["V"](V))
+        lQ = self.dropouts["Q"](self.linears["Q"](Q))
+        lK = self.dropouts["K"](self.linears["K"](K))
+        lV = self.dropouts["V"](self.linears["V"](V))
         
-        lQ = torch.cat(self.lQ.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
-        lK = torch.cat(self.lK.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
-        lV = torch.cat(self.lV.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        self.lQ = torch.cat(lQ.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        self.lK = torch.cat(lK.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        self.lV = torch.cat(lV.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         
-        QK_T = vmap(lambda q, k: torch.bmm(q, torch.transpose(k, -1, -2)), in_dims=-2, out_dims=-2)(lQ, lK) * self.inv_sqrt_d
+        QK_T = vmap(lambda q, k: torch.bmm(q, torch.transpose(k, -1, -2)), in_dims=-2, out_dims=-2)(self.lQ, self.lK) * self.inv_sqrt_d
         if mask is not None:
             QK_T = vmap(lambda x: x + mask, in_dims=-2, out_dims=-2)(QK_T)
         def _softmax(x):
             e_x = torch.exp(x)
             return e_x / torch.sum(e_x)
-        self.sQK_T[:] = vmap(vmap(vmap(_softmax)))(QK_T)
+        self.sQK_T = vmap(vmap(vmap(_softmax)))(QK_T)
         #torch.softmax(QK_T, dim=-1, out=self.sQK_T) #TODO add inplace update
         
-        out = vmap(lambda qk_t, v: torch.bmm(qk_t, v), in_dims=-2, out_dims=-2)(self.sQK_T, lV)
+        out = vmap(lambda qk_t, v: torch.bmm(qk_t, v), in_dims=-2, out_dims=-2)(self.sQK_T, self.lV)
         out = torch.flatten(out, -2, -1)
         return self.linears["O"](out)
 
@@ -457,19 +373,20 @@ class MultiHeadAttention(Layer):
         
         dL_dAtt = torch.cat(dL_dAtt.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         
-        lV = torch.cat(self.lV.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
-        dL_dsQKT = vmap(lambda dl_dout, v: torch.bmm(dl_dout, torch.transpose(v, -1,-2)), in_dims=-2, out_dims=-2)(dL_dAtt, lV)
+        dL_dsQKT = vmap(lambda dl_dout, v: torch.bmm(dl_dout, torch.transpose(v, -1,-2)), in_dims=-2, out_dims=-2)(dL_dAtt, self.lV)
+        self.lV = None
         
         # vmap across 3 dims BxCxH 
         J_sQKT = vmap(vmap(vmap(self._softmax_jacobian)))(self.sQK_T)  # sQK_T.shape -> BxCxHxC 
         dL_dQKT = torch.squeeze(vmap(vmap(vmap(torch.mm)))(dL_dsQKT.unsqueeze(-2), J_sQKT)) * self.inv_sqrt_d
-        lK = torch.cat(self.lK.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
-        lQ = torch.cat(self.lQ.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         
         # TODO verifiy this section
-        dL_dlQ = vmap(lambda dl_dqkt, k: torch.bmm(dl_dqkt, k), in_dims=-2, out_dims=-2)(dL_dQKT, lK)  # k.T not necessary as its k.T.T  
-        dL_dlKT = vmap(lambda dl_dqkt, q: torch.bmm(torch.transpose(q, -1,-2), dl_dqkt), in_dims=-2, out_dims=-2)(dL_dQKT, lQ)  
+        dL_dlQ = vmap(lambda dl_dqkt, k: torch.bmm(dl_dqkt, k), in_dims=-2, out_dims=-2)(dL_dQKT, self.lK)  # k.T not necessary as its k.T.T
+        self.lK = None
+        dL_dlKT = vmap(lambda dl_dqkt, q: torch.bmm(torch.transpose(q, -1,-2), dl_dqkt), in_dims=-2, out_dims=-2)(dL_dQKT, self.lQ)  
+        self.lQ = None
         dL_dlV = vmap(lambda dl_datt, sqkt: torch.bmm(torch.transpose(sqkt, -2, -1), dl_datt), in_dims=-2, out_dims=-2)(dL_dAtt, self.sQK_T) 
+        self.sQK_T = None
         
         dL_dQ = self.linears["Q"].backward_p1(self.dropouts["Q"].backward_p1(torch.flatten(dL_dlQ, -2, -1)))
         dL_dK = self.linears["K"].backward_p1(self.dropouts["K"].backward_p1(torch.flatten(torch.vmap(lambda dl_dlkt: torch.transpose(dl_dlkt, -1, -2), in_dims=-2, out_dims=-2)(dL_dlKT), -2, -1)))
@@ -532,32 +449,6 @@ class BatchNorm2D(Layer):
         self.r_var = torch.ones(1, in_channels, 1, 1)
         
         self.training = True
-        
-    def initial_pass(self, x:torch.Tensor):
-        """
-        Performs an initial forward pass to initialize intermediate tensors
-
-        Args:
-            x (torch.Tensor): Input Tensor
-
-        Returns:
-            torch.Tensor: The output of the BAtchNorm2D Layer
-        """
-        if self.training:
-            mean = x.mean(dim=[0,2,3], keepdim=True)
-            var = ((x-mean)**2).mean(dim=[0,2,3], keepdim=True)
-            self.r_mean = (1 - self.momentum) * self.r_mean + self.momentum * mean
-            self.r_var = (1 - self.momentum) * self.r_var + self.momentum * var
-        else:
-            mean, var = self.r_mean, self.r_var
-        
-        x_sub_mean = x - mean
-        self.x_sub_mean = torch.zeros_like(x_sub_mean)
-        self.var = var + self.eps
-        self.norm_x = (x_sub_mean)/torch.sqrt(self.var)
-        out = self.gamma.view(1, self.in_channels, 1, 1)*self.norm_x + self.beta.view(1, self.in_channels, 1, 1)
-        self.dL_dout = torch.zeros_like(out)
-        return out
     
     def forward(self, x: torch.Tensor):
         """
@@ -577,9 +468,9 @@ class BatchNorm2D(Layer):
         else:
             mean, var = self.r_mean, self.r_var
         
-        self.x_sub_mean[:] = x - mean
-        self.var[:] = var + self.eps
-        self.norm_x[:] = (self.x_sub_mean)/torch.sqrt(self.var)
+        self.x_sub_mean = x - mean
+        self.var = var + self.eps
+        self.norm_x = (self.x_sub_mean)/torch.sqrt(self.var)
         out = self.gamma.view(1, self.in_channels, 1, 1)*self.norm_x + self.beta.view(1, self.in_channels, 1, 1)
         return out
     
@@ -595,15 +486,18 @@ class BatchNorm2D(Layer):
             torch.Tensor: The derivatives of the loss with respect to the BatchNorm2D inputs
         """
         in_shape = dL_dout.shape
-        self.dL_dout[:] = dL_dout
+        self.dL_dout = dL_dout
         # https://stackoverflow.com/questions/67968913/derivative-of-batchnorm2d-in-pytorch
         
         B = in_shape[0]*in_shape[2]*in_shape[3]
         
-        dL_dxnorm = dL_dout * self.gamma.view(1, -1, 1, 1)
+        dL_dxnorm = self.dL_dout * self.gamma.view(1, -1, 1, 1)
         dL_dvar = (-0.5 * dL_dxnorm * (self.x_sub_mean)).sum((0, 2, 3), keepdim=True)  * ((self.var) ** -1.5)
         dL_dmean = (-1.0 / torch.sqrt(self.var) * dL_dxnorm).sum((0, 2, 3), keepdim=True) + (dL_dvar * (-2.0 * (self.x_sub_mean)).sum((0, 2, 3), keepdim=True) / B)
-        return (dL_dxnorm / torch.sqrt(self.var)) + (2.0 * dL_dvar * (self.x_sub_mean) / B) + (dL_dmean / B) 
+        dL_din =  (dL_dxnorm / torch.sqrt(self.var)) + (2.0 * dL_dvar * (self.x_sub_mean) / B) + (dL_dmean / B) 
+        self.var = None
+        self.x_sub_mean = None
+        return dL_din
         
     
     def backward_p2(self):
@@ -612,6 +506,8 @@ class BatchNorm2D(Layer):
         """
         self.gamma_g[:] = torch.sum(self.dL_dout*self.norm_x, dim=[0,2,3])
         self.beta_g[:] = torch.sum(self.dL_dout, dim=[0,2,3])
+        self.dL_dout = None
+        self.norm_x = None
         
       
 class NLPLayerNorm(Layer):
@@ -646,26 +542,6 @@ class NLPLayerNorm(Layer):
         
         self.gamma_g = torch.zeros(dim_size)
         self.bias_g = torch.zeros(dim_size)
-    
-    def initial_pass(self, x: torch.Tensor):
-        """
-        Performs an initial forward pass through the NLP Layer Norm and generates all intermediates
-
-        Args:
-            x (torch.Tensor): Input Tensor
-
-        Returns:
-            torch.Tensor: The output of the NLP layer norm
-        """
-        mean = torch.mean(x, dim=self.dim, keepdim=True)
-        x_sub_mean = x-mean
-        self.x_sub_mean = torch.zeros_like(x_sub_mean)
-        var = torch.mean(torch.square(x_sub_mean), dim=self.dim, keepdim=True) + self.eps
-        self.var = torch.zeros_like(var)
-        norm_x = (x_sub_mean)/torch.sqrt(var)
-        self.norm_x = torch.zeros_like(norm_x)
-        self.dL_dout = torch.zeros_like(norm_x)
-        return norm_x*self.gamma.view(1,1, self.dim_size) + self.bias.view(1,1, self.dim_size)
         
     def forward(self, x: torch.Tensor):
         """
@@ -679,9 +555,9 @@ class NLPLayerNorm(Layer):
         """
 
         mean = torch.mean(x, dim=self.dim, keepdim=True)
-        self.x_sub_mean[:] = x-mean
-        self.var[:] = torch.mean(torch.square(self.x_sub_mean), dim=self.dim, keepdim=True) + self.eps
-        self.norm_x[:] = (self.x_sub_mean)/torch.sqrt(self.var)
+        self.x_sub_mean = x-mean
+        self.var = torch.mean(torch.square(self.x_sub_mean), dim=self.dim, keepdim=True) + self.eps
+        self.norm_x = (self.x_sub_mean)/torch.sqrt(self.var)
         return self.norm_x*self.gamma.view(1,1,-1) + self.bias.view(1,1,-1)
     
     def _norm_jacobian(self):
@@ -722,15 +598,18 @@ class NLPLayerNorm(Layer):
         Returns:
             torch.Tensor: The derivatives of the loss with respect to the NLP layer norm inputs
         """
-        self.dL_dout[:] = dL_dout
+        self.dL_dout = dL_dout
         
         dx_hat = dL_dout * self.gamma.view(1,1,-1)  
         dL_dvar = torch.sum(dx_hat * self.x_sub_mean, dim=-1, keepdim=True) * -.5 * self.var**(-1.5)
         dL_dmean = torch.sum(dx_hat/-torch.sqrt(self.var), dim=-1, keepdim=True) + dL_dvar * torch.mean(-2. * self.x_sub_mean, dim=-1, keepdim=True)
-        return dx_hat / torch.sqrt(self.var) + dL_dvar * 2. * self.x_sub_mean /self.dim_size + dL_dmean / self.dim_size
+        dL_din = dx_hat / torch.sqrt(self.var) + dL_dvar * 2. * self.x_sub_mean /self.dim_size + dL_dmean / self.dim_size
+        self.x_sub_mean = None
+        self.var = None
+        return dL_din
         
-        J = self._norm_jacobian()
-        return vmap(vmap(torch.mm))(dL_dout.unsqueeze(-2), J).squeeze()
+        #J = self._norm_jacobian()
+        #return vmap(vmap(torch.mm))(dL_dout.unsqueeze(-2), J).squeeze()
 
         
     def backward_p2(self):
@@ -739,6 +618,8 @@ class NLPLayerNorm(Layer):
         """
         self.bias_g[:] = torch.sum(self.dL_dout, dim=tuple(range(self.dL_dout.ndim)[:-1]))
         self.gamma_g[:] = torch.sum(self.dL_dout*self.norm_x, dim=tuple(range(self.dL_dout.ndim)[:-1]))
+        self.dL_dout = None
+        self.norm_x = None
       
         
 class NLPRMSNorm(Layer):
@@ -770,24 +651,6 @@ class NLPRMSNorm(Layer):
         
         self.weights_g = torch.zeros(dim_size)
     
-    def initial_pass(self, x: torch.Tensor):
-        """
-        Performs an initial forward pass through the NLP RMS norm and generates all intermediates
-
-        Args:
-            x (torch.Tensor): Input Tensor
-
-        Returns:
-            torch.Tensor: The output of the NLP RMS norm
-        """
-        self.inputs = torch.zeros_like(x)
-        mean_pow2 = torch.mean(x**2, dim=-1, keepdim=True) + self.eps
-        self.mean_pow2 = torch.zeros_like(mean_pow2)
-        rms_norm_x = x*torch.rsqrt(mean_pow2)
-        self.rms_norm_x = torch.zeros_like(rms_norm_x)
-        self.dL_dout = torch.zeros_like(rms_norm_x)
-        return rms_norm_x*self.weights
-    
     def forward(self, x: torch.Tensor):
         """
         Performs a forward pass through the NLP RMS norm
@@ -798,9 +661,9 @@ class NLPRMSNorm(Layer):
         Returns:
             torch.Tensor: The output of the NLP RMS norm
         """
-        self.inputs[:] = x
-        self.mean_pow2[:] = torch.mean(x**2, dim=-1, keepdim=True) + self.eps
-        self.rms_norm_x[:] = x*torch.rsqrt(self.mean_pow2)
+        self.inputs = x
+        self.mean_pow2 = torch.mean(x**2, dim=-1, keepdim=True) + self.eps
+        self.rms_norm_x = x*torch.rsqrt(self.mean_pow2)
         return self.rms_norm_x*self.weights
     
     def _rmsnorm_jacobian(self):
@@ -1822,9 +1685,8 @@ if __name__ == "__main__":
     def test_multihead():
         x = torch.randn(16, 24, 80)
         dL_dout = torch.ones(16,24,80)
-        layer = MultiHeadAttention(80, 8, p=0)
+        layer = MultiHeadAttention(80, 8, p=0, device="cpu")
         with torch.no_grad():
-            layer.initial_pass(x, x, x)
             layer.forward(x, x, x)
             my_back = torch.sum(torch.stack(layer.backward_p1(dL_dout)), dim=0)
             layer.backward_p2()
@@ -1883,4 +1745,4 @@ if __name__ == "__main__":
         layer = NLPRMSNorm(-1,80)
         test(layer, x, dL_dout)
 
-    test_grouped_mulit_head()
+    test_multihead()
