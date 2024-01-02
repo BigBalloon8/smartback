@@ -1,21 +1,10 @@
+from mpi4py import MPI 
 import torch
-import time
+import torch.distributed as dist
 
-def f(x,z, n):
-    n2 = n**2
-    return n2*x*z - 1/n
+dist.init_process_group(backend='mpi')
 
-def g(x,z,n,n2):
-    return n2*x*z - 1/n
+comm = MPI.COMM_WORLD
 
-s = 1000000
-x, z, n, n2 = torch.randn(s), torch.randn(s), torch.tensor(s), torch.tensor(s)**2
+print(comm.Get_size())
 
-start = time.time_ns()
-torch.vmap(f, in_dims=(0,0,None))(x,z,n)
-int = time.time_ns()
-torch.vmap(g, in_dims=(0,0,None, None))(x, z, n, n2)
-end = time.time_ns()
-
-print((int - start)*10**-9)
-print((end - int)*10**-9)

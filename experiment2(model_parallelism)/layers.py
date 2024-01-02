@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, Union, Sequence
+from typing import Any, Dict, Optional, Union, Sequence, Tuple
 from abc import ABC, abstractmethod
 
 import torch
@@ -83,13 +83,14 @@ class Sequential:
 
 
 class Dense(Layer):
-    def __init__(self, input_size: int, output_size: int):
+    def __init__(self, input_size: int, output_size: int, bias: bool = True):
         """
         Initialize a Dense Layer
 
         Args:
             input_size (int): size of input vector
             output_size (int): size of output vector
+            bias (bool): whether or not to include bias
         
         Attributes:
             weights (torch.Tensor): weights of the dense layer
@@ -102,10 +103,10 @@ class Dense(Layer):
         """
         m = torch.distributions.normal.Normal(0, 0.01)
         self.weights = m.sample(torch.Size([input_size, output_size]))
-        self.bias = torch.zeros(output_size)
+        self.bias = torch.zeros(output_size) if bias else None
         
         self.weights_g = torch.zeros_like(self.weights)
-        self.bias_g = torch.zeros_like(self.bias)
+        self.bias_g = torch.zeros_like(self.bias) if bias else None
     
     def initial_pass(self, x: torch.Tensor):
         """
@@ -119,7 +120,10 @@ class Dense(Layer):
         """
         self.inputs = torch.zeros_like(x)
         x = vmap(lambda x_: torch.matmul(x_, self.weights))(x)
-        out = torch.add(x, self.bias)
+        if self.bias is not None:
+            out = torch.add(x, self.bias)
+        else:
+            out = x
         self.dL_dout = torch.zeros_like(out)
         return out
     
@@ -135,7 +139,10 @@ class Dense(Layer):
         """
         self.inputs[:] = x
         x =  vmap(lambda x_: torch.matmul(x_, self.weights))(x)
-        out = torch.add(x, self.bias)
+        if self.bias is not None: 
+            out = torch.add(x, self.bias)
+        else:
+            out = x
         return out
     
     def backward_p1(self, dL_dout: torch.Tensor):
@@ -155,7 +162,8 @@ class Dense(Layer):
         """
         Calculates the gradients of the dense layer's parameters
         """
-        self.bias_g[:] = torch.sum(self.dL_dout, dim=tuple(range(self.dL_dout.ndim)[:-1]))
+        if self.bias is not None:
+            self.bias_g[:] = torch.sum(self.dL_dout, dim=tuple(range(self.dL_dout.ndim)[:-1]))
         
         if self.dL_dout.ndim == 2:
             self.weights_g[:] = torch.sum(
@@ -364,7 +372,7 @@ class MultiHeadAttention(Layer):
         self.inv_sqrt_d = lK.shape[-1]**(-1/2)
         QK_T = vmap(lambda q, k: torch.bmm(q, torch.transpose(k, -1, -2)), in_dims=-2, out_dims=-2)(lQ, lK) * self.inv_sqrt_d
         
-        if mask:
+        if mask is not None:
             QK_T = vmap(lambda x: x + mask, in_dims=-2, out_dims=-2)(QK_T)
         sQK_T = torch.softmax(QK_T, dim=-1)
         
@@ -401,12 +409,12 @@ class MultiHeadAttention(Layer):
         lV = torch.cat(self.lV.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         
         QK_T = vmap(lambda q, k: torch.bmm(q, torch.transpose(k, -1, -2)), in_dims=-2, out_dims=-2)(lQ, lK) * self.inv_sqrt_d
-        if mask:
+        if mask is not None:
             QK_T = vmap(lambda x: x + mask, in_dims=-2, out_dims=-2)(QK_T)
         def _softmax(x):
             e_x = torch.exp(x)
             return e_x / torch.sum(e_x)
-        self.sQK_T[:] = vmap(vmap(_softmax))(QK_T)
+        self.sQK_T[:] = vmap(vmap(vmap(_softmax)))(QK_T)
         #torch.softmax(QK_T, dim=-1, out=self.sQK_T) #TODO add inplace update
         
         out = vmap(lambda qk_t, v: torch.bmm(qk_t, v), in_dims=-2, out_dims=-2)(self.sQK_T, lV)
@@ -1641,124 +1649,238 @@ class llamaFF(Layer):
         else:
             for l in self.linears:
                 l.backward_p2()
+
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)  # type: ignore
+    freqs = torch.outer(t, freqs).float()  # type: ignore
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    ndim = x.ndim
+    assert 0 <= 1 < ndim
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
+
+def apply_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    bs, slen, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+    )
+ 
+class GroupedMultiQueryAttention(Layer):
+    def __init__(self, emb_dim: int, num_heads: int, num_kv_heads:int, max_seq_len:int):
+        self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+        self.emb_dim = emb_dim
+        self.num_heads = num_heads
+        self.max_seq_len = max_seq_len
+        self.n_rep = self.num_heads // self.num_kv_heads
+        self.head_dim = emb_dim // num_heads
+        self.inv_square_d = 1/torch.sqrt(torch.tensor(self.head_dim))
+        
+        self.linears = {"Q": Dense(self.emb_dim, self.emb_dim, bias=False),
+                        "K": Dense(self.emb_dim, self.emb_dim, bias=False),
+                        "V": Dense(self.emb_dim, self.emb_dim, bias=False),
+                        "O": Dense(self.emb_dim, self.emb_dim, bias=False)
+                        }
+
+    def initial_pass(self, x: torch.Tensor):
+        batch_size, seqlen, _ = x.shape
+        self.device = x.device
+
+        self.k_cache = torch.zeros(batch_size, self.max_seq_len, self.num_kv_heads, self.head_dim).to(x.device)
+        self.v_cache = torch.zeros(batch_size, self.max_seq_len, self.num_kv_heads, self.head_dim).to(x.device)
+        
+        xq, xk, xv = self.linears["Q"].initial_pass(x), self.linears["K"].initial_pass(x), self.linears["V"].initial_pass(x)
+
+        self.linears["O"].initial_pass(x)
+
+    
+    def forward(self, x: torch.Tensor, start_pos: int, freq_cis: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        batch_size, seqlen, _ = x.shape
+
+        xq, xk, xv = self.linears["Q"](x), self.linears["K"](x), self.linears["V"](x)
+
+        xq = xq.view(batch_size, seqlen, self.num_heads, self.head_dim)
+        xk = xk.view(batch_size, seqlen, self.num_kv_heads, self.head_dim)
+        xv = xv.view(batch_size, seqlen, self.num_kv_heads, self.head_dim)
+
+        self.xq, xk = apply_rotary_emb(xq, xk, freq_cis)
+
+        self.k_cache.to(self.xq)
+        self.v_cache.to(self.xq)
+
+        self.k_cache[:batch_size, start_pos : start_pos + seqlen] = xk
+        self.v_cache[:batch_size, start_pos : start_pos + seqlen] = xv
+
+        self.keys = repeat_kv(self.k_cache, self.n_rep)
+        self.values = repeat_kv(self.v_cache, self.n_rep)
+
+        Q_KT = vmap(lambda q, k: torch.bmm(q, k.transpose(-1,-2)), in_dims=-2, out_dims=-2)(self.xq, self.keys) * self.inv_square_d
+        if mask is not None:
+            QK_T = vmap(lambda x: x + mask, in_dims=-2, out_dims=-2)(QK_T)
+        def _softmax(x):
+            e_x = torch.exp(x)
+            return e_x / torch.sum(e_x)
+        self.sQK_T = vmap(vmap(vmap(_softmax)))(QK_T)
+        out = vmap(lambda qk_t, v: torch.bmm(qk_t, v), in_dims=-2, out_dims=-2)(self.sQK_T, self.values)
+        out = torch.flatten(out, -2, -1)
+        return self.linears["O"](out)
+
+    @staticmethod
+    def _softmax_jacobian(softmax_out: torch.Tensor): #softmax_out.shape -> N | 1xN
+        """
+        Returns the Jacobian of the softmax within the multihead attention
+
+        Args:
+            softmax_out (torch.Tensor): The output of the softmax within the multihead attention
+
+        Returns:
+            torch.Tensor: The Jacobian of the softmax 
+        """
+        softmax_out = torch.squeeze(softmax_out)
+        n = softmax_out.shape[-1]
+        
+        jac_base = -softmax_out.view(n, 1) * softmax_out.view(1, n)
+        diag = softmax_out*(1-softmax_out)
+        jac_base[torch.arange(n), torch.arange(n)] = diag
+        
+        return jac_base
+
+    def backward_p1(self, dL_dout: torch.Tensor):
+        dL_dAtt = self.linears["O"].backward_p1(dL_dout)
+        dL_dAtt = torch.cat(dL_dAtt.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+
+        dL_dsQKT = vmap(lambda dl_dout, v: torch.bmm(dl_dout, torch.transpose(v, -1,-2)), in_dims=-2, out_dims=-2)(dL_dAtt, self.values)
+
+        J_sQKT = vmap(vmap(vmap(self._softmax_jacobian)))(self.sQK_T)  # sQK_T.shape -> BxCxHxC 
+        dL_dQKT = torch.squeeze(vmap(vmap(vmap(torch.mm)))(dL_dsQKT.unsqueeze(-2), J_sQKT)) * self.inv_sqrt_d
+
+        dL_dlQ = vmap(lambda dl_dqkt, k: torch.bmm(dl_dqkt, k), in_dims=-2, out_dims=-2)(dL_dQKT, self.values)  # k.T not necessary as its k.T.T  
+        dL_dlKT = vmap(lambda dl_dqkt, q: torch.bmm(torch.transpose(q, -1,-2), dl_dqkt), in_dims=-2, out_dims=-2)(dL_dQKT, self.xq)  
+        dL_dlV = vmap(lambda dl_datt, sqkt: torch.bmm(torch.transpose(sqkt, -2, -1), dl_datt), in_dims=-2, out_dims=-2)(dL_dAtt, self.sQK_T) 
+
+        dL_dQ = self.linears["Q"].backward_p1(torch.flatten(dL_dlQ, -2, -1))
+        dL_dK = self.linears["K"].backward_p1(torch.flatten(torch.vmap(lambda dl_dlkt: torch.transpose(dl_dlkt, -1, -2), in_dims=-2, out_dims=-2)(dL_dlKT), -2, -1))
+        dL_dV = self.linears["V"].backward_p1(torch.flatten(dL_dlV, -2, -1))
+
+        return dL_dQ + dL_dK + dL_dV
+    
+    def backward_p2(self):
+        if self.device == "cuda":
+            for k, s in zip(self.linears.keys(), self.streams):
+                with torch.cuda.stream(s):
+                    self.linears[k].backward_p2()
+        else:
+            for k in self.linears.keys():
+                self.linears[k].backward_p2()  
+
         
         
 
 if __name__ == "__main__":
-    
-    def test_dropout():
-        x = torch.randn(16, 24, 80)
-        dL_dout = torch.ones(16,24,80)
-        layer = Dropout(p=0)
-        layer.initial_pass(x)
+
+    def test(layer, x, dL_dout):
         with torch.no_grad():
+            layer.initial_pass(x)
             layer.forward(x)
             my_back = layer.backward_p1(dL_dout)
             layer.backward_p2()
         true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
-        print(my_back[0,0,:3])
-        print(true_back[0,0,:3])
-        print(torch.all(my_back==true_back))
+        if len(x.shape) == 3:
+            print(my_back[:2,:2,:2])
+            print(true_back[:2,:2,:2])
+        else:
+            print(my_back[:2,:2,:2, :2])
+            print(true_back[:2,:2,:2, :2])
+        print(torch.allclose(my_back, true_back))
+        return my_back, true_back
+    
+    def test_dropout():
+        test(Dropout(0.1), torch.randn(16,24,80), torch.ones(16,24,80))
+
     
     def test_multihead():
         x = torch.randn(16, 24, 80)
         dL_dout = torch.ones(16,24,80)
         layer = MultiHeadAttention(80, 8, p=0)
-        layer.initial_pass(x, x, x)
         with torch.no_grad():
+            layer.initial_pass(x, x, x)
             layer.forward(x, x, x)
             my_back = torch.sum(torch.stack(layer.backward_p1(dL_dout)), dim=0)
             layer.backward_p2()
         true_back = torch.autograd.functional.vjp(lambda _x: layer.forward(_x, _x, _x), x, dL_dout)[1]
         print(my_back[0,0])
         print(true_back[0,0])
+        print(torch.allclose(my_back, true_back))
+    
+    def test_grouped_mulit_head():
+        x = torch.randn(16, 24, 80)
+        dL_dout = torch.ones(16,23,80)
+        layer = GroupedMultiQueryAttention(80, 8, None, 30)
+        freqs_cis = precompute_freqs_cis(80 // 8, 30 * 2)[23: 23 + 30]
+        with torch.no_grad():
+            layer.initial_pass(x)
+            layer.forward(x, 24, freq_cis=freqs_cis)
+            my_back = layer.backward_p1(dL_dout)
+            layer.backward_p2()
+        true_back = torch.autograd.functional.vjp(lambda _x: layer.forward(_x, _x, _x), x, dL_dout)[1]
+        print(my_back[0,0])
+        print(true_back[0,0])
+        print(torch.allclose(my_back, true_back))
     
     def test_layernorm():
         m = torch.distributions.Uniform(1, 3)
-        
-        x = m.sample((16,24,80))
-        dL_dout = torch.ones(16,24,80)
-        layer = NLPLayerNorm(-1, 80)
-        layer.initial_pass(x)
-        with torch.no_grad():
-            layer.forward(x)
-            my_back = layer.backward_p1(dL_dout)
-            layer.backward_p2()
-        true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
-        print(my_back[:2,:10,:1])
-        print(true_back[:2,:10,:1])
-        print(torch.all(my_back==true_back))
+        test(NLPLayerNorm(-1, 80), m.sample((16,24,80)), torch.ones(16,24,80))
     
     def test_bert():
+        
         m = torch.distributions.Uniform(1, 3)
         x = torch.randn(16, 24, 80)
         x = m.sample(x.shape)
         dL_dout = torch.ones(16, 24, 80)
         layer = BertBlock(80, 8, 160, p=0)
-        layer.initial_pass(x)
-        with torch.no_grad():
-            layer.forward(x)
-            my_back = layer.backward_p1(dL_dout)
-            layer.backward_p2()
-        true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
-        print(my_back[0,0])
-        print(true_back[0,0])
+        test(layer, x, dL_dout)
     
     def test_conv2D():
         image = torch.randn(16, 3, 80, 80)
         conv = Conv2D(3, 16, 3)
-        conv.initial_pass(image)
-        with torch.no_grad():
-            dL_dout = torch.ones_like(conv.forward(image))
-            my_back = conv.backward_p1(dL_dout)
-            conv.backward_p2()
-        true_back = torch.autograd.functional.vjp(conv.forward, image, dL_dout)[1]
-        print(my_back.shape)
-        print(true_back.shape)
-        print(torch.all(my_back == true_back))
+        test(conv, image, torch.ones(16,16,78,78))
     
     def test_batchnorm():
         m = torch.distributions.Uniform(1, 3)
         image = m.sample((16, 3, 80, 80))
-        #image = torch.randn(16, 3, 80, 80)
-        bn = BatchNorm2D(3)
-        bn.initial_pass(image)
-        with torch.no_grad():
-            dL_dout = torch.ones_like(bn.forward(image))
-            my_back = bn.backward_p1(dL_dout)
-            bn.backward_p2()
-        true_back = torch.autograd.functional.vjp(bn.forward, image, dL_dout)[1]
-        print(my_back[:2,0,:10,0])
-        print(true_back[:2,0,:10, 0])
-        print(torch.all(my_back == true_back))
+        test(BatchNorm2D(3), image, torch.ones(16,3,80,80))
     
     def test_resnet():
         image = torch.randn(16, 3, 32, 32)
-        resnet18 = ResNet(BasicResNetBlock, [2, 2, 2, 2])
-        with torch.no_grad():
-            resnet18.initial_pass(image)
-            res = resnet18.forward(image)
-            dL_dout = torch.ones_like(res)
-            my_back = resnet18.backward_p1(dL_dout)
-        true_back = torch.autograd.functional.vjp(resnet18.forward, image, dL_dout)[1]
-        print(torch.all(my_back == true_back))
-        print(my_back[:,0,0, 0])
-        print(true_back[:,0,0, 0])
+        resnet50 = ResNet(ResNetBottleneck, [3, 4, 6, 3])
+        test(resnet50, image, torch.ones_like(resnet50.initial_pass(image)))
     
     def test_rmsnorm():
         m = torch.distributions.Uniform(1, 3)
         x = m.sample((16,24,80))
         dL_dout = torch.ones(16,24,80)
         layer = NLPRMSNorm(-1,80)
-        layer.initial_pass(x)
-        with torch.no_grad():
-            layer.forward(x)
-            my_back = layer.backward_p1(dL_dout)
-            layer.backward_p2()
-        true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
-        print(my_back[0,0])
-        print(true_back[0,0])
-        print(torch.all(my_back==true_back))
-    
-    test_bert()
-    
+        test(layer, x, dL_dout)
+
+    test_grouped_mulit_head()
