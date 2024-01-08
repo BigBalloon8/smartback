@@ -1,10 +1,21 @@
 from typing import Any, Dict, Optional, Union, Sequence, Tuple
 from abc import ABC, abstractmethod
+from functools import wraps
 
 import torch
 import torch.nn.functional as F
 from torch import vmap as vmap
 
+class cleanup(object):
+    def __init__(self, *args):
+        self.args = args
+    def __call__(self, func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            func(*args, **kwargs)
+            for arg in self.args:
+                setattr(args[0], arg, None)
+        return wrapper
 
 class Layer(ABC):
     def __call__(self, *args, **kwargs):
@@ -31,31 +42,23 @@ class Activation(Layer):
         pass
 
 class Sequential:
-    def __init__(self, layers: Sequence[Layer]):
+    def __init__(self, layers: Sequence[Layer], device:str = "cuda"):
         """
-        
-
         Args:
             layers (Sequence[Layer]): The layers given in order to be executed sequentially
         """
         self.layers = layers
-        
-    def __call__(self, *args: Any, **kwargs: Any):
-        return self.forward(*args, **kwargs)
-    
-    def initial_pass(self, x: torch.Tensor):
-        if "cuda" in str(x.device):
+
+        if device == "cuda":
             self.device = "cuda"
             self.streams = []
-            for layer in self.layers:
+            for _ in self.layers:
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
         
-        for layer in self.layers:
-            x = layer.initial_pass(x)
-        
-        return x
+    def __call__(self, *args: Any, **kwargs: Any):
+        return self.forward(*args, **kwargs)
     
     def forward(self, x: torch.Tensor):
         for layer in self.layers:
@@ -135,6 +138,7 @@ class Dense(Layer):
         self.dL_dout = dL_dout
         return vmap(lambda dl_dout: torch.matmul(dl_dout, self.weights.T))(dL_dout)
     
+    @cleanup("inputs", "dL_dout")
     def backward_p2(self):
         """
         Calculates the gradients of the dense layer's parameters
@@ -154,12 +158,12 @@ class Dense(Layer):
             dim=tuple(range(self.dL_dout.ndim)[:-2]))
         else:
             raise Exception("ndim of input to Dense not supported")
-        self.inputs = None
+        #self.inputs = None
         
         if self.bias is not None:
             self.bias_g[:] = torch.sum(self.dL_dout, dim=tuple(range(self.dL_dout.ndim)[:-1]))
         
-        self.dL_dout = None
+        #self.dL_dout = None
 
 
 class ReLU(Activation):
@@ -177,6 +181,7 @@ class ReLU(Activation):
         out = torch.maximum(x, torch.tensor(0.0, dtype=x.dtype))
         return out
     
+    @cleanup("inputs")
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the relus output and returns the derivative of the loss with respect to the relus input
@@ -188,7 +193,6 @@ class ReLU(Activation):
             torch.Tensor: Derivative of the loss with respect to the dense layers input
         """
         dout_din = torch.where(self.inputs>0, 1.0, 0.0)
-        self.inputs = None
         return dL_dout*dout_din
 
     def backward_p2(self):
@@ -227,6 +231,7 @@ class Dropout(Layer):
         self.p_mask = torch.bernoulli(torch.ones_like(x) -self.p)
         return x*self.p_mask
     
+    @cleanup("p_mask")
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the dropouts output and returns the derivative of the loss with respect to the dropouts input
@@ -241,9 +246,8 @@ class Dropout(Layer):
             return dL_dout
         if self.p==1:
             return torch.zeros_like(dL_dout)
-        out= dL_dout*self.p_mask
-        self.p_mask = None
-        return out
+        return dL_dout*self.p_mask
+
     
     def backward_p2(self):
         pass
@@ -358,7 +362,7 @@ class MultiHeadAttention(Layer):
         
         return jac_base
 
-        
+    @cleanup("lV", "lK", "lQ", "sQK_T")
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the multihead attention output and returns the derivative of the loss with respect to the multihead attention input
@@ -374,7 +378,7 @@ class MultiHeadAttention(Layer):
         dL_dAtt = torch.cat(dL_dAtt.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         
         dL_dsQKT = vmap(lambda dl_dout, v: torch.bmm(dl_dout, torch.transpose(v, -1,-2)), in_dims=-2, out_dims=-2)(dL_dAtt, self.lV)
-        self.lV = None
+        #self.lV = None
         
         # vmap across 3 dims BxCxH 
         J_sQKT = vmap(vmap(vmap(self._softmax_jacobian)))(self.sQK_T)  # sQK_T.shape -> BxCxHxC 
@@ -382,11 +386,11 @@ class MultiHeadAttention(Layer):
         
         # TODO verifiy this section
         dL_dlQ = vmap(lambda dl_dqkt, k: torch.bmm(dl_dqkt, k), in_dims=-2, out_dims=-2)(dL_dQKT, self.lK)  # k.T not necessary as its k.T.T
-        self.lK = None
+        #self.lK = None
         dL_dlKT = vmap(lambda dl_dqkt, q: torch.bmm(torch.transpose(q, -1,-2), dl_dqkt), in_dims=-2, out_dims=-2)(dL_dQKT, self.lQ)  
-        self.lQ = None
+        #self.lQ = None
         dL_dlV = vmap(lambda dl_datt, sqkt: torch.bmm(torch.transpose(sqkt, -2, -1), dl_datt), in_dims=-2, out_dims=-2)(dL_dAtt, self.sQK_T) 
-        self.sQK_T = None
+        #self.sQK_T = None
         
         dL_dQ = self.linears["Q"].backward_p1(self.dropouts["Q"].backward_p1(torch.flatten(dL_dlQ, -2, -1)))
         dL_dK = self.linears["K"].backward_p1(self.dropouts["K"].backward_p1(torch.flatten(torch.vmap(lambda dl_dlkt: torch.transpose(dl_dlkt, -1, -2), in_dims=-2, out_dims=-2)(dL_dlKT), -2, -1)))
@@ -474,7 +478,7 @@ class BatchNorm2D(Layer):
         out = self.gamma.view(1, self.in_channels, 1, 1)*self.norm_x + self.beta.view(1, self.in_channels, 1, 1)
         return out
     
-    
+    @cleanup("var", "x_sub_mean")
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the BatchNorm2D output and returns the derivative of the loss with respect to the BatchNorm2D input
@@ -494,20 +498,16 @@ class BatchNorm2D(Layer):
         dL_dxnorm = self.dL_dout * self.gamma.view(1, -1, 1, 1)
         dL_dvar = (-0.5 * dL_dxnorm * (self.x_sub_mean)).sum((0, 2, 3), keepdim=True)  * ((self.var) ** -1.5)
         dL_dmean = (-1.0 / torch.sqrt(self.var) * dL_dxnorm).sum((0, 2, 3), keepdim=True) + (dL_dvar * (-2.0 * (self.x_sub_mean)).sum((0, 2, 3), keepdim=True) / B)
-        dL_din =  (dL_dxnorm / torch.sqrt(self.var)) + (2.0 * dL_dvar * (self.x_sub_mean) / B) + (dL_dmean / B) 
-        self.var = None
-        self.x_sub_mean = None
-        return dL_din
-        
+        return (dL_dxnorm / torch.sqrt(self.var)) + (2.0 * dL_dvar * (self.x_sub_mean) / B) + (dL_dmean / B) 
     
+        
+    @cleanup("dL_dout", "norm_x")
     def backward_p2(self):
         """
         Calculates the gradients of the parameters in the BatchNorm2D
         """
         self.gamma_g[:] = torch.sum(self.dL_dout*self.norm_x, dim=[0,2,3])
         self.beta_g[:] = torch.sum(self.dL_dout, dim=[0,2,3])
-        self.dL_dout = None
-        self.norm_x = None
         
       
 class NLPLayerNorm(Layer):
@@ -587,7 +587,7 @@ class NLPLayerNorm(Layer):
         diag = vmap(vmap(_F_Jii))(self.x_sub_mean, self.norm_x, self.var).squeeze()
         return vmap(vmap(_diag_set))(jac_base, diag)
         
-        
+    @cleanup("x_sub_mean", "var")
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the NLP layer norm output and returns the derivative of the loss with respect to the NLP layer norm input
@@ -603,15 +603,12 @@ class NLPLayerNorm(Layer):
         dx_hat = dL_dout * self.gamma.view(1,1,-1)  
         dL_dvar = torch.sum(dx_hat * self.x_sub_mean, dim=-1, keepdim=True) * -.5 * self.var**(-1.5)
         dL_dmean = torch.sum(dx_hat/-torch.sqrt(self.var), dim=-1, keepdim=True) + dL_dvar * torch.mean(-2. * self.x_sub_mean, dim=-1, keepdim=True)
-        dL_din = dx_hat / torch.sqrt(self.var) + dL_dvar * 2. * self.x_sub_mean /self.dim_size + dL_dmean / self.dim_size
-        self.x_sub_mean = None
-        self.var = None
-        return dL_din
+        return dx_hat / torch.sqrt(self.var) + dL_dvar * 2. * self.x_sub_mean /self.dim_size + dL_dmean / self.dim_size
         
         #J = self._norm_jacobian()
         #return vmap(vmap(torch.mm))(dL_dout.unsqueeze(-2), J).squeeze()
 
-        
+    @cleanup("dL_dout", "norm_x")
     def backward_p2(self):
         """
         Computes the gradients of the parameter in the NLP layer norm
@@ -666,6 +663,7 @@ class NLPRMSNorm(Layer):
         self.rms_norm_x = x*torch.rsqrt(self.mean_pow2)
         return self.rms_norm_x*self.weights
     
+    @cleanup("inputs", "mean_pow2")
     def _rmsnorm_jacobian(self):
         """Returns the Jacobian of the NLP RMS norm
 
@@ -702,19 +700,22 @@ class NLPRMSNorm(Layer):
         Returns:
             torch.Tensor: The derivatives of the loss with respect to the NLP RMS norm inputs
         """
-        self.dL_dout[:] = dL_dout
+        self.dL_dout = dL_dout
         J = self._rmsnorm_jacobian()
         return vmap(vmap(torch.mm))(dL_dout.unsqueeze(-2), J).squeeze()
     
+    @cleanup("dL_dout", "rms_norm_x")
     def backward_p2(self):
         """
         Computes the gradients of the parameter in the NLP layer norm
         """
         self.weights_g[:] = torch.sum(self.dL_dout*self.rms_norm_x, dim=tuple(range(self.dL_dout.ndim)[:-1]))
+        self.dL_dout = None
+        self.rms_norm_x = None
 
         
 class BertBlock(Layer):
-    def __init__(self, emb_dim: int, num_heads: int, dim_ff:int, activation:Layer=ReLU, eps:float=1e-08, p:float=0.1):
+    def __init__(self, emb_dim: int, num_heads: int, dim_ff:int, activation:Layer=ReLU, eps:float=1e-08, p:float=0.1, device = "cuda"):
         """
         Initialize BERT block
 
@@ -743,35 +744,14 @@ class BertBlock(Layer):
                       "ff": NLPRMSNorm(-1, emb_dim, eps=eps)}
         self.dropouts = {"multi_head": Dropout(p=p),
                          "ff": Dropout(p=p)}
-    
-    def initial_pass(self, x: torch.Tensor):
-        """
-        Performs an initial pass through the BERT block and generates all intermediates
-
-        Args:
-            x (torch.Tensor): Input tensor
-
-        Returns:
-            torch.Tensor: Output tensor
-        """
         
-        if "cuda" in str(x.device):
+        if device == "cuda":
             self.device = "cuda"
             self.streams = []
             for _ in range(5):  # 5 Layers with parameters
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
-
-        mh_out = self.multihead.initial_pass(x, x, x) + x
-        norm_mh_out = self.norms["multi_head"].initial_pass(mh_out)
-        norm_mh_out = self.dropouts["multi_head"].initial_pass(norm_mh_out)
-        
-        ff1 = self.linears[0].initial_pass(norm_mh_out)
-        a = self.ff_act.initial_pass(ff1)
-        ff2 = self.linears[1].initial_pass(a) + norm_mh_out
-        ff2_norm = self.norms["ff"].initial_pass(ff2)
-        return self.dropouts["ff"].initial_pass(ff2_norm)
         
     def forward(self, x:torch.Tensor):
         """
@@ -886,21 +866,6 @@ class Conv2D(Layer):
             
         if self.stride[0] > 3 or self.stride[1] > 3:
             raise NotImplementedError("Stride larger than 3 not implemented")
-    
-    def initial_pass(self, x:torch.Tensor):
-        """
-        Performs an initial pass through the Conv2D layer and generates all intermediates
-
-        Args:
-            x (torch.Tensor): Input Tensor
-
-        Returns:
-            torch.Tensor: Output Tensor
-        """
-        self.inputs = torch.zeros_like(x)
-        out = F.conv2d(x, self.kernel, self.bias, self.stride, self.padding)
-        self.dL_dout = torch.zeros_like(out)
-        return out
         
     def forward(self, x:torch.Tensor):
         """
@@ -912,7 +877,7 @@ class Conv2D(Layer):
         Returns:
             torch.Tensor: Output Tensor
         """
-        self.inputs[:] = x
+        self.inputs = x
         return F.conv2d(x, self.kernel, self.bias, stride=self.stride, padding=self.padding)
     
     def backward_p1(self, dL_dout: torch.Tensor):
@@ -925,21 +890,29 @@ class Conv2D(Layer):
         Returns:
             torch.Tensor: derivative of the loss with respect to the Conv2D Layer's input
         """
-        self.dL_dout[:] = dL_dout
+        self.dL_dout = dL_dout
         #TODO fix bug when stride is greater than 3
         dL_din = F.conv_transpose2d(dL_dout, self.kernel, stride=self.stride, padding=self.padding, output_padding=(self.stride[0]-1,self.stride[1]-1))
         return dL_din
-        
+    
+    @cleanup("dL_dout", "inputs")
     def backward_p2(self):
         """
         Computes the gradients of the parameter within the Conv2D layer
         """
         if isinstance(self.bias, torch.Tensor):
             self.bias_g[:] = torch.sum(self.dL_dout, dim=(0, 2, 3))
+        
+        #print(self.inputs.unsqueeze(-3).shape, self.dL_dout.unsqueeze(-3).unsqueeze(-3).shape)
+
         def _dL_dk_fn(feature, kernal, stride, padding):
-            return F.conv2d(feature, kernal, stride=stride, padding=padding).squeeze(0)
+            new_stride = [stride[0]*kernal.shape[2], stride[1]*kernal.shape[3]]
+            out = F.conv2d(feature, kernal, stride=tuple(new_stride), padding=padding).squeeze(0)
+            return out
+        # witchcraft (apply a conv between each input and output channel and sum)
         self.kernel_g[:] = torch.sum(vmap(vmap(vmap(_dL_dk_fn, in_dims=(0, None)), in_dims=(None, 0)))(self.inputs.unsqueeze(-3), self.dL_dout.unsqueeze(-3).unsqueeze(-3), stride=self.stride, padding=self.padding),dim=0)
-    
+
+
 class MaxPool2D(Layer):
     def __init__(self, k_size: Union[Sequence[int], int], padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1):
         """
@@ -968,20 +941,6 @@ class MaxPool2D(Layer):
             self.stride = (stride, stride)
         else:
             self.stride = stride
-        
-    
-    def initial_pass(self, x: torch.Tensor):
-        """
-        Performs an initial pass through the MaxPool2D layer and generates all intermediates
-
-        Args:
-            x (torch.Tensor): Input tensor
-
-        Returns:
-            torch.Tensor: Output tensor
-        """
-        out, self.indices = F.max_pool2d(x, kernel_size=self.k_size, stride=self.stride, padding=self.padding, return_indices=True)
-        return out
     
     def forward(self, x: torch.Tensor):
         """
@@ -993,9 +952,10 @@ class MaxPool2D(Layer):
         Returns:
             torch.Tensor: Output tensor
         """
-        out, self.indices[:] = F.max_pool2d(x, kernel_size=self.k_size, stride=self.stride, padding=self.padding, return_indices=True)
+        out, self.indices = F.max_pool2d(x, kernel_size=self.k_size, stride=self.stride, padding=self.padding, return_indices=True)
         return out
     
+    @cleanup("indices")
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the MaxPool2D Layer's output and returns the derivative of the loss with respect to the MaxPool2D Layer's input
@@ -1006,14 +966,15 @@ class MaxPool2D(Layer):
         Returns:
             torch.Tensor: derivative of the loss with respect to the MaxPool2D Layer's input
         """
-        return F.max_unpool2d(dL_dout, self.indices, kernel_size=self.k_size, stride=self.stride, padding=self.padding)
-    
+        out = F.max_unpool2d(dL_dout, self.indices, kernel_size=self.k_size, stride=self.stride, padding=self.padding)
+        return out
+
     def backward_p2(self):
         pass
 
 
 class AvgPool2D(Layer):
-    def __init__(self, k_size: Union[Sequence[int], int], padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1):
+    def __init__(self, k_size: Union[Sequence[int], int], padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=None):
         """
         Initializes a AvgPool2D layer
 
@@ -1035,24 +996,16 @@ class AvgPool2D(Layer):
             self.padding = 1 if padding else 0
         else:
             self.padding = padding
-
-        if isinstance(stride, int):
+        
+        if stride is None:
+            self.stride = self.k_size
+        elif isinstance(stride, int):
             self.stride = (stride, stride)
         else:
             self.stride = stride
         
-    
-    def initial_pass(self, x: torch.Tensor):
-        """
-        Performs an initial pass through the AvgPool2D layer
-
-        Args:
-            x (torch.Tensor): Input tensor
-
-        Returns:
-            torch.Tensor: Output tensor
-        """
-        return self.forward(x)
+        if self.stride[0] != self.k_size[0]:
+            raise NotImplementedError("A stride size not equal to the kernel size has not been implmented due to the interpolation used in the backward pass")
     
     def forward(self, x: torch.Tensor):
         """
@@ -1076,6 +1029,8 @@ class AvgPool2D(Layer):
         Returns:
             torch.Tensor: derivative of the loss with respect to the AvgPool2D Layer's input
         """
+        intrp_size = (dL_dout.shape[2]*self.k_size[0], dL_dout.shape[3]*self.k_size[1])
+        dL_dout = F.interpolate(dL_dout, size=intrp_size)
         return dL_dout * (1/(self.k_size[0]*self.k_size[1]))
     
     def backward_p2(self):
@@ -1083,7 +1038,7 @@ class AvgPool2D(Layer):
 
 class BasicResNetBlock(Layer):
     expansion = 1
-    def __init__(self, in_channels: int, out_channels: int, stride: int=1):
+    def __init__(self, in_channels: int, out_channels: int, stride: int=1, device: str="cuda"):
         """
         Initializes a Basic ResNet Block.
 
@@ -1113,33 +1068,14 @@ class BasicResNetBlock(Layer):
                              ]
         else:
             self.shortcut = []
-    
-    def initial_pass(self, x: torch.Tensor):
-        """
-        Performs an initial pass through the BasicResNetBlock and generates all intermediates 
-
-        Args:
-            x (torch.Tensor): Input tensor
-
-        Returns:
-            torch.Tensor: Output tensor
-        """
-        if "cuda" in x.device.type:
+        
+        if device == "cuda":
             self.streams = []
             self.device = "cuda"
             for _ in range(len(self.convs) + len(self.batchnorms) + len(self.shortcut)):
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
-        out = self.convs[0].initial_pass(x)
-        out = self.batchnorms[0].initial_pass(out)
-        out = self.relus[0].initial_pass(out)
-        out = self.convs[1].initial_pass(out)
-        out = self.batchnorms[1].initial_pass(out)
-        if self.shortcut:
-            for layer in self.shortcut:
-                x = layer.initial_pass(x)
-        return self.relus[1].initial_pass(out + x)
     
     def forward(self, x: torch.Tensor):
         """
@@ -1209,7 +1145,7 @@ class BasicResNetBlock(Layer):
 
 class ResNetBottleneck(Layer):
     expansion = 4
-    def __init__(self, in_channels: int, out_channels: int, stride: int=1):
+    def __init__(self, in_channels: int, out_channels: int, stride: int=1, device: str="cuda"):
         """
         Initializes a Basic ResNet Block.
 
@@ -1241,39 +1177,14 @@ class ResNetBottleneck(Layer):
                              ]
         else:
             self.shortcut = []
-    
-    def initial_pass(self, x:torch.Tensor):
-        """
-        Performs an initial pass through the ResNetBottleneck and generates all intermediates 
-
-        Args:
-            x (torch.Tensor): Input tensor
-
-        Returns:
-            torch.Tensor: Output tensor
-        """
-        if "cuda" in x.device.type:
+        
+        if device == "cuda":
             self.streams = []
             self.device = "cuda"
             for _ in range(len(self.convs) + len(self.batchnorms) + len(self.shortcut)):
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
-        
-        out = self.convs[0].initial_pass(x)
-        out = self.batchnorms[0].initial_pass(out)
-        out = self.relus[0].initial_pass(out)
-        out = self.convs[1].initial_pass(out)
-        out = self.batchnorms[1].initial_pass(out)
-        out = self.relus[1].initial_pass(out)
-        out = self.convs[2].initial_pass(out)
-        out = self.batchnorms[2].initial_pass(out)
-        
-        if self.shortcut:
-            for layer in self.shortcut:
-                x = layer.initial_pass(x)
-                
-        return self.relus[2].initial_pass(out + x)
             
     def forward(self, x: torch.Tensor):
         """
@@ -1341,7 +1252,7 @@ class ResNetBottleneck(Layer):
                 with torch.cuda.stream(self.streams[i+len(self.convs)+len(self.batchnorms)]):
                     layer.backward_p2()
         
-        if self.device == "cpu":
+        elif self.device == "cpu":
             for layer in self.convs:
                 layer.backward_p2()
             for layer in self.batchnorms:
@@ -1352,8 +1263,17 @@ class ResNetBottleneck(Layer):
 class ResNet(Layer):
     # For Reference https://github.com/henryqin1997/CIFAR10-ResNet50-PyTorch/blob/master/models/resnet.py
     # Needs to be parallised just for testing
-    def __init__(self, block: Union[BasicResNetBlock , ResNetBottleneck], num_blocks: list, num_classes: int=10):
+    def __init__(self, block: Union[BasicResNetBlock , ResNetBottleneck], num_blocks: list, num_classes: int=10, device:str = "cuda"):
         self.in_planes = 64
+
+        if device == "cuda":
+            self.device = "cuda"
+            for _ in range(3):  # conv1, bn1, dense
+                self.streams.append(torch.cuda.Stream())
+            for _ in range(4):  # layers
+                self.streams.append(torch.cuda.Stream())
+        else:
+            self.device = "cpu"
         
         self.conv1 = Conv2D(3, 64, 3, stride=1, padding=1, bias=False)
         self.bn1 = BatchNorm2D(64)
@@ -1367,37 +1287,15 @@ class ResNet(Layer):
         
         self.relu = ReLU()
         self.avgpool = AvgPool2D(4)
+        
     
     def _make_layer(self, block, planes, num_blocks, stride):
         strides = [stride] + [1]*(num_blocks-1)
         layers = []
         for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
+            layers.append(block(self.in_planes, planes, stride, device=self.device))
             self.in_planes = planes * block.expansion
-        return Sequential(layers)
-    
-    def initial_pass(self, x:torch.Tensor):
-        self.streams = []
-        if "cuda" in x.device.type:
-            self.device = "cuda"
-            for _ in range(3):  # conv1, bn1, dense
-                self.streams.append(torch.cuda.Stream())
-            for _ in range(4):  # layers
-                self.streams.append(torch.cuda.Stream())
-        else:
-            self.device = "cpu"
-        out = self.conv1.initial_pass(x)
-        out = self.bn1.initial_pass(out)
-        out = self.relu.initial_pass(out)
-        out = self.layers1.initial_pass(out)
-        out = self.layers2.initial_pass(out)
-        out = self.layers3.initial_pass(out)
-        out = self.layers4.initial_pass(out)
-        out = self.avgpool.initial_pass(out)
-        self.preflattened = out.shape
-        out = out.view(out.size(0), -1)
-        out = self.linear.initial_pass(out)
-        return out
+        return Sequential(layers, device=self.device)
         
     def forward(self, x: torch.Tensor):
         out = self.conv1(x)
@@ -1408,6 +1306,7 @@ class ResNet(Layer):
         out = self.layers3(out)
         out = self.layers4(out)
         out = self.avgpool(out)
+        self.preflattened = out.shape
         out = out.view(out.size(0), -1)
         out = self.linear(out)
         return out
@@ -1425,41 +1324,47 @@ class ResNet(Layer):
         return self.conv1.backward_p1(dL_dconv)
     
     def backward_p2(self):
-        with self.streams[0]:
+        if self.device == "cuda":
+            with self.streams[0]:
+                self.conv1.backward_p2()
+            with self.streams[1]:
+                self.bn1.backward_p2()
+            with self.streams[2]:
+                self.linear.backward_p2()
+            with self.streams[3]:
+                self.layers1.backward_p2()
+            with self.streams[4]:
+                self.layers2.backward_p2()
+            with self.streams[5]:
+                self.layers3.backward_p2()
+            with self.streams[6]:
+                self.layers4.backward_p2()
+        else:
             self.conv1.backward_p2()
-        with self.streams[1]:
             self.bn1.backward_p2()
-        with self.streams[2]:
             self.linear.backward_p2()
-        with self.streams[3]:
             self.layers1.backward_p2()
-        with self.streams[4]:
             self.layers2.backward_p2()
-        with self.streams[5]:
             self.layers3.backward_p2()
-        with self.streams[6]:
             self.layers4.backward_p2()
 
 
 class SiLU(Activation):
-    def initial_pass(self, x:torch.Tensor):
-        self.inputs = x
-        return x / (1+torch.exp(-x))
-        
     def forward(self, x: torch.Tensor):
-        self.inputs[:] = x
+        self.inputs = x
         return x * torch.sigmoid(x)
 
+    @cleanup("inputs")
     def backward_p1(self, dL_dout: torch.Tensor):
         e_x = torch.exp(-self.inputs)
-        return dL_dout * ((1+e_x) + self.inputs*e_x)/((1+e_x)**2)
-    
+        out = dL_dout * ((1+e_x) + self.inputs*e_x)/((1+e_x)**2)
+
     def backward_p2(self):
         pass
 
 
 class llamaFF(Layer):
-    def __init__(self, dim, hidden_dim, multiple_of, ffn_dim_multiplier = None):
+    def __init__(self, dim, hidden_dim, multiple_of, ffn_dim_multiplier = None, device:str = "cuda"):
         hidden_dim = int(2 * hidden_dim / 3)
         
         if ffn_dim_multiplier is not None:
@@ -1473,30 +1378,24 @@ class llamaFF(Layer):
         ]
         
         self.silu = SiLU()
-        
-    def initial_pass(self, x:torch.Tensor):
+
         self.streams = []
-        if "cuda" in x.device.type:
+        if device == "cuda":
             self.device = "cuda"
             for _ in range(3):  # 3 dense
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
-        l0 = self.linears[0].initial_pass(x)
-        l2 = self.linears[2].initial_pass(x)
-        self.l2 = l2
-        silu_out = self.silu.initial_pass(l0)
-        self.silu_out = silu_out
-        return self.linears[1].initial_pass(silu_out*l2)
     
     def forward(self, x: torch.Tensor):
         l0 = self.linears[0](x)
         l2 = self.linears[2](x)
-        self.l2[:] = l2
+        self.l2 = l2
         silu_out = self.silu.initial_pass(l0)
-        self.silu_out[:] = silu_out
+        self.silu_out = silu_out
         return self.linears[1](self.silu(l0)*l2)
     
+    @cleanup("l2", "silu_out")
     def backward_p1(self, dL_dout:torch.Tensor):
         dL_dl2in = self.linears[1].backward_p1(dL_dout)
         dL_dl0 = self.silu.backward_p1(dL_dl2in)
@@ -1549,7 +1448,11 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .expand(bs, slen, n_kv_heads, n_rep, head_dim)
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
- 
+
+class RotaryEmbeddings(Layer):
+    def __init__(self, freq_cis):
+        ...
+
 class GroupedMultiQueryAttention(Layer):
     def __init__(self, emb_dim: int, num_heads: int, num_kv_heads:int, max_seq_len:int):
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
@@ -1560,10 +1463,10 @@ class GroupedMultiQueryAttention(Layer):
         self.head_dim = emb_dim // num_heads
         self.inv_square_d = 1/torch.sqrt(torch.tensor(self.head_dim))
         
-        self.linears = {"Q": Dense(self.emb_dim, self.emb_dim, bias=False),
-                        "K": Dense(self.emb_dim, self.emb_dim, bias=False),
-                        "V": Dense(self.emb_dim, self.emb_dim, bias=False),
-                        "O": Dense(self.emb_dim, self.emb_dim, bias=False)
+        self.linears = {"Q": Dense(self.emb_dim, self.num_heads*self.head_dim, bias=False),
+                        "K": Dense(self.emb_dim, self.num_kv_heads*self.head_dim, bias=False),
+                        "V": Dense(self.emb_dim, self.num_kv_heads*self.head_dim, bias=False),
+                        "O": Dense(self.num_heads*self.head_dim, self.emb_dim, bias=False)
                         }
 
     def initial_pass(self, x: torch.Tensor):
@@ -1578,34 +1481,35 @@ class GroupedMultiQueryAttention(Layer):
         self.linears["O"].initial_pass(x)
 
     
-    def forward(self, x: torch.Tensor, start_pos: int, freq_cis: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor, freq_cis: torch.Tensor, mask: Optional[torch.Tensor] = None):
         batch_size, seqlen, _ = x.shape
 
         xq, xk, xv = self.linears["Q"](x), self.linears["K"](x), self.linears["V"](x)
 
         xq = xq.view(batch_size, seqlen, self.num_heads, self.head_dim)
         xk = xk.view(batch_size, seqlen, self.num_kv_heads, self.head_dim)
-        xv = xv.view(batch_size, seqlen, self.num_kv_heads, self.head_dim)
+        self.xv = xv.view(batch_size, seqlen, self.num_kv_heads, self.head_dim)
 
-        self.xq, xk = apply_rotary_emb(xq, xk, freq_cis)
+        xq, self.xk = apply_rotary_emb(xq, xk, freq_cis)
+        self.xq = torch.cat(xq.unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
+        #self.xq = xq #torch.chunk(xq, self.n_rep, dim=-2)
 
-        self.k_cache.to(self.xq)
-        self.v_cache.to(self.xq)
-
-        self.k_cache[:batch_size, start_pos : start_pos + seqlen] = xk
-        self.v_cache[:batch_size, start_pos : start_pos + seqlen] = xv
-
-        self.keys = repeat_kv(self.k_cache, self.n_rep)
-        self.values = repeat_kv(self.v_cache, self.n_rep)
-
-        Q_KT = vmap(lambda q, k: torch.bmm(q, k.transpose(-1,-2)), in_dims=-2, out_dims=-2)(self.xq, self.keys) * self.inv_square_d
+        print(xk.shape, xq.shape)
+        QK_T = vmap(lambda q, k: vmap(lambda _q: torch.bmm(_q, k.transpose(-1,-2)), in_dims=-2, out_dims=-2)(q), in_dims=-2, out_dims=-2)(self.xq, self.xk) * self.inv_square_d
+        QK_T = torch.flatten(QK_T, -3, -2)
+        #vmap(lambda k: vamp(torch.bmm(q, k.transpose(-1,-2)))(self.xk)    * self.inv_square_d
+        print(QK_T.shape)
+        #Q_KT = vmap(lambda q, k: torch.bmm(q, k.transpose(-1,-2)), in_dims=-2, out_dims=-2)(self.xq, self.xk) * self.inv_square_d
         if mask is not None:
             QK_T = vmap(lambda x: x + mask, in_dims=-2, out_dims=-2)(QK_T)
         def _softmax(x):
             e_x = torch.exp(x)
             return e_x / torch.sum(e_x)
         self.sQK_T = vmap(vmap(vmap(_softmax)))(QK_T)
-        out = vmap(lambda qk_t, v: torch.bmm(qk_t, v), in_dims=-2, out_dims=-2)(self.sQK_T, self.values)
+        self.sQK_T = torch.cat(self.sQK_T.unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
+        print(self.sQK_T.shape)
+        out = vmap(lambda sqkt, v: vmap(lambda _sqkt: torch.bmm(_sqkt, v), in_dims=-2, out_dims=-2)(sqkt), in_dims=-2, out_dims=-2)(self.sQK_T, self.xv)
+        out = torch.flatten(out, -3, -2)
         out = torch.flatten(out, -2, -1)
         return self.linears["O"](out)
 
@@ -1657,25 +1561,28 @@ class GroupedMultiQueryAttention(Layer):
             for k in self.linears.keys():
                 self.linears[k].backward_p2()  
 
-        
-        
 
 if __name__ == "__main__":
 
     def test(layer, x, dL_dout):
         with torch.no_grad():
-            layer.initial_pass(x)
             layer.forward(x)
             my_back = layer.backward_p1(dL_dout)
             layer.backward_p2()
         true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
+        print(my_back.shape, true_back.shape)
         if len(x.shape) == 3:
             print(my_back[:2,:2,:2])
             print(true_back[:2,:2,:2])
+        elif len(x.shape) == 2:
+            print(my_back[:2,:2])
+            print(true_back[:2,:2])
         else:
             print(my_back[:2,:2,:2, :2])
             print(true_back[:2,:2,:2, :2])
-        print(torch.allclose(my_back, true_back))
+        print(my_back.mean())
+        num_correct = (torch.isclose(my_back, true_back, rtol=0.01, atol=0.00001)).sum()
+        print(f"Num correct: {num_correct}/{my_back.numel()}")
         return my_back, true_back
     
     def test_dropout():
@@ -1696,13 +1603,14 @@ if __name__ == "__main__":
         print(torch.allclose(my_back, true_back))
     
     def test_grouped_mulit_head():
-        x = torch.randn(16, 24, 80)
-        dL_dout = torch.ones(16,23,80)
-        layer = GroupedMultiQueryAttention(80, 8, None, 30)
-        freqs_cis = precompute_freqs_cis(80 // 8, 30 * 2)[23: 23 + 30]
+        x = torch.randn(16, 30, 80)
+        dL_dout = torch.ones(16,30,80)
+        layer = GroupedMultiQueryAttention(80, 8, 4, 30)
+        freqs_cis = precompute_freqs_cis(80 // 8, 30)
+        print(freqs_cis.shape)
         with torch.no_grad():
-            layer.initial_pass(x)
-            layer.forward(x, 24, freq_cis=freqs_cis)
+            layer.forward(x, freq_cis=freqs_cis)
+            exit()
             my_back = layer.backward_p1(dL_dout)
             layer.backward_p2()
         true_back = torch.autograd.functional.vjp(lambda _x: layer.forward(_x, _x, _x), x, dL_dout)[1]
@@ -1715,7 +1623,6 @@ if __name__ == "__main__":
         test(NLPLayerNorm(-1, 80), m.sample((16,24,80)), torch.ones(16,24,80))
     
     def test_bert():
-        
         m = torch.distributions.Uniform(1, 3)
         x = torch.randn(16, 24, 80)
         x = m.sample(x.shape)
@@ -1732,11 +1639,15 @@ if __name__ == "__main__":
         m = torch.distributions.Uniform(1, 3)
         image = m.sample((16, 3, 80, 80))
         test(BatchNorm2D(3), image, torch.ones(16,3,80,80))
+
+    def test_dense():
+        x = torch.randn(16, 80)
+        test(Dense(80, 160), x, torch.ones(16,160))
     
     def test_resnet():
         image = torch.randn(16, 3, 32, 32)
-        resnet50 = ResNet(ResNetBottleneck, [3, 4, 6, 3])
-        test(resnet50, image, torch.ones_like(resnet50.initial_pass(image)))
+        resnet50 = ResNet(ResNetBottleneck, [3, 4, 6, 3], device="cpu")
+        test(resnet50, image, torch.ones_like(resnet50(image)))
     
     def test_rmsnorm():
         m = torch.distributions.Uniform(1, 3)
@@ -1745,4 +1656,5 @@ if __name__ == "__main__":
         layer = NLPRMSNorm(-1,80)
         test(layer, x, dL_dout)
 
-    test_multihead()
+
+    test_resnet()
