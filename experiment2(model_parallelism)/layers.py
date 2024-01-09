@@ -12,9 +12,10 @@ class cleanup(object):
     def __call__(self, func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            func(*args, **kwargs)
+            out = func(*args, **kwargs)
             for arg in self.args:
                 setattr(args[0], arg, None)
+            return out
         return wrapper
 
 class Layer(ABC):
@@ -25,6 +26,9 @@ class Layer(ABC):
     def forward(self):
         pass
     
+    def init_params(self):
+        pass
+
     @abstractmethod
     def backward_p1(self):
         pass
@@ -59,6 +63,10 @@ class Sequential:
         
     def __call__(self, *args: Any, **kwargs: Any):
         return self.forward(*args, **kwargs)
+
+    def init_params(self):
+        for layer in self.layers:
+            layer.init_params()
     
     def forward(self, x: torch.Tensor):
         for layer in self.layers:
@@ -82,7 +90,7 @@ class Sequential:
 
 
 class Dense(Layer):
-    def __init__(self, input_size: int, output_size: int, bias: bool = True):
+    def __init__(self, input_size: int, output_size: int, bias: bool = True, device:str = "cuda"):
         """
         Initialize a Dense Layer
 
@@ -90,6 +98,7 @@ class Dense(Layer):
             input_size (int): size of input vector
             output_size (int): size of output vector
             bias (bool): whether or not to include bias
+            device (str): device to use for computation (cpu or cuda)
         
         Attributes:
             weights (torch.Tensor): weights of the dense layer
@@ -100,12 +109,19 @@ class Dense(Layer):
             dL_dout (torch.Tensor): derivative of the loss with respect to the dense layers output
         
         """
+        self.input_size = input_size
+        self.output_size = output_size
+        self.bias_ = bias
+        self.device = device
+    
+    @cleanup("input_size", "output_size", "bias_")
+    def init_params(self):
         m = torch.distributions.normal.Normal(0, 0.01)
-        self.weights = m.sample(torch.Size([input_size, output_size]))
-        self.bias = torch.zeros(output_size) if bias else None
+        self.weights = m.sample(torch.Size([self.input_size, self.output_size])).to(self.device)
+        self.bias = torch.zeros(self.output_size, device=self.device) if self.bias_ else None
         
-        self.weights_g = torch.zeros_like(self.weights)
-        self.bias_g = torch.zeros_like(self.bias) if bias else None
+        self.weights_g = torch.zeros_like(self.weights, device=self.device)
+        self.bias_g = torch.zeros_like(self.bias, device=self.device) if self.bias_ else None
     
     def forward(self, x: torch.Tensor):
         """
@@ -178,7 +194,7 @@ class ReLU(Activation):
             torch.Tensor: Output tensor after applying relu
         """
         self.inputs = x
-        out = torch.maximum(x, torch.tensor(0.0, dtype=x.dtype))
+        out = torch.maximum(x, torch.tensor(0.0, dtype=x.dtype, device=x.device))
         return out
     
     @cleanup("inputs")
@@ -195,9 +211,16 @@ class ReLU(Activation):
         dout_din = torch.where(self.inputs>0, 1.0, 0.0)
         return dL_dout*dout_din
 
-    def backward_p2(self):
-        pass
-    
+class GeLU(Activation):
+    def forward(self, x):
+        self.inputs = x
+        return x * 0.5 * (1 + torch.erf(x/((2)**(0.5))))
+
+    @cleanup("inputs")
+    def backward_p1(self, dL_dout):
+        #TODO clean this up 
+        return dL_dout * (0.5 * (1 + torch.erf(self.inputs/((2)**(0.5)))) + (self.inputs)/torch.sqrt(torch.pi) * torch.exp(-torch.pow(self.inputs, 2)))
+
 class Dropout(Layer):
     def __init__(self, p: Optional[float]=0.1):
         """
@@ -228,7 +251,7 @@ class Dropout(Layer):
             return x
         if self.p==1:
             return torch.zeros_like(x)
-        self.p_mask = torch.bernoulli(torch.ones_like(x) -self.p)
+        self.p_mask = torch.bernoulli(torch.ones_like(x, device=x.device) -self.p)
         return x*self.p_mask
     
     @cleanup("p_mask")
@@ -263,6 +286,8 @@ class MultiHeadAttention(Layer):
             emb_dim (int): Size of the embedding dimension
             num_heads (int): Number of attention heads
             p (Optional[float]): Probability for the dropouts. Defaults to 0.1.
+            device (Optional[str]): The device the multi head attention is on. Defaults to "cuda".
+        
         
         Attributes:
             emb_dim (int): Size of the embedding dimension
@@ -283,16 +308,8 @@ class MultiHeadAttention(Layer):
         self.num_heads = num_heads
         self.emb_dim = emb_dim
         self.inv_sqrt_d = (emb_dim / num_heads)**(-1/2)
-        self.linears = {"Q": Dense(self.emb_dim, self.emb_dim),
-                        "K": Dense(self.emb_dim, self.emb_dim),
-                        "V": Dense(self.emb_dim, self.emb_dim),
-                        "O": Dense(self.emb_dim, self.emb_dim)
-                        }
-        self.dropouts = {"Q": Dropout(p=p),
-                         "K": Dropout(p=p),
-                         "V": Dropout(p=p)
-                        }
-        
+        self.p = p
+
         self.inputs = {"Q": None, "K": None, "V": None}
         
         if "cuda" in device:
@@ -302,6 +319,20 @@ class MultiHeadAttention(Layer):
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
+    
+    @cleanup("p")
+    def init_params(self):
+        self.linears = {"Q": Dense(self.emb_dim, self.emb_dim, device=self.device),
+                        "K": Dense(self.emb_dim, self.emb_dim, device=self.device),
+                        "V": Dense(self.emb_dim, self.emb_dim, device=self.device),
+                        "O": Dense(self.emb_dim, self.emb_dim, device=self.device)
+                        }
+        for l in self.linears.values():
+            l.init_params()
+        self.dropouts = {"Q": Dropout(p=self.p),
+                         "K": Dropout(p=self.p),
+                         "V": Dropout(p=self.p)
+                        }
     
     def forward(self, Q, K, V, mask = None):
         """
@@ -415,7 +446,7 @@ class MultiHeadAttention(Layer):
 
 #TODO will have to update for 3D parallelism (DP)
 class BatchNorm2D(Layer):
-    def __init__(self, in_channels: int, eps: float=1e-05, momentum =0.1):
+    def __init__(self, in_channels: int, eps: float=1e-05, momentum =0.1, device:str = "cuda"):
         """
         Initializes a BatchNorm2D layer
 
@@ -423,7 +454,8 @@ class BatchNorm2D(Layer):
             in_channels (int): the number of input channels of the forward input 
             eps (float, optional): eps used to prevent div by 0. Defaults to 1e-05.
             momentum (float, optional): the value used for the running_mean and running_var computation. Defaults to 0.1.
-        
+            device (str, optional): the device to use for the layer. Defaults to "cuda".
+
         Attributes:
             in_channels (int): the number of input channels of the forward input 
             eps (float, optional): eps used to prevent div by 0. Defaults to 1e-05.
@@ -442,17 +474,19 @@ class BatchNorm2D(Layer):
         self.eps = eps
         self.momentum = momentum
         self.in_channels = in_channels
-        
-        self.gamma = torch.ones(in_channels)
-        self.beta = torch.zeros(in_channels)
-        
-        self.gamma_g = torch.zeros(in_channels)
-        self.beta_g = torch.zeros(in_channels)
-        
-        self.r_mean = torch.zeros(1, in_channels, 1, 1)
-        self.r_var = torch.ones(1, in_channels, 1, 1)
-        
+        self.device = device
         self.training = True
+    
+    def init_params(self):
+        self.gamma = torch.ones(self.in_channels, device=self.device)
+        self.beta = torch.zeros(self.in_channels, device=self.device)
+        
+        self.gamma_g = torch.zeros(self.in_channels, device=self.device)
+        self.beta_g = torch.zeros(self.in_channels, device=self.device)
+        
+        self.r_mean = torch.zeros(1, self.in_channels, 1, 1, device=self.device)
+        self.r_var = torch.ones(1, self.in_channels, 1, 1, device=self.device)
+        
     
     def forward(self, x: torch.Tensor):
         """
@@ -511,7 +545,7 @@ class BatchNorm2D(Layer):
         
       
 class NLPLayerNorm(Layer):
-    def __init__(self, dim: int, dim_size: int, eps:Optional[float]=1e-08):
+    def __init__(self, dim: int, dim_size: int, eps:Optional[float]=1e-08, device: Optional[str]="cuda"):
         """
         Initializes the NLP Layer Norm
 
@@ -519,7 +553,8 @@ class NLPLayerNorm(Layer):
             dim (int): Embedding dim
             dim_size (int): Size of embedding dim
             eps (Optional[float]): eps used to prevent div by 0. Defaults to 1e-08.
-        
+            device (Optional[str]): the device to use for the layer. Defaults to "cuda".
+
         Attributes:
             dim (int): Embedding dim
             dim_size (int): Size of embedding dim
@@ -536,12 +571,14 @@ class NLPLayerNorm(Layer):
         self.dim = dim #seqdim for nlp
         self.dim_size = dim_size
         self.eps = eps
+        self.device = device
+    
+    def init_params(self):
+        self.gamma = torch.ones(self.dim_size, device=self.device)
+        self.bias = torch.zeros(self.dim_size, device=self.device)
         
-        self.gamma = torch.ones(dim_size)
-        self.bias = torch.zeros(dim_size)
-        
-        self.gamma_g = torch.zeros(dim_size)
-        self.bias_g = torch.zeros(dim_size)
+        self.gamma_g = torch.zeros(self.dim_size, device=self.device)
+        self.bias_g = torch.zeros(self.dim_size, device=self.device)
         
     def forward(self, x: torch.Tensor):
         """
@@ -620,7 +657,7 @@ class NLPLayerNorm(Layer):
       
         
 class NLPRMSNorm(Layer):
-    def __init__(self, dim: int, dim_size: int, eps: float= 1e-08):
+    def __init__(self, dim: int, dim_size: int, eps: float= 1e-08, device: Optional[str]= "cuda"):
         """
         Initializes the NLP RMS Norm
 
@@ -628,7 +665,9 @@ class NLPRMSNorm(Layer):
             dim (int): Embedding dim
             dim_size (int): Size of embedding dim
             eps (Optional[float]): eps used to prevent div by 0. Defaults to 1e-08.
-        
+            device (Optional[str]): the device to use for the layer. Defaults to "cuda".
+            
+
         Attributes:
             dim (int): Embedding dim
             dim_size (int): Size of embedding dim
@@ -643,10 +682,11 @@ class NLPRMSNorm(Layer):
         self.dim = dim #seqdim for nlp
         self.dim_size = dim_size
         self.eps = eps
-        
-        self.weights = torch.ones(dim_size)
-        
-        self.weights_g = torch.zeros(dim_size)
+        self.device = device
+    
+    def init_params(self):
+        self.weights = torch.ones(self.dim_size, device=self.device)
+        self.weights_g = torch.zeros(self.dim_size, device=self.device)
     
     def forward(self, x: torch.Tensor):
         """
@@ -726,7 +766,8 @@ class BertBlock(Layer):
             activation (Layer, optional): activation function used on hidden layer in ffn. Defaults to ReLU.
             eps (float, optional): the eps used in the layer norms. Defaults to 1e-08.
             p (float, optional): the probability used in the dropouts. Defaults to 0.1.
-        
+            device (str optional): the device used for computation. Defaults to "cuda".
+
         Attributes:
             multihead (MultiHeadAttention): multihead attention layer
             linears (Dict[Dense]): linear layers
@@ -736,14 +777,12 @@ class BertBlock(Layer):
             device (str): device used for computation
             streams (List[torch.cuda.Stream]): streams used for parallel computation of backward_p2
         """
-        self.multihead = MultiHeadAttention(emb_dim=emb_dim, num_heads=num_heads)
-        self.linears = {0: Dense(emb_dim, dim_ff),
-                        1: Dense(dim_ff, emb_dim)}
-        self.ff_act = activation()
-        self.norms = {"multi_head": NLPRMSNorm(-1, emb_dim, eps=eps),
-                      "ff": NLPRMSNorm(-1, emb_dim, eps=eps)}
-        self.dropouts = {"multi_head": Dropout(p=p),
-                         "ff": Dropout(p=p)}
+        self.emb_dim = emb_dim
+        self.num_heads = num_heads
+        self.dim_ff = dim_ff
+        self.activation = activation
+        self.eps = eps
+        self.p = p
         
         if device == "cuda":
             self.device = "cuda"
@@ -752,6 +791,22 @@ class BertBlock(Layer):
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
+    
+    @cleanup("emb_dim", "num_heads", "dim_ff", "eps", "p")
+    def init_params(self):
+        self.multihead = MultiHeadAttention(emb_dim=self.emb_dim, num_heads=self.num_heads, device=self.device)
+        self.multihead.init_params()
+        self.linears = {0: Dense(self.emb_dim, self.dim_ff, device=self.device),
+                        1: Dense(self.dim_ff, self.emb_dim, device=self.device)}
+        for l in self.linears.values():
+            l.init_params()
+        self.ff_act = self.activation()
+        self.norms = {"multi_head": NLPRMSNorm(-1, self.emb_dim, eps=self.eps, device=self.device),
+                      "ff": NLPRMSNorm(-1, self.emb_dim, eps=self.eps, device=self.device)}
+        for n in self.norms.values():
+            n.init_params()
+        self.dropouts = {"multi_head": Dropout(p=self.p),
+                         "ff": Dropout(p=self.p)}
         
     def forward(self, x:torch.Tensor):
         """
@@ -763,15 +818,15 @@ class BertBlock(Layer):
         Returns:
             torch.Tensor: Output tensor of Bert block 
         """
-        mh_out = self.multihead(x, x, x) + x
-        norm_mh_out = self.norms["multi_head"](mh_out)
-        norm_mh_out = self.dropouts["multi_head"](norm_mh_out)
+        mh_out = self.multihead(x, x, x)
+        mh_out = self.dropouts["multi_head"](mh_out)
+        norm_mh_out = self.norms["multi_head"](mh_out + x)
         
         ff1 = self.linears[0](norm_mh_out)
         a = self.ff_act(ff1)
-        ff2 = self.linears[1](a) + norm_mh_out
-        ff2_norm = self.norms["ff"](ff2)
-        return self.dropouts["ff"](ff2_norm)
+        ff2 = self.linears[1](a)
+        ff2 = self.dropouts["ff"](ff2)
+        return self.norms["ff"](ff2 + norm_mh_out)
     
     def backward_p1(self, dL_dout:torch.Tensor):
         """
@@ -784,16 +839,17 @@ class BertBlock(Layer):
             torch.Tensor: The derivative of the loss with respect to the BERT block input
 
         """
-        dL_dff2norm = self.dropouts["ff"].backward_p1(dL_dout)
-        dL_dff2 = self.norms["ff"].backward_p1(dL_dff2norm)
+
+        dL_dff2_d = self.norms["ff"].backward_p1(dL_dout)
+        dL_dff2 = self.dropouts["ff"].backward_p1(dL_dff2_d)
         dL_da = self.linears[1].backward_p1(dL_dff2)
         dL_dff1 = self.ff_act.backward_p1(dL_da)
-        dL_dnormmhout = self.linears[0].backward_p1(dL_dff1) + dL_dff2
-        
-        dL_dnormmhout = self.dropouts["multi_head"].backward_p1(dL_dnormmhout)
-        dL_dmhout = self.norms["multi_head"].backward_p1(dL_dnormmhout)
-        dL_din1 = torch.sum(torch.stack(self.multihead.backward_p1(dL_dmhout)),dim=0)
-        return dL_din1 + dL_dmhout  # dLdmhout == dL_din2
+        dL_dnormmhout = self.linears[0].backward_p1(dL_dff1) + dL_dff2_d
+
+        dL_dmhout_d = self.norms["multi_head"].backward_p1(dL_dnormmhout)
+        dL_dmhout = self.dropouts["multi_head"].backward_p1(dL_dmhout_d)
+        dL_din = torch.sum(torch.stack(self.multihead.backward_p1(dL_dmhout)),dim=0)
+        return dL_din + dL_dmhout_d
     
     def backward_p2(self):
         """
@@ -818,7 +874,7 @@ class BertBlock(Layer):
                 self.norms[k].backward_p2()
             
 class Conv2D(Layer):
-    def __init__(self, in_channels: int, out_channels: int, k_size: Union[Sequence[int], int], bias: bool=True,  padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1):
+    def __init__(self, in_channels: int, out_channels: int, k_size: Union[Sequence[int], int], bias: bool=True,  padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1, device: Optional[str]="cuda"):
         """
         Initializes Conv2D layer
 
@@ -829,6 +885,8 @@ class Conv2D(Layer):
             bias (bool): whether the conv2d layer has bias. Defaults to True.
             padding (Union[bool, int]): the padding either side of the input feature. Defaults to False.
             stride (Union[Sequence[int], int], optional): the stride pattern followed by the kernel. Defaults to 1.
+            device (Optioanl[str]): the device used for computation. Defaults to "cuda".
+            
 
         Raises:
             NotImplementedError: There is a Bug in the backward pass when the stride is greater than 3
@@ -842,17 +900,14 @@ class Conv2D(Layer):
             stride (Tuple[int]): the stride pattern followed by the kernel
             inputs (torch.Tensor): the input tensor
         """
+        self.out_channels = out_channels
+        self.in_channels = in_channels
+        self.bias_ = bias
+
         if isinstance(k_size, int):
-            k_size = (k_size, k_size)
-        self.kernel = torch.randn(out_channels, in_channels, *k_size)
-        if bias:
-            self.bias = torch.zeros(out_channels)
-        else:
-            self.bias = None
+            self.k_size = (k_size, k_size)
         
-        self.kernel_g = torch.zeros_like(self.kernel)
-        if bias:
-            self.bias_g = torch.zeros_like(self.bias)
+        self.device = device
         
         if isinstance(padding, bool):
             self.padding = 1 if padding else 0
@@ -866,6 +921,18 @@ class Conv2D(Layer):
             
         if self.stride[0] > 3 or self.stride[1] > 3:
             raise NotImplementedError("Stride larger than 3 not implemented")
+    
+    @cleanup("out_channels", "in_channels", "k_size", "bias_")
+    def init_params(self):
+        self.kernel = torch.randn(self.out_channels, self.in_channels, *self.k_size, device=self.device)
+        if self.bias_:
+            self.bias = torch.zeros(self.out_channels, device=self.device)
+        else:
+            self.bias = None
+        self.kernel_g = torch.zeros_like(self.kernel, device=self.device)
+        if self.bias_:
+            self.bias_g = torch.zeros_like(self.bias, device=self.device)
+
         
     def forward(self, x:torch.Tensor):
         """
@@ -902,12 +969,10 @@ class Conv2D(Layer):
         """
         if isinstance(self.bias, torch.Tensor):
             self.bias_g[:] = torch.sum(self.dL_dout, dim=(0, 2, 3))
-        
-        #print(self.inputs.unsqueeze(-3).shape, self.dL_dout.unsqueeze(-3).unsqueeze(-3).shape)
 
         def _dL_dk_fn(feature, kernal, stride, padding):
-            new_stride = [stride[0]*kernal.shape[2], stride[1]*kernal.shape[3]]
-            out = F.conv2d(feature, kernal, stride=tuple(new_stride), padding=padding).squeeze(0)
+            new_stride = (stride[0]*kernal.shape[2], stride[1]*kernal.shape[3])
+            out = F.conv2d(feature, kernal, stride=new_stride, padding=padding).squeeze(0)
             return out
         # witchcraft (apply a conv between each input and output channel and sum)
         self.kernel_g[:] = torch.sum(vmap(vmap(vmap(_dL_dk_fn, in_dims=(0, None)), in_dims=(None, 0)))(self.inputs.unsqueeze(-3), self.dL_dout.unsqueeze(-3).unsqueeze(-3), stride=self.stride, padding=self.padding),dim=0)
@@ -1046,6 +1111,7 @@ class BasicResNetBlock(Layer):
             in_channels (int): Number of input channels
             out_channels (int): Number of output channels
             stride (int, optional): he stride pattern followed by the kernel of the first conv layer. Defaults to 1.
+            device (Optional, str): Device used to parallelize the execution of the Basic ResNet Block. Defaults to "cuda".
         
         Attributes:
             convs (List[Conv2D]): List of Conv2D layers
@@ -1055,19 +1121,9 @@ class BasicResNetBlock(Layer):
             streams (List[torch.cuda.Stream]): List of streams used to parallelize the execution of the Basic ResNet Block
             device (str): Device used to parallelize the execution of the Basic ResNet Block
         """
-        self.convs = [Conv2D(in_channels, out_channels, 3, stride=stride, padding=1, bias=False),
-                      Conv2D(out_channels, out_channels, 3, stride=1, padding=1, bias=False)
-                      ]
-        self.batchnorms = [BatchNorm2D(out_channels),
-                           BatchNorm2D(out_channels)
-                           ]
-        self.relus = [ReLU(), ReLU()]
-        if stride != 1 or in_channels != out_channels*self.expansion:
-            self.shortcut = [Conv2D(in_channels, out_channels*self.expansion, 1, stride=stride, bias=False),
-                             BatchNorm2D(out_channels*self.expansion)
-                             ]
-        else:
-            self.shortcut = []
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
         
         if device == "cuda":
             self.streams = []
@@ -1076,6 +1132,29 @@ class BasicResNetBlock(Layer):
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
+    
+    @cleanup("in_channels", "out_channels", "stride")
+    def init_params(self):
+        self.convs = [Conv2D(self.in_channels, self.out_channels, 3, stride=self.stride, padding=1, bias=False, device=self.device),
+                      Conv2D(self.out_channels, self.out_channels, 3, stride=1, padding=1, bias=False, device=self.device)
+                      ]
+        for c in self.convs:
+            c.init_params()
+        self.batchnorms = [BatchNorm2D(self.out_channels, device=self.device),
+                           BatchNorm2D(self.out_channels, device=self.device)
+                           ]
+        for b in self.batchnorms:
+            b.init_params()
+        self.relus = [ReLU(), ReLU()]
+        if self.stride != 1 or self.in_channels != self.out_channels*self.expansion:
+            self.shortcut = [Conv2D(self.in_channels, self.out_channels*self.expansion, 1, stride=self.stride, bias=False, device=self.device),
+                             BatchNorm2D(self.out_channels*self.expansion, device=self.device)
+                             ]
+            for l in self.shortcut:
+                l.init_params()
+        else:
+            self.shortcut = []
+        
     
     def forward(self, x: torch.Tensor):
         """
@@ -1153,6 +1232,7 @@ class ResNetBottleneck(Layer):
             in_channels (int): Number of input channels
             out_channels (int): Number of output channels
             stride (int, optional): he stride pattern followed by the kernel of the first conv layer. Defaults to 1.
+            device (str, optional): Device used to parallelize the execution of the Basic ResNet Block. Defaults to "cuda".
         
         Attributes:
             convs (List[Conv2D]): List of Conv2D layers
@@ -1162,21 +1242,9 @@ class ResNetBottleneck(Layer):
             streams (List[torch.cuda.Stream]): List of streams used to parallelize the execution of the Basic ResNet Block
             device (str): Device used to parallelize the execution of the Basic ResNet Block
         """
-        self.convs = [Conv2D(in_channels, out_channels, 1, bias=False),
-                      Conv2D(out_channels, out_channels, 3, stride=stride, padding=1, bias=False),
-                      Conv2D(out_channels, self.expansion*out_channels, 1, bias=False)
-                      ]
-        self.batchnorms = [BatchNorm2D(out_channels),
-                           BatchNorm2D(out_channels),
-                           BatchNorm2D(self.expansion*out_channels)
-                           ]
-        self.relus = [ReLU(), ReLU(), ReLU()]
-        if stride != 1 or in_channels != out_channels*self.expansion:
-            self.shortcut = [Conv2D(in_channels, out_channels*self.expansion, 1, stride=stride, bias=False),
-                             BatchNorm2D(out_channels*self.expansion)
-                             ]
-        else:
-            self.shortcut = []
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
         
         if device == "cuda":
             self.streams = []
@@ -1185,6 +1253,30 @@ class ResNetBottleneck(Layer):
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
+    
+    @cleanup("in_channels", "out_channels", "stride")
+    def init_params(self):
+        self.convs = [Conv2D(self.in_channels, self.out_channels, 1, bias=False, device=self.device),
+                      Conv2D(self.out_channels, self.out_channels, 3, stride=self.stride, padding=1, bias=False, device=self.device),
+                      Conv2D(self.out_channels, self.expansion*self.out_channels, 1, bias=False, device=self.device)
+                      ]
+        for c in self.convs:
+            c.init_params()
+        self.batchnorms = [BatchNorm2D(self.out_channels, device=self.device),
+                           BatchNorm2D(self.out_channels, device=self.device),
+                           BatchNorm2D(self.expansion*self.out_channels, device=self.device)
+                           ]
+        for b in self.batchnorms:
+            b.init_params()
+        self.relus = [ReLU(), ReLU(), ReLU()]
+        if self.stride != 1 or self.in_channels != self.out_channels*self.expansion:
+            self.shortcut = [Conv2D(self.in_channels, self.out_channels*self.expansion, 1, stride=self.stride, bias=False, device=self.device),
+                             BatchNorm2D(self.out_channels*self.expansion, device=self.device)
+                             ]
+            for l in self.shortcut:
+                l.init_params()
+        else:
+            self.shortcut = []
             
     def forward(self, x: torch.Tensor):
         """
@@ -1274,16 +1366,22 @@ class ResNet(Layer):
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
+    
+        self.block = block
+        self.num_blocks = num_blocks
+        self.num_classes = num_classes
+    
+    @cleanup("block", "num_blocks", "num_classes")
+    def init_params(self):
+        self.conv1 = Conv2D(3, 64, 3, stride=1, padding=1, bias=False, device=self.device)
+        self.bn1 = BatchNorm2D(64, device=self.device)
         
-        self.conv1 = Conv2D(3, 64, 3, stride=1, padding=1, bias=False)
-        self.bn1 = BatchNorm2D(64)
+        self.layers1 = self._make_layer(self.block, 64, self.num_blocks[0], stride=1)
+        self.layers2 = self._make_layer(self.block, 128, self.num_blocks[1], stride=2)
+        self.layers3 = self._make_layer(self.block, 256, self.num_blocks[2], stride=2)
+        self.layers4 = self._make_layer(self.block, 512, self.num_blocks[3], stride=2)
         
-        self.layers1 = self._make_layer(block, 64, num_blocks[0], stride=1)
-        self.layers2 = self._make_layer(block, 128, num_blocks[1], stride=2)
-        self.layers3 = self._make_layer(block, 256, num_blocks[2], stride=2)
-        self.layers4 = self._make_layer(block, 512, num_blocks[3], stride=2)
-        
-        self.linear = Dense(512*block.expansion, num_classes)
+        self.linear = Dense(512*self.block.expansion, self.num_classes, device=self.device)
         
         self.relu = ReLU()
         self.avgpool = AvgPool2D(4)
@@ -1357,7 +1455,7 @@ class SiLU(Activation):
     @cleanup("inputs")
     def backward_p1(self, dL_dout: torch.Tensor):
         e_x = torch.exp(-self.inputs)
-        out = dL_dout * ((1+e_x) + self.inputs*e_x)/((1+e_x)**2)
+        return dL_dout * ((1+e_x) + self.inputs*e_x)/((1+e_x)**2)
 
     def backward_p2(self):
         pass
@@ -1371,13 +1469,8 @@ class llamaFF(Layer):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
         
-        self.linears = [
-            Dense(dim, hidden_dim),
-            Dense(hidden_dim, dim),
-            Dense(dim, hidden_dim)
-        ]
-        
-        self.silu = SiLU()
+        self.dim = dim
+        self.hidden_dim = hidden_dim
 
         self.streams = []
         if device == "cuda":
@@ -1387,21 +1480,34 @@ class llamaFF(Layer):
         else:
             self.device = "cpu"
     
+    @cleanup("dim", "hidden_dim")
+    def init_params(self):
+        self.linears = [
+            Dense(self.dim, self.hidden_dim, bias=False, device=self.device),
+            Dense(self.hidden_dim, self.dim, bias=False, device=self.device),
+            Dense(self.dim, self.hidden_dim, bias=False, device=self.device)
+        ]
+        for l in self.linears:
+            l.init_params()
+        
+        self.silu = SiLU()
+
+
     def forward(self, x: torch.Tensor):
         l0 = self.linears[0](x)
         l2 = self.linears[2](x)
         self.l2 = l2
-        silu_out = self.silu.initial_pass(l0)
-        self.silu_out = silu_out
-        return self.linears[1](self.silu(l0)*l2)
+        self.silu_out = self.silu(l0)
+        return self.linears[1](self.silu_out*l2)
     
     @cleanup("l2", "silu_out")
     def backward_p1(self, dL_dout:torch.Tensor):
         dL_dl2in = self.linears[1].backward_p1(dL_dout)
-        dL_dl0 = self.silu.backward_p1(dL_dl2in)
-        dL_dx1 = self.linears[0].backward_p1(dL_dl0) * self.l2
-        dL_dx2 = self.linears[2].backward_p1(dL_dl2in) * self.silu_out
+        dL_dl0 = self.silu.backward_p1(dL_dl2in * self.l2)
+        dL_dx1 = self.linears[0].backward_p1(dL_dl0) 
+        dL_dx2 = self.linears[2].backward_p1(dL_dl2in * self.silu_out) 
         return dL_dx1 + dL_dx2
+
     
     def backward_p2(self):
         if self.device == "cuda":  
@@ -1412,94 +1518,115 @@ class llamaFF(Layer):
             for l in self.linears:
                 l.backward_p2()
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
-    ndim = x.ndim
-    assert 0 <= 1 < ndim
-    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
-    return freqs_cis.view(*shape)
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
-    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
-    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
-
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
-    bs, slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-    )
 
 class RotaryEmbeddings(Layer):
-    def __init__(self, freq_cis):
-        ...
+    def __init__(self, dim, n_heads, seq_len, theta=10000.0, device:str="cuda"):
+        dim = dim // n_heads
+        self.device = device
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+        t = torch.arange(seq_len, device=freqs.device)  # type: ignore
+        freqs = torch.outer(t, freqs).float()  # type: ignore
+        self.freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+        self.freqs_cis = self.freqs_cis.reshape([1, seq_len, 1, dim//2])
+    
+    def init_params(self):
+        self.freqs_cis = self.freqs_cis.to(self.device)
+    
+    def forward(self, xq: torch.Tensor, xk: torch.Tensor):
+        xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+        xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+        xq_out = torch.view_as_real(xq_ * self.freqs_cis).flatten(3)
+        xk_out = torch.view_as_real(xk_ * self.freqs_cis).flatten(3)
+        return xq_out.type_as(xq), xk_out.type_as(xk)
+    
+    def _per_grad_backpass(self, dL_dout):
+        """
+        Forward
+        x = a + bi
+        freq_cis = c + di
+        x*freq_cis -> (a+bi)(c+di) = e +fi
+        ac - bd + (ad +bc)i = e +fi 
+        e = ac - bd & f = ad+bc
+
+        Backward
+        dL/da = dL/de * de/da + dL/df * df/da = c * dL/de + d * dL/df
+        dL/db = dL/df * df/db - dL/de * de/da = c * dL/df - d dL/de
+        """
+
+        freq_cis = torch.view_as_real(self.freqs_cis)
+        dL_da = dL_dout[:,:,:,:,0]*freq_cis[:,:,:,:,0] + dL_dout[:,:,:,:,1]*freq_cis[:,:,:,:,1]
+        dL_db = freq_cis[:,:,:,:,0]*dL_dout[:,:,:,:,1] - freq_cis[:,:,:,:,1]*dL_dout[:,:,:,:,0]
+        return torch.stack([dL_da, dL_db], dim=-1)
+
+    def backward_p1(self, dL_dxqout, dL_dxkout):
+        #return self.forward(dL_dxqout, dL_dxkout)
+        dL_dxqout_ = dL_dxqout.reshape(*dL_dxqout.shape[:-1], -1, 2)
+        dL_dxkout_ = dL_dxkout.reshape(*dL_dxkout.shape[:-1], -1, 2)
+        dL_dxq = self._per_grad_backpass(dL_dxqout_).flatten(3)
+        dL_dxk = self._per_grad_backpass(dL_dxkout_).flatten(3)
+        return dL_dxq, dL_dxk
+    
+    def backward_p2(self):
+        return None
+
+        
 
 class GroupedMultiQueryAttention(Layer):
-    def __init__(self, emb_dim: int, num_heads: int, num_kv_heads:int, max_seq_len:int):
+    def __init__(self, emb_dim: int, num_heads: int, num_kv_heads:int, max_seq_len:int, theta:float=10000.0, p:float=0.1, device:str="cuda"):
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.emb_dim = emb_dim
         self.num_heads = num_heads
         self.max_seq_len = max_seq_len
         self.n_rep = self.num_heads // self.num_kv_heads
         self.head_dim = emb_dim // num_heads
-        self.inv_square_d = 1/torch.sqrt(torch.tensor(self.head_dim))
-        
-        self.linears = {"Q": Dense(self.emb_dim, self.num_heads*self.head_dim, bias=False),
-                        "K": Dense(self.emb_dim, self.num_kv_heads*self.head_dim, bias=False),
-                        "V": Dense(self.emb_dim, self.num_kv_heads*self.head_dim, bias=False),
-                        "O": Dense(self.num_heads*self.head_dim, self.emb_dim, bias=False)
+        self.theta = theta
+        self.p = p
+        self.inv_square_d = 1/torch.sqrt(torch.tensor(self.head_dim, device=device))
+
+        self.streams = []
+        if device == "cuda":
+            self.device = "cuda"
+            for _ in self.linears:
+                self.streams.append(torch.cuda.Stream())
+        else:
+            self.device = "cpu"
+
+    def init_params(self):
+        self.linears = {"Q": Dense(self.emb_dim, self.num_heads*self.head_dim, bias=False, device=self.device),
+                        "K": Dense(self.emb_dim, self.num_kv_heads*self.head_dim, bias=False, device=self.device),
+                        "V": Dense(self.emb_dim, self.num_kv_heads*self.head_dim, bias=False, device=self.device),
+                        "O": Dense(self.num_heads*self.head_dim, self.emb_dim, bias=False, device=self.device)
                         }
-
-    def initial_pass(self, x: torch.Tensor):
-        batch_size, seqlen, _ = x.shape
-        self.device = x.device
-
-        self.k_cache = torch.zeros(batch_size, self.max_seq_len, self.num_kv_heads, self.head_dim).to(x.device)
-        self.v_cache = torch.zeros(batch_size, self.max_seq_len, self.num_kv_heads, self.head_dim).to(x.device)
+        for l in self.linears.keys():
+            self.linears[l].init_params()
         
-        xq, xk, xv = self.linears["Q"].initial_pass(x), self.linears["K"].initial_pass(x), self.linears["V"].initial_pass(x)
-
-        self.linears["O"].initial_pass(x)
-
+        self.dropouts = {"Q": Dropout(p=self.p),
+                         "K": Dropout(p=self.p),
+                         "V": Dropout(p=self.p)
+                        }
+        
+        self.rotary_emb = RotaryEmbeddings(self.emb_dim, self.num_heads, self.max_seq_len, theta=self.theta, device=self.device)
+        self.rotary_emb.init_params()
     
-    def forward(self, x: torch.Tensor, freq_cis: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
         batch_size, seqlen, _ = x.shape
 
-        xq, xk, xv = self.linears["Q"](x), self.linears["K"](x), self.linears["V"](x)
+        xq = self.dropouts["Q"](self.linears["Q"](x))
+        xk = self.dropouts["K"](self.linears["K"](x))
+        xv = self.dropouts["V"](self.linears["V"](x))
 
         xq = xq.view(batch_size, seqlen, self.num_heads, self.head_dim)
         xk = xk.view(batch_size, seqlen, self.num_kv_heads, self.head_dim)
         self.xv = xv.view(batch_size, seqlen, self.num_kv_heads, self.head_dim)
 
-        xq, self.xk = apply_rotary_emb(xq, xk, freq_cis)
+
+        xq, self.xk = self.rotary_emb.forward(xq, xk)
         self.xq = torch.cat(xq.unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
         #self.xq = xq #torch.chunk(xq, self.n_rep, dim=-2)
 
-        print(xk.shape, xq.shape)
+
         QK_T = vmap(lambda q, k: vmap(lambda _q: torch.bmm(_q, k.transpose(-1,-2)), in_dims=-2, out_dims=-2)(q), in_dims=-2, out_dims=-2)(self.xq, self.xk) * self.inv_square_d
         QK_T = torch.flatten(QK_T, -3, -2)
-        #vmap(lambda k: vamp(torch.bmm(q, k.transpose(-1,-2)))(self.xk)    * self.inv_square_d
-        print(QK_T.shape)
-        #Q_KT = vmap(lambda q, k: torch.bmm(q, k.transpose(-1,-2)), in_dims=-2, out_dims=-2)(self.xq, self.xk) * self.inv_square_d
         if mask is not None:
             QK_T = vmap(lambda x: x + mask, in_dims=-2, out_dims=-2)(QK_T)
         def _softmax(x):
@@ -1507,8 +1634,9 @@ class GroupedMultiQueryAttention(Layer):
             return e_x / torch.sum(e_x)
         self.sQK_T = vmap(vmap(vmap(_softmax)))(QK_T)
         self.sQK_T = torch.cat(self.sQK_T.unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
-        print(self.sQK_T.shape)
+
         out = vmap(lambda sqkt, v: vmap(lambda _sqkt: torch.bmm(_sqkt, v), in_dims=-2, out_dims=-2)(sqkt), in_dims=-2, out_dims=-2)(self.sQK_T, self.xv)
+        self.sQK_T = self.sQK_T.flatten(-3,-2)
         out = torch.flatten(out, -3, -2)
         out = torch.flatten(out, -2, -1)
         return self.linears["O"](out)
@@ -1536,19 +1664,32 @@ class GroupedMultiQueryAttention(Layer):
     def backward_p1(self, dL_dout: torch.Tensor):
         dL_dAtt = self.linears["O"].backward_p1(dL_dout)
         dL_dAtt = torch.cat(dL_dAtt.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        dL_dAtt = torch.cat(dL_dAtt.unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
 
-        dL_dsQKT = vmap(lambda dl_dout, v: torch.bmm(dl_dout, torch.transpose(v, -1,-2)), in_dims=-2, out_dims=-2)(dL_dAtt, self.values)
+        dL_dsQKT = vmap(lambda dldatt, v: vmap(lambda _dldatt: torch.bmm(_dldatt, v.transpose(-1,-2)), in_dims=-2, out_dims=-2)(dldatt), in_dims=-2, out_dims=-2)(dL_dAtt, self.xv)
+        dL_dsQKT = torch.flatten(dL_dsQKT, -3, -2)
 
         J_sQKT = vmap(vmap(vmap(self._softmax_jacobian)))(self.sQK_T)  # sQK_T.shape -> BxCxHxC 
-        dL_dQKT = torch.squeeze(vmap(vmap(vmap(torch.mm)))(dL_dsQKT.unsqueeze(-2), J_sQKT)) * self.inv_sqrt_d
+        dL_dQKT = torch.squeeze(vmap(vmap(vmap(torch.mm)))(dL_dsQKT.unsqueeze(-2), J_sQKT)) * self.inv_square_d
+        
+        dL_dQKT =  torch.cat(dL_dQKT.unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
+        
+        dL_dxq = vmap(lambda dldqkt, k: vmap(lambda _dldqkt: torch.bmm(_dldqkt, k), in_dims=-2, out_dims=-2)(dldqkt), in_dims=-2, out_dims=-2)(dL_dQKT, self.xk)
+        dL_dxq = dL_dxq.flatten(-3,-2)
 
-        dL_dlQ = vmap(lambda dl_dqkt, k: torch.bmm(dl_dqkt, k), in_dims=-2, out_dims=-2)(dL_dQKT, self.values)  # k.T not necessary as its k.T.T  
-        dL_dlKT = vmap(lambda dl_dqkt, q: torch.bmm(torch.transpose(q, -1,-2), dl_dqkt), in_dims=-2, out_dims=-2)(dL_dQKT, self.xq)  
-        dL_dlV = vmap(lambda dl_datt, sqkt: torch.bmm(torch.transpose(sqkt, -2, -1), dl_datt), in_dims=-2, out_dims=-2)(dL_dAtt, self.sQK_T) 
+        dL_dxkt = vmap(vmap(lambda q, dldqkt: torch.bmm(q.transpose(-1,-2), dldqkt), in_dims=-2, out_dims=-2), in_dims=-2, out_dims=-2)(self.xq, dL_dQKT)
+        dL_dxkt = torch.sum(dL_dxkt, -3)
+        dL_dxk = torch.vmap(lambda dl_dlkt: torch.transpose(dl_dlkt, -1, -2), in_dims=-2, out_dims=-2)(dL_dxkt)
 
-        dL_dQ = self.linears["Q"].backward_p1(torch.flatten(dL_dlQ, -2, -1))
-        dL_dK = self.linears["K"].backward_p1(torch.flatten(torch.vmap(lambda dl_dlkt: torch.transpose(dl_dlkt, -1, -2), in_dims=-2, out_dims=-2)(dL_dlKT), -2, -1))
-        dL_dV = self.linears["V"].backward_p1(torch.flatten(dL_dlV, -2, -1))
+        self.sQK_T = torch.cat(self.sQK_T.unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
+        dL_dxv = vmap(vmap(lambda sqkt, dldatt: torch.bmm(sqkt.transpose(-1,-2), dldatt), in_dims=-2, out_dims=-2), in_dims=-2, out_dims=-2)(self.sQK_T, dL_dAtt)
+        dL_dxv = torch.sum(dL_dxv, -3)
+
+        dL_dxq, dL_dxk = self.rotary_emb.backward_p1(dL_dxq, dL_dxk)
+
+        dL_dQ = self.linears["Q"].backward_p1(self.dropouts["Q"].backward_p1(torch.flatten(dL_dxq, -2, -1)))
+        dL_dK = self.linears["K"].backward_p1(self.dropouts["K"].backward_p1(torch.flatten(dL_dxk, -2, -1)))
+        dL_dV = self.linears["V"].backward_p1(self.dropouts["V"].backward_p1(torch.flatten(dL_dxv, -2, -1)))
 
         return dL_dQ + dL_dK + dL_dV
     
@@ -1559,8 +1700,61 @@ class GroupedMultiQueryAttention(Layer):
                     self.linears[k].backward_p2()
         else:
             for k in self.linears.keys():
-                self.linears[k].backward_p2()  
+                self.linears[k].backward_p2()
+    
 
+# Transformer++
+class TransformerPPBlock(Layer):
+    def __init__(self, dim, num_heads, num_kv_heads, max_seqlen, theta=10000.0, p=0.1, device="cuda"):
+        self.dim = dim
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.max_seqlen = max_seqlen
+        self.theta = theta
+        self.p = p
+
+        if device == "cuda":
+            self.streams = [torch.cuda.Stream() for _ in range(4)]
+            self.device = "cuda"
+        else:
+            self.device = "cpu"
+    
+    @cleanup("dim", "num_heads", "num_kv_heads", "max_seqlen", "theta", "p")
+    def init_params(self):
+        self.attention = GroupedMultiQueryAttention(self.dim, self.num_heads, self.num_kv_heads, self.max_seqlen, theta=self.theta, p=self.p, device=self.device)
+        self.ff = llamaFF(self.dim, self.dim*4, 256, device=self.device)
+        self.att_norm = NLPRMSNorm(-1, self.dim, device=self.device)
+        self.ff_norm = NLPRMSNorm(-1, self.dim, device=self.device)
+        self.att_dropout = Dropout(self.p)
+        self.ff_dropout = Dropout(self.p)
+
+        self.attention.init_params()
+        self.ff.init_params()
+        self.att_norm.init_params()
+        self.ff_norm.init_params()
+
+    def forward(self, x):
+        x = self.attention(self.att_norm(x)) + x
+        h = self.att_dropout(x)
+        x = self.ff(self.ff_norm(h)) + h
+        return self.ff_dropout(x)
+
+    def backward_p1(self, dL_dout):
+        dL_dff = self.ff_dropout.backward_p1(dL_dout)
+        dL_h = self.ff_norm.backward_p1(self.ff.backward_p1(dL_dff)) + dL_dff
+        dL_datt = self.att_dropout.backward_p1(dL_h)
+        return self.att_norm.backward_p1(self.attention.backward_p1(dL_datt)) + dL_datt
+    
+    def backward_p2(self):
+        if self.device == "cuda":
+            with torch.cuda.stream(self.streams[0]):
+                self.attention.backward_p2()
+            with torch.cuda.stream(self.streams[1]):
+                self.ff.backward_p2()
+            with torch.cuda.stream(self.streams[2]):
+                self.att_norm.backward_p2()
+            with torch.cuda.stream(self.streams[3]):
+                self.ff_norm.backward_p2()
 
 if __name__ == "__main__":
 
@@ -1581,8 +1775,8 @@ if __name__ == "__main__":
             print(my_back[:2,:2,:2, :2])
             print(true_back[:2,:2,:2, :2])
         print(my_back.mean())
-        num_correct = (torch.isclose(my_back, true_back, rtol=0.01, atol=0.00001)).sum()
-        print(f"Num correct: {num_correct}/{my_back.numel()}")
+        num_correct = (torch.isclose(my_back, true_back, rtol=0.0001)).sum()
+        print(f"Num correct: {num_correct}/{my_back.numel()} ({100*num_correct/my_back.numel():.2f}%)")
         return my_back, true_back
     
     def test_dropout():
@@ -1606,14 +1800,11 @@ if __name__ == "__main__":
         x = torch.randn(16, 30, 80)
         dL_dout = torch.ones(16,30,80)
         layer = GroupedMultiQueryAttention(80, 8, 4, 30)
-        freqs_cis = precompute_freqs_cis(80 // 8, 30)
-        print(freqs_cis.shape)
         with torch.no_grad():
-            layer.forward(x, freq_cis=freqs_cis)
-            exit()
+            layer.forward(x)
             my_back = layer.backward_p1(dL_dout)
-            layer.backward_p2()
-        true_back = torch.autograd.functional.vjp(lambda _x: layer.forward(_x, _x, _x), x, dL_dout)[1]
+            #layer.backward_p2()
+        true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
         print(my_back[0,0])
         print(true_back[0,0])
         print(torch.allclose(my_back, true_back))
@@ -1627,7 +1818,8 @@ if __name__ == "__main__":
         x = torch.randn(16, 24, 80)
         x = m.sample(x.shape)
         dL_dout = torch.ones(16, 24, 80)
-        layer = BertBlock(80, 8, 160, p=0)
+        layer = BertBlock(80, 8, 160, p=0, device="cpu")
+        layer.init_params()
         test(layer, x, dL_dout)
     
     def test_conv2D():
@@ -1655,6 +1847,23 @@ if __name__ == "__main__":
         dL_dout = torch.ones(16,24,80)
         layer = NLPRMSNorm(-1,80)
         test(layer, x, dL_dout)
+    
+    def test_rotary():
+        xq = torch.randn(16, 24, 8, 10)
+        dL_dout = torch.ones(16,24,8,10)
+        model = RotaryEmbeddings(80, 8, 24)
+        with torch.no_grad():
+            model.forward(xq, xq)
+            my_back = torch.sum(torch.stack(model.backward_p1(dL_dout, dL_dout)), dim=0)
+            model.backward_p2()
+        true_back = torch.autograd.functional.vjp(lambda _x: model.forward(_x, _x), xq, (dL_dout, dL_dout))[1]
+        print(torch.allclose(my_back, true_back))
+
+    def test_transformer_pp():
+        x = torch.randn(16, 24, 80)
+        dL_dout = torch.ones(16,24,80)
+        layer = TransformerPPBlock(80, 8, 4, 24, device="cpu")
+        test(layer, x, dL_dout)
 
 
-    test_resnet()
+    test_bert()

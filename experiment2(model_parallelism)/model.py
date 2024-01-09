@@ -66,7 +66,7 @@ class BaseSequentialMP:
     def to(self):
         ...
 
-class CustomMSequentialMP:
+class CustomSequentialMP:
     def __init__(self, *args: Layer):
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
