@@ -1,24 +1,17 @@
 from typing import Any, Dict, Optional, Union, Sequence, Tuple
 from abc import ABC, abstractmethod
-from functools import wraps
 
 import torch
 import torch.nn.functional as F
 from torch import vmap as vmap
 
-class cleanup(object):
-    def __init__(self, *args):
-        self.args = args
-    def __call__(self, func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            out = func(*args, **kwargs)
-            for arg in self.args:
-                setattr(args[0], arg, None)
-            return out
-        return wrapper
+from wrappers import cleanup, multi_stage_wrapper
 
 class Layer(ABC):
+    def __init__(self):
+        self.multi_stage = True
+        self.training = True
+
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
         
@@ -37,6 +30,16 @@ class Layer(ABC):
     def backward_p2(self):
         #p2 is for calculating param grads if theres no params can just pass
         pass
+
+    def backward_p2_non_recursive(self):
+        return self.backward_p2()
+    
+    @classmethod
+    def turn_off_multi_stage(cls):
+        cls.multi_stage = False
+    
+    def turn_on_multi_stage(cls):
+        cls.multi_stage = True
 
 class Activation(Layer):
     """
@@ -109,6 +112,7 @@ class Dense(Layer):
             dL_dout (torch.Tensor): derivative of the loss with respect to the dense layers output
         
         """
+        super().__init__()
         self.input_size = input_size
         self.output_size = output_size
         self.bias_ = bias
@@ -141,6 +145,7 @@ class Dense(Layer):
             out = x
         return out
     
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the dense layers output and returns the derivative of the loss with respect to the dense layers input
@@ -198,6 +203,7 @@ class ReLU(Activation):
         return out
     
     @cleanup("inputs")
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the relus output and returns the derivative of the loss with respect to the relus input
@@ -217,6 +223,7 @@ class GeLU(Activation):
         return x * 0.5 * (1 + torch.erf(x/((2)**(0.5))))
 
     @cleanup("inputs")
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout):
         #TODO clean this up 
         return dL_dout * (0.5 * (1 + torch.erf(self.inputs/((2)**(0.5)))) + (self.inputs)/torch.sqrt(torch.pi) * torch.exp(-torch.pow(self.inputs, 2)))
@@ -234,6 +241,7 @@ class Dropout(Layer):
             p_mask (torch.Tensor): Mask for the dropout layer
             training (bool): Turned to False during inference in order to turn off dropout
         """
+        super().__init__()
         self.p = p
         self.training = True
     
@@ -255,6 +263,7 @@ class Dropout(Layer):
         return x*self.p_mask
     
     @cleanup("p_mask")
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the dropouts output and returns the derivative of the loss with respect to the dropouts input
@@ -305,6 +314,7 @@ class MultiHeadAttention(Layer):
             weights_g (torch.Tensor): The gradient of the weights of the multi head attention
             bias_g (torch.Tensor): The gradient of the bias of the multi head attention
         """
+        super().__init__()
         self.num_heads = num_heads
         self.emb_dim = emb_dim
         self.inv_sqrt_d = (emb_dim / num_heads)**(-1/2)
@@ -394,6 +404,7 @@ class MultiHeadAttention(Layer):
         return jac_base
 
     @cleanup("lV", "lK", "lQ", "sQK_T")
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the multihead attention output and returns the derivative of the loss with respect to the multihead attention input
@@ -441,7 +452,10 @@ class MultiHeadAttention(Layer):
                     self.linears[k].backward_p2()
         else:
             for k in self.linears.keys():
-                self.linears[k].backward_p2()          
+                self.linears[k].backward_p2()  
+
+    def backward_p2_non_recursive(self):
+        pass        
 
 
 #TODO will have to update for 3D parallelism (DP)
@@ -471,6 +485,7 @@ class BatchNorm2D(Layer):
             var (torch.Tensor): the variance of the input
             norm_x (torch.Tensor): the normalized input
         """
+        super().__init__()
         self.eps = eps
         self.momentum = momentum
         self.in_channels = in_channels
@@ -513,6 +528,7 @@ class BatchNorm2D(Layer):
         return out
     
     @cleanup("var", "x_sub_mean")
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the BatchNorm2D output and returns the derivative of the loss with respect to the BatchNorm2D input
@@ -568,6 +584,7 @@ class NLPLayerNorm(Layer):
             norm_x (torch.Tensor): normalization of x 
             dL_dout (torch.Tensor): the derivative of the loss with respect to the output
         """
+        super().__init__()
         self.dim = dim #seqdim for nlp
         self.dim_size = dim_size
         self.eps = eps
@@ -625,6 +642,7 @@ class NLPLayerNorm(Layer):
         return vmap(vmap(_diag_set))(jac_base, diag)
         
     @cleanup("x_sub_mean", "var")
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the NLP layer norm output and returns the derivative of the loss with respect to the NLP layer norm input
@@ -652,8 +670,6 @@ class NLPLayerNorm(Layer):
         """
         self.bias_g[:] = torch.sum(self.dL_dout, dim=tuple(range(self.dL_dout.ndim)[:-1]))
         self.gamma_g[:] = torch.sum(self.dL_dout*self.norm_x, dim=tuple(range(self.dL_dout.ndim)[:-1]))
-        self.dL_dout = None
-        self.norm_x = None
       
         
 class NLPRMSNorm(Layer):
@@ -679,6 +695,7 @@ class NLPRMSNorm(Layer):
             rms_norm_x (torch.Tensor): rms normalized x
             dL_dout (torch.Tensor): the derivative of the loss with respect to the output
         """
+        super().__init__()
         self.dim = dim #seqdim for nlp
         self.dim_size = dim_size
         self.eps = eps
@@ -730,6 +747,7 @@ class NLPRMSNorm(Layer):
         diag = vmap(vmap(_F_Jii))(self.inputs, self.rms_norm_x, self.mean_pow2).squeeze()
         return vmap(vmap(_diag_set))(jac_base, diag)
 
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the NLP RMS norm output and returns the derivative of the loss with respect to the NLP RMS norm input
@@ -750,8 +768,6 @@ class NLPRMSNorm(Layer):
         Computes the gradients of the parameter in the NLP layer norm
         """
         self.weights_g[:] = torch.sum(self.dL_dout*self.rms_norm_x, dim=tuple(range(self.dL_dout.ndim)[:-1]))
-        self.dL_dout = None
-        self.rms_norm_x = None
 
         
 class BertBlock(Layer):
@@ -777,6 +793,7 @@ class BertBlock(Layer):
             device (str): device used for computation
             streams (List[torch.cuda.Stream]): streams used for parallel computation of backward_p2
         """
+        super().__init__()
         self.emb_dim = emb_dim
         self.num_heads = num_heads
         self.dim_ff = dim_ff
@@ -828,6 +845,7 @@ class BertBlock(Layer):
         ff2 = self.dropouts["ff"](ff2)
         return self.norms["ff"](ff2 + norm_mh_out)
     
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout:torch.Tensor):
         """
         Takes the derivative of the loss with respect to the BERT block output and returns the derivative of the loss with respect to the BERT block input
@@ -872,6 +890,9 @@ class BertBlock(Layer):
                 self.linears[i].backward_p2()
             for k in self.norms.keys():
                 self.norms[k].backward_p2()
+    
+    def backward_p2_non_recursive(self):
+        pass
             
 class Conv2D(Layer):
     def __init__(self, in_channels: int, out_channels: int, k_size: Union[Sequence[int], int], bias: bool=True,  padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1, device: Optional[str]="cuda"):
@@ -900,6 +921,7 @@ class Conv2D(Layer):
             stride (Tuple[int]): the stride pattern followed by the kernel
             inputs (torch.Tensor): the input tensor
         """
+        super().__init__()
         self.out_channels = out_channels
         self.in_channels = in_channels
         self.bias_ = bias
@@ -947,6 +969,7 @@ class Conv2D(Layer):
         self.inputs = x
         return F.conv2d(x, self.kernel, self.bias, stride=self.stride, padding=self.padding)
     
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the Conv2D Layer's output and returns the derivative of the loss with respect to the Conv2D Layer's input
@@ -994,6 +1017,7 @@ class MaxPool2D(Layer):
             stride (Tuple[int]): the stride pattern followed by the kernel
             indices (torch.Tensor): the indices of the max pool
         """
+        super().__init__()
         if isinstance(k_size, int):
             self.k_size = (k_size, k_size)
         
@@ -1054,6 +1078,7 @@ class AvgPool2D(Layer):
             stride (Tuple[int]): the stride pattern followed by the kernel
             indices (torch.Tensor): the indices of the max pool
         """
+        super().__init__()
         if isinstance(k_size, int):
             self.k_size = (k_size, k_size)
         
@@ -1121,6 +1146,7 @@ class BasicResNetBlock(Layer):
             streams (List[torch.cuda.Stream]): List of streams used to parallelize the execution of the Basic ResNet Block
             device (str): Device used to parallelize the execution of the Basic ResNet Block
         """
+        super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.stride = stride
@@ -1176,6 +1202,7 @@ class BasicResNetBlock(Layer):
                 x = layer(x)
         return self.relus[1](out + x)
     
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the BasicResNetBlock's output and returns the derivative of the loss with respect to the BasicResNetBlock's input
@@ -1220,6 +1247,9 @@ class BasicResNetBlock(Layer):
                 layer.backward_p2()
             for i, layer in enumerate(self.shortcut):
                 layer.backward_p2()
+    
+    def backward_p2_non_recursive(self):
+        pass
             
 
 class ResNetBottleneck(Layer):
@@ -1242,6 +1272,7 @@ class ResNetBottleneck(Layer):
             streams (List[torch.cuda.Stream]): List of streams used to parallelize the execution of the Basic ResNet Block
             device (str): Device used to parallelize the execution of the Basic ResNet Block
         """
+        super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.stride = stride
@@ -1303,6 +1334,7 @@ class ResNetBottleneck(Layer):
                 
         return self.relus[2](out + x)
     
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout):
         """
         Takes the derivative of the loss with respect to the ResNetBottleneck's output and returns the derivative of the loss with respect to the ResNetBottleneck's input
@@ -1351,11 +1383,15 @@ class ResNetBottleneck(Layer):
                 layer.backward_p2()
             for layer in self.shortcut:
                 layer.backward_p2()
+
+    def backward_p2_non_recursive(self):
+        pass
         
 class ResNet(Layer):
     # For Reference https://github.com/henryqin1997/CIFAR10-ResNet50-PyTorch/blob/master/models/resnet.py
     # Needs to be parallised just for testing
     def __init__(self, block: Union[BasicResNetBlock , ResNetBottleneck], num_blocks: list, num_classes: int=10, device:str = "cuda"):
+        super().__init__()
         self.in_planes = 64
 
         if device == "cuda":
@@ -1409,6 +1445,7 @@ class ResNet(Layer):
         out = self.linear(out)
         return out
     
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout):
         dL_davgpool = self.linear.backward_p1(dL_dout)
         dL_davgpool = dL_davgpool.view(*self.preflattened)
@@ -1445,6 +1482,9 @@ class ResNet(Layer):
             self.layers2.backward_p2()
             self.layers3.backward_p2()
             self.layers4.backward_p2()
+    
+    def backward_p2_non_recursive(self):
+        pass
 
 
 class SiLU(Activation):
@@ -1463,6 +1503,7 @@ class SiLU(Activation):
 
 class llamaFF(Layer):
     def __init__(self, dim, hidden_dim, multiple_of, ffn_dim_multiplier = None, device:str = "cuda"):
+        super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
         
         if ffn_dim_multiplier is not None:
@@ -1501,6 +1542,7 @@ class llamaFF(Layer):
         return self.linears[1](self.silu_out*l2)
     
     @cleanup("l2", "silu_out")
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout:torch.Tensor):
         dL_dl2in = self.linears[1].backward_p1(dL_dout)
         dL_dl0 = self.silu.backward_p1(dL_dl2in * self.l2)
@@ -1508,7 +1550,6 @@ class llamaFF(Layer):
         dL_dx2 = self.linears[2].backward_p1(dL_dl2in * self.silu_out) 
         return dL_dx1 + dL_dx2
 
-    
     def backward_p2(self):
         if self.device == "cuda":  
             for l, s in zip(self.linears, self.streams):
@@ -1517,10 +1558,14 @@ class llamaFF(Layer):
         else:
             for l in self.linears:
                 l.backward_p2()
+    
+    def backward_p2_non_recursive(self):
+        pass
 
 
 class RotaryEmbeddings(Layer):
     def __init__(self, dim, n_heads, seq_len, theta=10000.0, device:str="cuda"):
+        super().__init__()
         dim = dim // n_heads
         self.device = device
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -1567,12 +1612,13 @@ class RotaryEmbeddings(Layer):
         return dL_dxq, dL_dxk
     
     def backward_p2(self):
-        return None
+        pass
 
         
 
 class GroupedMultiQueryAttention(Layer):
     def __init__(self, emb_dim: int, num_heads: int, num_kv_heads:int, max_seq_len:int, theta:float=10000.0, p:float=0.1, device:str="cuda"):
+        super().__init__()
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.emb_dim = emb_dim
         self.num_heads = num_heads
@@ -1661,7 +1707,9 @@ class GroupedMultiQueryAttention(Layer):
         
         return jac_base
 
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout: torch.Tensor):
+        #vmap go fast
         dL_dAtt = self.linears["O"].backward_p1(dL_dout)
         dL_dAtt = torch.cat(dL_dAtt.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         dL_dAtt = torch.cat(dL_dAtt.unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
@@ -1702,10 +1750,14 @@ class GroupedMultiQueryAttention(Layer):
             for k in self.linears.keys():
                 self.linears[k].backward_p2()
     
+    def backward_p2_non_recursive(self):
+        pass
+    
 
 # Transformer++
 class TransformerPPBlock(Layer):
     def __init__(self, dim, num_heads, num_kv_heads, max_seqlen, theta=10000.0, p=0.1, device="cuda"):
+        super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
@@ -1727,18 +1779,26 @@ class TransformerPPBlock(Layer):
         self.ff_norm = NLPRMSNorm(-1, self.dim, device=self.device)
         self.att_dropout = Dropout(self.p)
         self.ff_dropout = Dropout(self.p)
-
+        
+        mask = torch.zeros(self.max_seqlen, self.max_seqlen)
+        self.mask = mask.masked_fill(torch.triu(torch.ones(self.max_seqlen, self.max_seqlen), diagonal=1).bool(), float('-inf'))
+    
         self.attention.init_params()
         self.ff.init_params()
         self.att_norm.init_params()
         self.ff_norm.init_params()
 
     def forward(self, x):
-        x = self.attention(self.att_norm(x)) + x
+        n_x = self.att_norm(x)
+        if self.training:
+            x = self.attention(n_x, self.mask) + x
+        else:
+            x = self.attention(n_x) + x
         h = self.att_dropout(x)
         x = self.ff(self.ff_norm(h)) + h
         return self.ff_dropout(x)
 
+    @multi_stage_wrapper
     def backward_p1(self, dL_dout):
         dL_dff = self.ff_dropout.backward_p1(dL_dout)
         dL_h = self.ff_norm.backward_p1(self.ff.backward_p1(dL_dff)) + dL_dff
@@ -1755,6 +1815,10 @@ class TransformerPPBlock(Layer):
                 self.att_norm.backward_p2()
             with torch.cuda.stream(self.streams[3]):
                 self.ff_norm.backward_p2()
+
+    def backward_p2_non_recursive(self):
+        pass
+
 
 if __name__ == "__main__":
 
