@@ -5,12 +5,14 @@ import torch
 import torch.nn.functional as F
 from torch import vmap as vmap
 
-from wrappers import cleanup, multi_stage_wrapper
+from wrappers import cleanup, multi_stage_wrapper, expose_params
 
 class Layer(ABC):
     def __init__(self):
         self.multi_stage = True
         self.training = True
+        self.params = {}
+        self.grads = {}
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
@@ -33,6 +35,28 @@ class Layer(ABC):
 
     def backward_p2_non_recursive(self):
         return self.backward_p2()
+
+    def update(self):
+        pass
+
+    def to_(self, arg):
+        if hasattr(self, "params"):
+                for k in self.params.keys():
+                    self.params[k] = self.params[k].to(arg)
+                for k in self.grads.keys():
+                    self.grads[k] = self.grads[k].to(arg)
+        
+        for item in dir(self):
+            if isinstance(getattr(self, item), Layer):
+                getattr(self, item).to_(arg)
+            elif isinstance(getattr(self, item), list):
+                for sub_layer in getattr(self, item):
+                    if isinstance(sub_layer, Layer):
+                        getattr(self, sub_layer).to_(arg)
+            elif isinstance(getattr(self, item), dict):
+                for sub_layer in getattr(self, item).values():
+                    if isinstance(sub_layer, Layer):
+                        getattr(self, sub_layer).to_(arg)
     
     @classmethod
     def turn_off_multi_stage(cls):
@@ -90,6 +114,17 @@ class Sequential:
             for layer in self.layers:
                 layer.backward_p2()
     
+    def backward_p2_non_recursive(self):
+        pass
+    
+    def update(self):
+        if self.device == "cuda":
+            for i, layer in enumerate(self.layers):
+                with torch.cuda.stream(self.streams[i]):
+                    layer.backward_p2()
+        else:
+            for layer in self.layers:
+                layer.backward_p2()
 
 
 class Dense(Layer):
@@ -119,6 +154,7 @@ class Dense(Layer):
         self.device = device
     
     @cleanup("input_size", "output_size", "bias_")
+    @expose_params({"weights": "weights_g", "bias": "bias_g"})
     def init_params(self):
         m = torch.distributions.normal.Normal(0, 0.01)
         self.weights = m.sample(torch.Size([self.input_size, self.output_size])).to(self.device)
@@ -284,7 +320,31 @@ class Dropout(Layer):
     def backward_p2(self):
         pass
 
+class Embeddings(Layer):
+    def __init__(self, num_embeddings, dim):
+        self.num_embeddings = num_embeddings
+        self.dim = dim
     
+    @expose_params({"weights": "weights_g"})
+    def init_params(self):
+        self.weight = torch.randn(self.num_embeddings, self.dim)
+        self.weight_g = torch.zeros_like(self.weight)
+    
+    def forward(self, x):
+        self.x = x
+        return self.weight[x]
+    
+    @multi_stage_wrapper
+    def backward_p1(self, dL_dout):
+        # Embedding is the first operation so doesnt need a backward pass
+        self.dL_dout = dL_dout
+        pass
+    
+    @cleanup("dL_dout", "x")
+    def backward_p2(self):
+        self.weight_g[self.x] = self.dL_dout
+
+
 class MultiHeadAttention(Layer):
     #TODO self is the first layer in the model you can cache the linear outputs of the first 3 linears
     def __init__(self, emb_dim: int, num_heads: int, p: Optional[float]=0.1, device="cuda"):
@@ -453,6 +513,15 @@ class MultiHeadAttention(Layer):
         else:
             for k in self.linears.keys():
                 self.linears[k].backward_p2()  
+    
+    def update(self):
+        if self.device == "cuda":
+            for k, s in zip(self.linears.keys(), self.streams):
+                with torch.cuda.stream(s):
+                    self.linears[k].update()
+        else:
+            for k in self.linears.keys():
+                self.linears[k].update() 
 
     def backward_p2_non_recursive(self):
         pass        
@@ -492,6 +561,7 @@ class BatchNorm2D(Layer):
         self.device = device
         self.training = True
     
+    @expose_params({"gamma": "gamma_g", "beta": "beta_g"})
     def init_params(self):
         self.gamma = torch.ones(self.in_channels, device=self.device)
         self.beta = torch.zeros(self.in_channels, device=self.device)
@@ -590,6 +660,7 @@ class NLPLayerNorm(Layer):
         self.eps = eps
         self.device = device
     
+    @expose_params({"gamma": "gamma_g", "beta": "beta_g"})
     def init_params(self):
         self.gamma = torch.ones(self.dim_size, device=self.device)
         self.bias = torch.zeros(self.dim_size, device=self.device)
@@ -701,6 +772,7 @@ class NLPRMSNorm(Layer):
         self.eps = eps
         self.device = device
     
+    @expose_params({"gamma": "gamma_g"})
     def init_params(self):
         self.weights = torch.ones(self.dim_size, device=self.device)
         self.weights_g = torch.zeros(self.dim_size, device=self.device)
@@ -804,7 +876,7 @@ class BertBlock(Layer):
         if device == "cuda":
             self.device = "cuda"
             self.streams = []
-            for _ in range(5):  # 5 Layers with parameters
+            for _ in range(4): 
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
@@ -874,14 +946,13 @@ class BertBlock(Layer):
         Computes the gradients of the parameter in the BERT block
         """
         if "cuda" in str(self.device):
-            with torch.cuda.stream(self.streams[0]):
-                self.multihead.backward_p2()
+            self.multihead.backward_p2()
                 
-            for i, s in zip(range(2), self.streams[1:3]):
+            for i, s in zip(range(2), self.streams[0:2]):
                 with torch.cuda.stream(s):
                     self.linears[i].backward_p2()
             
-            for k, s in zip(self.norms.keys(), self.streams[3:]):
+            for k, s in zip(self.norms.keys(), self.streams[2:]):
                 with torch.cuda.stream(s):
                     self.norms[k].backward_p2()
         else:
@@ -891,6 +962,24 @@ class BertBlock(Layer):
             for k in self.norms.keys():
                 self.norms[k].backward_p2()
     
+    def update(self):
+        if "cuda" in str(self.device):
+            self.multihead.update()
+                
+            for i, s in zip(range(2), self.streams[1:3]):
+                with torch.cuda.stream(s):
+                    self.linears[i].update()
+            
+            for k, s in zip(self.norms.keys(), self.streams[3:]):
+                with torch.cuda.stream(s):
+                    self.norms[k].update()
+        else:
+            self.multihead.update()
+            for i in range(2):
+                self.linears[i].update()
+            for k in self.norms.keys():
+                self.norms[k].update()
+
     def backward_p2_non_recursive(self):
         pass
             
@@ -945,6 +1034,7 @@ class Conv2D(Layer):
             raise NotImplementedError("Stride larger than 3 not implemented")
     
     @cleanup("out_channels", "in_channels", "k_size", "bias_")
+    @expose_params({"kernel":"kernel_g", "bias":"bias_g"})
     def init_params(self):
         self.kernel = torch.randn(self.out_channels, self.in_channels, *self.k_size, device=self.device)
         if self.bias_:
@@ -1154,7 +1244,7 @@ class BasicResNetBlock(Layer):
         if device == "cuda":
             self.streams = []
             self.device = "cuda"
-            for _ in range(len(self.convs) + len(self.batchnorms) + len(self.shortcut)):
+            for _ in range(len(self.convs) + len(self.batchnorms)):
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
@@ -1238,8 +1328,7 @@ class BasicResNetBlock(Layer):
                 with torch.cuda.stream(self.streams[i+len(self.convs)]):
                     layer.backward_p2()
             for i, layer in enumerate(self.shortcut):
-                with torch.cuda.stream(self.streams[i+len(self.convs)+len(self.batchnorms)]):
-                    layer.backward_p2()
+                layer.backward_p2()
         else:
             for i, layer in enumerate(self.convs):
                 layer.backward_p2()
@@ -1248,6 +1337,24 @@ class BasicResNetBlock(Layer):
             for i, layer in enumerate(self.shortcut):
                 layer.backward_p2()
     
+    def update(self):
+        if self.device == "cuda":
+            for i, layer in enumerate(self.convs):
+                with torch.cuda.stream(self.streams[i]):
+                    layer.update()
+            for i, layer in enumerate(self.batchnorms):
+                with torch.cuda.stream(self.streams[i+len(self.convs)]):
+                    layer.update()
+            for i, layer in enumerate(self.shortcut):
+                layer.update()
+        else:
+            for i, layer in enumerate(self.convs):
+                layer.update()
+            for i, layer in enumerate(self.batchnorms):
+                layer.update()
+            for i, layer in enumerate(self.shortcut):
+                layer.update()
+
     def backward_p2_non_recursive(self):
         pass
             
@@ -1373,8 +1480,7 @@ class ResNetBottleneck(Layer):
                 with torch.cuda.stream(self.streams[i+len(self.convs)]):
                     layer.backward_p2()
             for i, layer in enumerate(self.shortcut):
-                with torch.cuda.stream(self.streams[i+len(self.convs)+len(self.batchnorms)]):
-                    layer.backward_p2()
+                layer.backward_p2()
         
         elif self.device == "cpu":
             for layer in self.convs:
@@ -1383,6 +1489,25 @@ class ResNetBottleneck(Layer):
                 layer.backward_p2()
             for layer in self.shortcut:
                 layer.backward_p2()
+    
+    def update(self):
+        if self.device == "cuda":
+            for i, layer in enumerate(self.convs):
+                with torch.cuda.stream(self.streams[i]):
+                    layer.update()
+            for i, layer in enumerate(self.batchnorms):
+                with torch.cuda.stream(self.streams[i+len(self.convs)]):
+                    layer.update()
+            for i, layer in enumerate(self.shortcut):
+                layer.update()
+        
+        elif self.device == "cpu":
+            for layer in self.convs:
+                layer.update()
+            for layer in self.batchnorms:
+                layer.update()
+            for layer in self.shortcut:
+                layer.update()
 
     def backward_p2_non_recursive(self):
         pass
@@ -1397,8 +1522,6 @@ class ResNet(Layer):
         if device == "cuda":
             self.device = "cuda"
             for _ in range(3):  # conv1, bn1, dense
-                self.streams.append(torch.cuda.Stream())
-            for _ in range(4):  # layers
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
@@ -1466,14 +1589,10 @@ class ResNet(Layer):
                 self.bn1.backward_p2()
             with self.streams[2]:
                 self.linear.backward_p2()
-            with self.streams[3]:
-                self.layers1.backward_p2()
-            with self.streams[4]:
-                self.layers2.backward_p2()
-            with self.streams[5]:
-                self.layers3.backward_p2()
-            with self.streams[6]:
-                self.layers4.backward_p2()
+            self.layers1.backward_p2()
+            self.layers2.backward_p2()
+            self.layers3.backward_p2()
+            self.layers4.backward_p2()
         else:
             self.conv1.backward_p2()
             self.bn1.backward_p2()
@@ -1482,6 +1601,27 @@ class ResNet(Layer):
             self.layers2.backward_p2()
             self.layers3.backward_p2()
             self.layers4.backward_p2()
+    
+    def update(self):
+        if self.device == "cuda":
+            with self.streams[0]:
+                self.conv1.update()
+            with self.streams[1]:
+                self.bn1.update()
+            with self.streams[2]:
+                self.linear.update()
+            self.layers1.update()
+            self.layers2.update()
+            self.layers3.update()
+            self.layers4.update()
+        else:
+            self.conv1.update()
+            self.bn1.update()
+            self.linear.update()
+            self.layers1.update()
+            self.layers2.update()
+            self.layers3.update()
+            self.layers4.update()
     
     def backward_p2_non_recursive(self):
         pass
@@ -1558,6 +1698,15 @@ class llamaFF(Layer):
         else:
             for l in self.linears:
                 l.backward_p2()
+    
+    def update(self):
+        if self.device == "cuda":
+            for l, s in zip(self.linears, self.streams):
+                with s:
+                    l.update()
+        else:
+            for l in self.linears:
+                l.update()
     
     def backward_p2_non_recursive(self):
         pass
@@ -1750,6 +1899,15 @@ class GroupedMultiQueryAttention(Layer):
             for k in self.linears.keys():
                 self.linears[k].backward_p2()
     
+    def update(self):
+        if self.device == "cuda":
+            for k, s in zip(self.linears.keys(), self.streams):
+                with torch.cuda.stream(s):
+                    self.linears[k].update()
+        else:
+            for k in self.linears.keys():
+                self.linears[k].update()
+    
     def backward_p2_non_recursive(self):
         pass
     
@@ -1766,7 +1924,7 @@ class TransformerPPBlock(Layer):
         self.p = p
 
         if device == "cuda":
-            self.streams = [torch.cuda.Stream() for _ in range(4)]
+            self.streams = [torch.cuda.Stream() for _ in range(3)]
             self.device = "cuda"
         else:
             self.device = "cpu"
@@ -1779,7 +1937,7 @@ class TransformerPPBlock(Layer):
         self.ff_norm = NLPRMSNorm(-1, self.dim, device=self.device)
         self.att_dropout = Dropout(self.p)
         self.ff_dropout = Dropout(self.p)
-        
+
         mask = torch.zeros(self.max_seqlen, self.max_seqlen)
         self.mask = mask.masked_fill(torch.triu(torch.ones(self.max_seqlen, self.max_seqlen), diagonal=1).bool(), float('-inf'))
     
@@ -1807,14 +1965,33 @@ class TransformerPPBlock(Layer):
     
     def backward_p2(self):
         if self.device == "cuda":
+            self.attention.backward_p2()
             with torch.cuda.stream(self.streams[0]):
-                self.attention.backward_p2()
-            with torch.cuda.stream(self.streams[1]):
                 self.ff.backward_p2()
-            with torch.cuda.stream(self.streams[2]):
+            with torch.cuda.stream(self.streams[1]):
                 self.att_norm.backward_p2()
-            with torch.cuda.stream(self.streams[3]):
+            with torch.cuda.stream(self.streams[2]):
                 self.ff_norm.backward_p2()
+        else:
+            self.attention.backward_p2()
+            self.ff.backward_p2()
+            self.att_norm.backward_p2()
+            self.ff_norm.backward_p2()
+    
+    def update(self):
+        if self.device == "cuda":
+            self.attention.update()
+            with torch.cuda.stream(self.streams[0]):
+                self.ff.update()
+            with torch.cuda.stream(self.streams[1]):
+                self.att_norm.update()
+            with torch.cuda.stream(self.streams[2]):
+                self.ff_norm.update()
+        else:
+            self.attention.update()
+            self.ff.update()
+            self.att_norm.update()
+            self.ff_norm.update()
 
     def backward_p2_non_recursive(self):
         pass

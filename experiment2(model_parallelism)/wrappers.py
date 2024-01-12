@@ -12,7 +12,6 @@ class cleanup(object):
             return out
         return wrapper
 
-
 def multi_stage_wrapper(func):
     # designed to wrap backward_p1
     @wraps(func)
@@ -26,3 +25,21 @@ def multi_stage_wrapper(func):
         else:
             return func(self, *args, **kwargs)
     return wrapper
+
+class expose_params(object):
+    def __init__(self, p_and_g: dict):
+        self.p_and_g = p_and_g 
+    def __call__(self, func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            out = func(*args, **kwargs)
+            _self = args[0]
+            _self.params = {}
+            _self.grads = {}
+            for p, g in self.p_and_g.items():
+                if not hasattr(_self, p):
+                    continue
+                _self.params[p] = getattr(_self, p)
+                _self.grads[p] = getattr(_self, g)
+            return out
+        return wrapper
