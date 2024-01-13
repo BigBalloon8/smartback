@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from functools import partial
 
 import torch
 
@@ -16,7 +17,7 @@ class Optimizer(ABC):
         pass
     
     def _recursive_set_attr(self, layer: layers.Layer, attr: tuple):
-        if layer.p_to_g:
+        if layer.params:
             setattr(layer, *attr)
 
         for item in dir(layer):
@@ -30,6 +31,22 @@ class Optimizer(ABC):
                 for sub_layer in getattr(layer, item).values():
                     if isinstance(sub_layer, layers.Layer):
                         self._recursive_set_attr(sub_layer, attr)
+                        
+    def _recursive_set_update_fn(self, layer, fn):
+        if layer.params:
+            layer.update = partial(fn, layer)
+
+        for item in dir(layer):
+            if isinstance(getattr(layer, item), layers.Layer):
+                self._recursive_set_update_fn(getattr(layer, item), fn)
+            elif isinstance(getattr(layer, item), list):
+                for sub_layer in getattr(layer, item):
+                    if isinstance(sub_layer, layers.Layer):
+                        self._recursive_set_update_fn(sub_layer, fn)
+            elif isinstance(getattr(layer, item), dict):
+                for sub_layer in getattr(layer, item).values():
+                    if isinstance(sub_layer, layers.Layer):
+                        self._recursive_set_update_fn(sub_layer, fn)
     
     def _recursive_set_empty_opt_states(self, layer: layers.Layer, opt_creation_fn:callable, *args):
         if layer.params:
@@ -50,22 +67,22 @@ class Optimizer(ABC):
                 for sub_layer in getattr(layer, item).values():
                     if isinstance(sub_layer, layers.Layer):
                         self._recursive_set_empty_opt_states(sub_layer, opt_creation_fn, *args)
-                        
+         
 
 class SGD(Optimizer):
-    def __init__(self, lr:float, model:models.Model):
-        super().__init__(lr, model)
+    def __init__(self, model:models.Model, lr:float):
+        super().__init__(model=model, lr=lr)
 
     def update_fn(self):
         def _update_fn(_self: layers.Layer):
             for k in _self.params.keys():
                 _self.params[k] -= self.lr*_self.grads[k]
         for layer in self.model.layers:
-            self._recursive_set_attr(layer, ("update", _update_fn))
+            self._recursive_set_update_fn(layer, _update_fn)
 
 
 class Adam(Optimizer):
-    def __init__(self, lr, model:models.Model, beta1=0.9, beta2=0.999, epsilon=1e-08):
+    def __init__(self, model:models.Model, lr, beta1=0.9, beta2=0.999, epsilon=1e-08):
         self.beta1 = beta1
         self.beta2 = beta2
         self.epsilon = epsilon
@@ -73,7 +90,7 @@ class Adam(Optimizer):
         for layer in model.layers:
             self._recursive_set_attr(layer, ("t", 0))
             self._recursive_set_empty_opt_states(layer, torch.zeros_like, "m", "v")
-        super().__init__(lr, model)
+        super().__init__(model, lr)
     
     def update_fn(self):
         def _update_fn(_self: layers.Layer):

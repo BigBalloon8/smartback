@@ -322,6 +322,7 @@ class Dropout(Layer):
 
 class Embeddings(Layer):
     def __init__(self, num_embeddings, dim):
+        super().__init__()
         self.num_embeddings = num_embeddings
         self.dim = dim
     
@@ -343,6 +344,31 @@ class Embeddings(Layer):
     @cleanup("dL_dout", "x")
     def backward_p2(self):
         self.weight_g[self.x] = self.dL_dout
+
+
+class Softmax(Activation):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, x):
+        self.out = torch.softmax(x, -1)
+        return self.out
+    
+    @cleanup("out")
+    def backward_p1(self, dL_dout:torch.Tensor):
+        def _per_input_backpass(dldout, s_out):
+            J = -torch.outer(s_out, s_out)
+            J.diagonal().copy_(s_out*(1-s_out))
+            return torch.mm(dldout.unsqueeze(0), J).squeeze(0)
+        func = _per_input_backpass
+        for i in range(len(dL_dout.shape)-1):
+            if i ==1:
+                func = vmap(func, chunk_size=8)
+            else:
+                func = vmap(func)
+        print(dL_dout.shape, self.out.shape)
+        return func(dL_dout, self.out)
+    
 
 
 class MultiHeadAttention(Layer):
@@ -381,6 +407,7 @@ class MultiHeadAttention(Layer):
         self.p = p
 
         self.inputs = {"Q": None, "K": None, "V": None}
+        self.softmax_func = Softmax()
         
         if "cuda" in device:
             self.device = "cuda" 
@@ -432,36 +459,13 @@ class MultiHeadAttention(Layer):
         QK_T = vmap(lambda q, k: torch.bmm(q, torch.transpose(k, -1, -2)), in_dims=-2, out_dims=-2)(self.lQ, self.lK) * self.inv_sqrt_d
         if mask is not None:
             QK_T = vmap(lambda x: x + mask, in_dims=-2, out_dims=-2)(QK_T)
-        def _softmax(x):
-            e_x = torch.exp(x)
-            return e_x / torch.sum(e_x)
-        self.sQK_T = vmap(vmap(vmap(_softmax)))(QK_T)
+        
+        self.sQK_T = self.softmax_func(QK_T)
         #torch.softmax(QK_T, dim=-1, out=self.sQK_T) #TODO add inplace update
         
         out = vmap(lambda qk_t, v: torch.bmm(qk_t, v), in_dims=-2, out_dims=-2)(self.sQK_T, self.lV)
         out = torch.flatten(out, -2, -1)
         return self.linears["O"](out)
-
-    
-    @staticmethod
-    def _softmax_jacobian(softmax_out: torch.Tensor): #softmax_out.shape -> N | 1xN
-        """
-        Returns the Jacobian of the softmax within the multihead attention
-
-        Args:
-            softmax_out (torch.Tensor): The output of the softmax within the multihead attention
-
-        Returns:
-            torch.Tensor: The Jacobian of the softmax 
-        """
-        softmax_out = torch.squeeze(softmax_out)
-        n = softmax_out.shape[-1]
-        
-        jac_base = -softmax_out.view(n, 1) * softmax_out.view(1, n)
-        diag = softmax_out*(1-softmax_out)
-        jac_base[torch.arange(n), torch.arange(n)] = diag
-        
-        return jac_base
 
     @cleanup("lV", "lK", "lQ", "sQK_T")
     @multi_stage_wrapper
@@ -483,8 +487,7 @@ class MultiHeadAttention(Layer):
         #self.lV = None
         
         # vmap across 3 dims BxCxH 
-        J_sQKT = vmap(vmap(vmap(self._softmax_jacobian)))(self.sQK_T)  # sQK_T.shape -> BxCxHxC 
-        dL_dQKT = torch.squeeze(vmap(vmap(vmap(torch.mm)))(dL_dsQKT.unsqueeze(-2), J_sQKT)) * self.inv_sqrt_d
+        dL_dQKT = self.softmax_func.backward_p1(dL_dsQKT)* self.inv_sqrt_d
         
         # TODO verifiy this section
         dL_dlQ = vmap(lambda dl_dqkt, k: torch.bmm(dl_dqkt, k), in_dims=-2, out_dims=-2)(dL_dQKT, self.lK)  # k.T not necessary as its k.T.T
@@ -820,6 +823,7 @@ class NLPRMSNorm(Layer):
         return vmap(vmap(_diag_set))(jac_base, diag)
 
     @multi_stage_wrapper
+    @cleanup("inputs", "mean_pow2")
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the NLP RMS norm output and returns the derivative of the loss with respect to the NLP RMS norm input
@@ -830,7 +834,13 @@ class NLPRMSNorm(Layer):
         Returns:
             torch.Tensor: The derivatives of the loss with respect to the NLP RMS norm inputs
         """
-        self.dL_dout = dL_dout
+        def _per_input_backpass(dldout, x, z, mx2):
+            J = ((1/self.dim_size)*-torch.outer(z, x))/mx2
+            J.diagonal()[:] += torch.rsqrt(mx2)
+            return torch.mm(dldout.unsqueeze(0), J).squeeze(0)
+        self.dL_dout = dL_dout#
+        return vmap(vmap(_per_input_backpass, chunk_size=128))(dL_dout, self.inputs, self.rms_norm_x, self.mean_pow2)
+        print(dL_dout.shape)
         J = self._rmsnorm_jacobian()
         return vmap(vmap(torch.mm))(dL_dout.unsqueeze(-2), J).squeeze()
     
@@ -1781,7 +1791,7 @@ class GroupedMultiQueryAttention(Layer):
         self.streams = []
         if device == "cuda":
             self.device = "cuda"
-            for _ in self.linears:
+            for _ in range(4):
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
@@ -1799,6 +1809,8 @@ class GroupedMultiQueryAttention(Layer):
                          "K": Dropout(p=self.p),
                          "V": Dropout(p=self.p)
                         }
+
+        self.softmax_fn = Softmax()
         
         self.rotary_emb = RotaryEmbeddings(self.emb_dim, self.num_heads, self.max_seq_len, theta=self.theta, device=self.device)
         self.rotary_emb.init_params()
@@ -1824,10 +1836,7 @@ class GroupedMultiQueryAttention(Layer):
         QK_T = torch.flatten(QK_T, -3, -2)
         if mask is not None:
             QK_T = vmap(lambda x: x + mask, in_dims=-2, out_dims=-2)(QK_T)
-        def _softmax(x):
-            e_x = torch.exp(x)
-            return e_x / torch.sum(e_x)
-        self.sQK_T = vmap(vmap(vmap(_softmax)))(QK_T)
+        self.sQK_T = self.softmax_fn(QK_T)
         self.sQK_T = torch.cat(self.sQK_T.unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
 
         out = vmap(lambda sqkt, v: vmap(lambda _sqkt: torch.bmm(_sqkt, v), in_dims=-2, out_dims=-2)(sqkt), in_dims=-2, out_dims=-2)(self.sQK_T, self.xv)
@@ -1866,8 +1875,7 @@ class GroupedMultiQueryAttention(Layer):
         dL_dsQKT = vmap(lambda dldatt, v: vmap(lambda _dldatt: torch.bmm(_dldatt, v.transpose(-1,-2)), in_dims=-2, out_dims=-2)(dldatt), in_dims=-2, out_dims=-2)(dL_dAtt, self.xv)
         dL_dsQKT = torch.flatten(dL_dsQKT, -3, -2)
 
-        J_sQKT = vmap(vmap(vmap(self._softmax_jacobian)))(self.sQK_T)  # sQK_T.shape -> BxCxHxC 
-        dL_dQKT = torch.squeeze(vmap(vmap(vmap(torch.mm)))(dL_dsQKT.unsqueeze(-2), J_sQKT)) * self.inv_square_d
+        dL_dQKT = self.softmax_fn.backward_p1(dL_dsQKT) * self.inv_square_d
         
         dL_dQKT =  torch.cat(dL_dQKT.unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
         
@@ -2000,6 +2008,7 @@ class TransformerPPBlock(Layer):
 if __name__ == "__main__":
 
     def test(layer, x, dL_dout):
+        layer.init_params()
         with torch.no_grad():
             layer.forward(x)
             my_back = layer.backward_p1(dL_dout)
@@ -2040,7 +2049,8 @@ if __name__ == "__main__":
     def test_grouped_mulit_head():
         x = torch.randn(16, 30, 80)
         dL_dout = torch.ones(16,30,80)
-        layer = GroupedMultiQueryAttention(80, 8, 4, 30)
+        layer = GroupedMultiQueryAttention(80, 8, 4, 30, device="cpu")
+        layer.init_params()
         with torch.no_grad():
             layer.forward(x)
             my_back = layer.backward_p1(dL_dout)
@@ -2048,6 +2058,8 @@ if __name__ == "__main__":
         true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
         print(my_back[0,0])
         print(true_back[0,0])
+        num_correct = (torch.isclose(my_back, true_back, rtol=0.0001)).sum()
+        print(f"Num correct: {num_correct}/{my_back.numel()} ({100*num_correct/my_back.numel():.2f}%)")
         print(torch.allclose(my_back, true_back))
     
     def test_layernorm():
@@ -2060,7 +2072,6 @@ if __name__ == "__main__":
         x = m.sample(x.shape)
         dL_dout = torch.ones(16, 24, 80)
         layer = BertBlock(80, 8, 160, p=0, device="cpu")
-        layer.init_params()
         test(layer, x, dL_dout)
     
     def test_conv2D():
@@ -2086,7 +2097,7 @@ if __name__ == "__main__":
         m = torch.distributions.Uniform(1, 3)
         x = m.sample((16,24,80))
         dL_dout = torch.ones(16,24,80)
-        layer = NLPRMSNorm(-1,80)
+        layer = NLPRMSNorm(-1,80, device="cpu")
         test(layer, x, dL_dout)
     
     def test_rotary():
@@ -2107,4 +2118,4 @@ if __name__ == "__main__":
         test(layer, x, dL_dout)
 
 
-    test_bert()
+    test_grouped_mulit_head()

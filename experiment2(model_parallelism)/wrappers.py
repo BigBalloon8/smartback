@@ -37,7 +37,7 @@ class expose_params(object):
             _self.params = {}
             _self.grads = {}
             for p, g in self.p_and_g.items():
-                if not hasattr(_self, p):
+                if not hasattr(_self, p) or getattr(_self, p) is None:
                     continue
                 _self.params[p] = getattr(_self, p)
                 _self.grads[p] = getattr(_self, g)
