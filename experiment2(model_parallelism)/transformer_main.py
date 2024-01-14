@@ -1,12 +1,15 @@
 import os
+import time
 
 import torch
 import torch.distributed as dist
 
 from models import Transformer
 from data.dummy import get_train_dataloader, get_val_dataloader
+import layers
 import loss
 import optimizers
+from utils import benchmark
 
 def main():
     torch.manual_seed(31082005)
@@ -19,9 +22,9 @@ def main():
     if dist.get_world_size() > 1 and dist.get_backend() != "gloo":
         torch.cuda.set_device(dist.get_rank())
     
-    gbs = 4
-    dim = 2048
-    max_seqlen = 1024
+    gbs = 16
+    dim = 512
+    max_seqlen = 256
     vocab_size = 32000
     
     model = Transformer(
@@ -33,30 +36,30 @@ def main():
         vocab_size=vocab_size,
         device="cpu"
     )
+    
     model.init_params((gbs, max_seqlen, dim))
+    model.multi_stage(False)
     
     train_data = get_train_dataloader(65536, (max_seqlen,), gbs, vocab_size=vocab_size)
     
+    print(model.layers[0].multi_stage)
     
-    opt = optimizers.SGD(model, 0.0001)
-    
-    #print(model.layers[1].ff.linears[0])
-    #print(dir(model.layers[1].ff.linears[0]))
+    opt = optimizers.Adam(model, 0.0001)
     
     for data in train_data:
-        if dist.get_rank() != 0:
-            data = None
-        y = model.forward(data)
-        break
-    if dist.get_rank() == dist.get_world_size()-1:
-        dL_dout = torch.ones_like(y)
-    else:
-        dL_dout = None
-        
-        
-    model.backward(dL_dout)
+        with benchmark("Time For Step"):
+            if dist.get_rank() != 0:
+                data = None
+            y = model.forward(data)
+            if dist.get_rank() == dist.get_world_size()-1:
+                dL_dout = torch.ones_like(y)
+            else:
+                dL_dout = None
+            model.backward(dL_dout)
+            model.update()
+            model.zero_grad()
     
-    model.update()
+    
     
 
 
@@ -64,4 +67,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    with torch.inference_mode():
+        main()

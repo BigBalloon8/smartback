@@ -75,8 +75,9 @@ class SGD(Optimizer):
 
     def update_fn(self):
         def _update_fn(_self: layers.Layer):
+            print(_self.grads)
             for k in _self.params.keys():
-                _self.params[k] -= self.lr*_self.grads[k]
+                _self.params[k][:] =  _self.params[k] - self.lr*_self.grads[k]
         for layer in self.model.layers:
             self._recursive_set_update_fn(layer, _update_fn)
 
@@ -104,5 +105,5 @@ class Adam(Optimizer):
                 v_hat = _self.v[k]/(1-self.beta2**_self.t)
                 _self.params[k] -= self.lr*m_hat/(torch.sqrt(v_hat) + self.epsilon)
         for layer in self.model.layers:
-            self._recursive_set_attr(layer, ("update", _update_fn))
+            self._recursive_set_update_fn(layer, _update_fn)
             

@@ -41,10 +41,10 @@ class Layer(ABC):
 
     def to_(self, arg):
         if hasattr(self, "params"):
-                for k in self.params.keys():
-                    self.params[k] = self.params[k].to(arg)
-                for k in self.grads.keys():
-                    self.grads[k] = self.grads[k].to(arg)
+            for k in self.params.keys():
+                self.params[k] = self.params[k].to(arg)
+            for k in self.grads.keys():
+                self.grads[k] = self.grads[k].to(arg)
         
         for item in dir(self):
             if isinstance(getattr(self, item), Layer):
@@ -52,19 +52,45 @@ class Layer(ABC):
             elif isinstance(getattr(self, item), list):
                 for sub_layer in getattr(self, item):
                     if isinstance(sub_layer, Layer):
-                        getattr(self, sub_layer).to_(arg)
+                        sub_layer.to_(arg)
             elif isinstance(getattr(self, item), dict):
                 for sub_layer in getattr(self, item).values():
                     if isinstance(sub_layer, Layer):
-                        getattr(self, sub_layer).to_(arg)
+                         sub_layer.to_(arg)
     
-    @classmethod
-    def turn_off_multi_stage(cls):
-        cls.multi_stage = False
+    def multi_stage_set(self, _bool):
+        self.multi_stage = _bool
+        
+        for item in dir(self):
+            if isinstance(getattr(self, item), Layer):
+                getattr(self, item).multi_stage_set(_bool)
+            elif isinstance(getattr(self, item), list):
+                for sub_layer in getattr(self, item):
+                    if isinstance(sub_layer, Layer):
+                        sub_layer.multi_stage_set(_bool)
+            elif isinstance(getattr(self, item), dict):
+                for sub_layer in getattr(self, item).values():
+                    if isinstance(sub_layer, Layer):
+                        sub_layer.multi_stage_set(_bool)
     
-    def turn_on_multi_stage(cls):
-        cls.multi_stage = True
-
+    def zero_grad(self):
+        if self.grads:
+            for k in self.grads.keys():
+                self.grads[k].zero_()
+        
+        for item in dir(self):
+            if isinstance(getattr(self, item), Layer):
+                getattr(self, item).zero_grad()
+            elif isinstance(getattr(self, item), list):
+                for sub_layer in getattr(self, item):
+                    if isinstance(sub_layer, Layer):
+                        sub_layer.zero_grad()
+            elif isinstance(getattr(self, item), dict):
+                for sub_layer in getattr(self, item).values():
+                    if isinstance(sub_layer, Layer):
+                        sub_layer.zero_grad()
+            
+        
 class Activation(Layer):
     """
     Used for Activation functions that dont have parameters
@@ -366,7 +392,6 @@ class Softmax(Activation):
                 func = vmap(func, chunk_size=8)
             else:
                 func = vmap(func)
-        print(dL_dout.shape, self.out.shape)
         return func(dL_dout, self.out)
     
 
@@ -839,7 +864,7 @@ class NLPRMSNorm(Layer):
             J.diagonal()[:] += torch.rsqrt(mx2)
             return torch.mm(dldout.unsqueeze(0), J).squeeze(0)
         self.dL_dout = dL_dout#
-        return vmap(vmap(_per_input_backpass, chunk_size=128))(dL_dout, self.inputs, self.rms_norm_x, self.mean_pow2)
+        return vmap(vmap(_per_input_backpass, chunk_size=8))(dL_dout, self.inputs, self.rms_norm_x, self.mean_pow2)
         print(dL_dout.shape)
         J = self._rmsnorm_jacobian()
         return vmap(vmap(torch.mm))(dL_dout.unsqueeze(-2), J).squeeze()
@@ -1932,7 +1957,7 @@ class TransformerPPBlock(Layer):
         self.p = p
 
         if device == "cuda":
-            self.streams = [torch.cuda.Stream() for _ in range(3)]
+            self.streams = [torch.cuda.Stream() for _ in range(2)]
             self.device = "cuda"
         else:
             self.device = "cpu"
@@ -1974,11 +1999,10 @@ class TransformerPPBlock(Layer):
     def backward_p2(self):
         if self.device == "cuda":
             self.attention.backward_p2()
+            self.ff.backward_p2()
             with torch.cuda.stream(self.streams[0]):
-                self.ff.backward_p2()
-            with torch.cuda.stream(self.streams[1]):
                 self.att_norm.backward_p2()
-            with torch.cuda.stream(self.streams[2]):
+            with torch.cuda.stream(self.streams[1]):
                 self.ff_norm.backward_p2()
         else:
             self.attention.backward_p2()
@@ -1989,11 +2013,10 @@ class TransformerPPBlock(Layer):
     def update(self):
         if self.device == "cuda":
             self.attention.update()
+            self.ff.update()
             with torch.cuda.stream(self.streams[0]):
-                self.ff.update()
-            with torch.cuda.stream(self.streams[1]):
                 self.att_norm.update()
-            with torch.cuda.stream(self.streams[2]):
+            with torch.cuda.stream(self.streams[1]):
                 self.ff_norm.update()
         else:
             self.attention.update()
@@ -2116,6 +2139,11 @@ if __name__ == "__main__":
         dL_dout = torch.ones(16,24,80)
         layer = TransformerPPBlock(80, 8, 4, 24, device="cpu")
         test(layer, x, dL_dout)
+    
+    def test_llamaff():
+        x = torch.randn(16, 24, 80)
+        dL_dout = torch.ones(16,24,80)
+        layer = llamaFF(80, 160, 160, device="cpu")
+        test(layer, x, dL_dout)
 
-
-    test_grouped_mulit_head()
+    test_llamaff()

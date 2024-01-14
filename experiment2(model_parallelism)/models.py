@@ -10,34 +10,27 @@ class Model(ABC):
         self.layers: list[layers.Layer] = []
         self.x = ...
         self.dL_dout = ...
+        self.recv_buffer = ...
 
     def forward(self, input):
         if dist.get_rank()  == 0:
-            for i, layer in enumerate(self.layers):
+            for layer in self.layers:
                 input = layer(input)
-                print(f"Finished Layer: {i}")
-            print("Rank 0 Sending...")
             dist.send(input, dist.get_rank()+1)
-            print("Rank 0 Sent\n")
             
         elif dist.get_rank() == dist.get_world_size()-1:
-            print(f"Rank {dist.get_rank()} Receiving...")
-            dist.recv(self.x, dist.get_rank()-1)
-            print(f"Rank {dist.get_rank()} Received\n")
-            for i, layer in enumerate(self.layers):
-                self.x = layer(self.x)
-                print(f"Finished Layer: {len(self.layers)+ i*dist.get_rank()+1}")
-            return self.x
+            dist.recv(self.recv_buffer, dist.get_rank()-1)
+            x = self.recv_buffer.clone()
+            for layer in self.layers:
+                x = layer(x)
+            return x
         
         else:
-            print(f"Rank {dist.get_rank()} Receiving...")
-            dist.recv(self.x, dist.get_rank()-1)
-            print(f"Rank {dist.get_rank()} Received\n")
-            self.x = self.x
-            for i, layer in enumerate(self.layers):
-                self.x = layer(self.x)
-                print(f"Finished Layer: {len(self.layers)+ i*dist.get_rank()+1}")
-            dist.send(self.x, dist.get_rank()+1)
+            dist.recv(self.recv_buffer, dist.get_rank()-1)
+            x = self.recv_buffer.clone()
+            for layer in self.layers:
+                x = layer(x)
+            dist.send(x, dist.get_rank()+1)
 
     def backward(self, dL_dout):
         if dist.get_rank() == dist.get_world_size()-1:
@@ -45,37 +38,42 @@ class Model(ABC):
                 dL_dout = layer.backward_p1(dL_dout)
             dist.send(dL_dout, dist.get_rank()-1)
             if layer.multi_stage:
-                for i, layer in enumerate(self.layers):
+                for layer in self.layers:
                     layer.backward_p2()
-                    print(f"Finished Layer: {len(self.layers)+ i*dist.get_rank()+1}")
-            dist.barrier()
         
         elif dist.get_rank() == 0:
-            dist.recv(self.dL_dout, dist.get_rank()+1)
-            self.dL_dout = self.dL_dout
+            dist.recv(self.recv_buffer, dist.get_rank()+1)
+            dL_dout = self.recv_buffer.clone()
             for layer in self.layers[::-1]:
-                self.dL_dout = layer.backward_p1(self.dL_dout)
+                dL_dout = layer.backward_p1(dL_dout)
                 if layer.multi_stage:
                     layer.backward_p2()
-            dist.barrier()
         
         else:
-            dist.recv(self.dL_dout, dist.get_rank()+1)
-            self.dL_dout = self.dL_dout
+            dist.recv(self.recv_buffer, dist.get_rank()+1)
+            dL_dout = self.recv_buffer.clone()
             for layer in self.layers[::-1]:
-                self.dL_dout = layer(self.dL_dout)
+                dL_dout = layer.backward_p1(dL_dout)
             dist.send(dL_dout, dist.get_rank()-1)
             if layer.multi_stage:
                 for layer in self.layers:
                     layer.backward_p2()
-            dist.barrier()
         torch.cuda.synchronize()
+        dist.barrier()
 
     def update(self):
         for layer in self.layers:
             layer.update()
         torch.cuda.synchronize()
         dist.barrier()
+    
+    def multi_stage(self, _bool):
+        for layer in self.layers:
+            layer.multi_stage_set(_bool)
+
+    def zero_grad(self):
+        for layer in self.layers:
+            layer.zero_grad()
 
     def save(self, path):
         pass
@@ -116,6 +114,8 @@ class Transformer(Model):
         if dist.get_rank() == 0:
             self.layers.insert(0, layers.Embeddings(**self.embedding_kwargs))  # TODO implement embeddings
             self.layers[0].init_params()
+        
+        self.recv_buffer = torch.zeros(input_shape, device=self.device)
         
         if dist.get_rank() == dist.get_world_size()-1:
             self.x = torch.zeros(input_shape, device=self.device)
