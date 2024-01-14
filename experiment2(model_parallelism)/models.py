@@ -98,7 +98,8 @@ class Transformer(Model):
             }
         self.embedding_kwargs ={
             "num_embeddings": vocab_size,
-            "dim": dim_size
+            "dim": dim_size, 
+            "device": device
         }
         self.num_blocks = num_blocks
         self.device = device

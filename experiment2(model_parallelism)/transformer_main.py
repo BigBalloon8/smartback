@@ -26,6 +26,7 @@ def main():
     dim = 512
     max_seqlen = 256
     vocab_size = 32000
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     
     model = Transformer(
         dim_size=dim,
@@ -34,11 +35,11 @@ def main():
         num_blocks=4,
         max_seqlen=max_seqlen,
         vocab_size=vocab_size,
-        device="cpu"
+        device=device
     )
     
     model.init_params((gbs, max_seqlen, dim))
-    model.multi_stage(False)
+    model.multi_stage(True)
     
     train_data = get_train_dataloader(65536, (max_seqlen,), gbs, vocab_size=vocab_size)
     
@@ -47,6 +48,7 @@ def main():
     opt = optimizers.Adam(model, 0.0001)
     
     for data in train_data:
+        data = data.to(device)
         with benchmark("Time For Step"):
             if dist.get_rank() != 0:
                 data = None

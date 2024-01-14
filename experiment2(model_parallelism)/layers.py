@@ -347,15 +347,16 @@ class Dropout(Layer):
         pass
 
 class Embeddings(Layer):
-    def __init__(self, num_embeddings, dim):
+    def __init__(self, num_embeddings, dim, device):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.dim = dim
+        self.device = device
     
     @expose_params({"weights": "weights_g"})
     def init_params(self):
-        self.weight = torch.randn(self.num_embeddings, self.dim)
-        self.weight_g = torch.zeros_like(self.weight)
+        self.weight = torch.randn(self.num_embeddings, self.dim, device=self.device)
+        self.weight_g = torch.zeros_like(self.weight, device=self.device)
     
     def forward(self, x):
         self.x = x
@@ -1728,7 +1729,7 @@ class llamaFF(Layer):
     def backward_p2(self):
         if self.device == "cuda":  
             for l, s in zip(self.linears, self.streams):
-                with s:
+                with torch.cuda.stream(s):
                     l.backward_p2()
         else:
             for l in self.linears:
@@ -1971,8 +1972,8 @@ class TransformerPPBlock(Layer):
         self.att_dropout = Dropout(self.p)
         self.ff_dropout = Dropout(self.p)
 
-        mask = torch.zeros(self.max_seqlen, self.max_seqlen)
-        self.mask = mask.masked_fill(torch.triu(torch.ones(self.max_seqlen, self.max_seqlen), diagonal=1).bool(), float('-inf'))
+        mask = torch.zeros(self.max_seqlen, self.max_seqlen, device=self.device)
+        self.mask = mask.masked_fill(torch.triu(torch.ones(self.max_seqlen, self.max_seqlen, device=self.device), diagonal=1).bool(), float('-inf'))
     
         self.attention.init_params()
         self.ff.init_params()
@@ -2135,15 +2136,15 @@ if __name__ == "__main__":
         print(torch.allclose(my_back, true_back))
 
     def test_transformer_pp():
-        x = torch.randn(16, 24, 80)
-        dL_dout = torch.ones(16,24,80)
-        layer = TransformerPPBlock(80, 8, 4, 24, device="cpu")
+        x = torch.randn(16, 24, 80, device="cuda")
+        dL_dout = torch.ones(16,24,80, device="cuda")
+        layer = TransformerPPBlock(80, 8, 4, 24, device="cuda")
         test(layer, x, dL_dout)
     
     def test_llamaff():
-        x = torch.randn(16, 24, 80)
-        dL_dout = torch.ones(16,24,80)
-        layer = llamaFF(80, 160, 160, device="cpu")
+        x = torch.randn(16, 24, 80, device="cuda")
+        dL_dout = torch.ones(16,24,80, device="cuda")
+        layer = llamaFF(80, 160, 160, device="cuda")
         test(layer, x, dL_dout)
 
-    test_llamaff()
+    test_transformer_pp()
