@@ -16,7 +16,7 @@ class Model:
             torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Forward")
             for layer in self.layers:
                 input = layer(input)
-            dist.send(input, dist.get_rank()+1)
+            work = dist.isend(input, dist.get_rank()+1)
             torch.cuda.nvtx.range_pop()
             
             
@@ -35,7 +35,7 @@ class Model:
             x = self.f_recv_buffer.clone()
             for layer in self.layers:
                 x = layer(x)
-            dist.send(x, dist.get_rank()+1)
+            work = dist.isend(x, dist.get_rank()+1)
             torch.cuda.nvtx.range_pop()
 
     def backward(self, dL_dout):
@@ -43,13 +43,14 @@ class Model:
             torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Backward P1")
             for layer in self.layers[::-1]:
                 dL_dout = layer.backward_p1(dL_dout)
-            dist.send(dL_dout, dist.get_rank()-1)
+            work = dist.isend(dL_dout, dist.get_rank()-1)
             torch.cuda.nvtx.range_pop()
             if layer.multi_stage:
                 torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Backward P2")
                 for layer in self.layers:
                     layer.backward_p2()
                 torch.cuda.nvtx.range_pop()
+            work.wait()
         
         elif dist.get_rank() == 0:
             dist.recv(self.b_recv_buffer, dist.get_rank()+1)
