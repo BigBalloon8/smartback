@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import vmap as vmap
 
+
 from wrappers import cleanup, multi_stage_wrapper, expose_params
 
 class Layer(ABC):
@@ -1018,7 +1019,15 @@ class BertBlock(Layer):
 
     def backward_p2_non_recursive(self):
         pass
-            
+
+class Flatten(Activation):
+    def forward(self, x: torch.Tensor):
+        self.shape = x.shape
+        return x.view(x.size(0), -1)
+
+    def backward_p1(self, dL_dout):
+        return dL_dout.view(*self.shape)
+
 class Conv2D(Layer):
     def __init__(self, in_channels: int, out_channels: int, k_size: Union[Sequence[int], int], bias: bool=True,  padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1, device: Optional[str]="cuda"):
         """
@@ -1569,15 +1578,22 @@ class ResNet(Layer):
     @cleanup("block", "num_blocks", "num_classes")
     def init_params(self):
         self.conv1 = Conv2D(3, 64, 3, stride=1, padding=1, bias=False, device=self.device)
+        self.conv1.init_params()
         self.bn1 = BatchNorm2D(64, device=self.device)
+        self.bn1.init_params()
         
         self.layers1 = self._make_layer(self.block, 64, self.num_blocks[0], stride=1)
+        self.layers1.init_params()
         self.layers2 = self._make_layer(self.block, 128, self.num_blocks[1], stride=2)
+        self.layers2.init_params()
         self.layers3 = self._make_layer(self.block, 256, self.num_blocks[2], stride=2)
+        self.layers3.init_params()
         self.layers4 = self._make_layer(self.block, 512, self.num_blocks[3], stride=2)
+        self.layers4.init_params()
         
         self.linear = Dense(512*self.block.expansion, self.num_classes, device=self.device)
-        
+        self.linear.init_params()
+        self.flatten = Flatten()
         self.relu = ReLU()
         self.avgpool = AvgPool2D(4)
         
@@ -1599,15 +1615,14 @@ class ResNet(Layer):
         out = self.layers3(out)
         out = self.layers4(out)
         out = self.avgpool(out)
-        self.preflattened = out.shape
-        out = out.view(out.size(0), -1)
+        out = self.flatten(out)
         out = self.linear(out)
         return out
     
     @multi_stage_wrapper
     def backward_p1(self, dL_dout):
         dL_davgpool = self.linear.backward_p1(dL_dout)
-        dL_davgpool = dL_davgpool.view(*self.preflattened)
+        dL_davgpool = self.flatten.backward_p1(dL_davgpool)
         dL_dl4 = self.avgpool.backward_p1(dL_davgpool)
         dL_dl3 = self.layers4.backward_p1(dL_dl4)
         dL_dl2 = self.layers3.backward_p1(dL_dl3)
@@ -1738,7 +1753,7 @@ class llamaFF(Layer):
     def update(self):
         if self.device == "cuda":
             for l, s in zip(self.linears, self.streams):
-                with s:
+                with torch.cuda.stream(s):
                     l.update()
         else:
             for l in self.linears:
@@ -2032,7 +2047,7 @@ class TransformerPPBlock(Layer):
 if __name__ == "__main__":
 
     def test(layer, x, dL_dout):
-        layer.init_params()
+        #layer.init_params()
         with torch.no_grad():
             layer.forward(x)
             my_back = layer.backward_p1(dL_dout)
@@ -2115,6 +2130,7 @@ if __name__ == "__main__":
     def test_resnet():
         image = torch.randn(16, 3, 32, 32)
         resnet50 = ResNet(ResNetBottleneck, [3, 4, 6, 3], device="cpu")
+        resnet50.init_params()
         test(resnet50, image, torch.ones_like(resnet50(image)))
     
     def test_rmsnorm():
@@ -2147,4 +2163,4 @@ if __name__ == "__main__":
         layer = llamaFF(80, 160, 160, device="cuda")
         test(layer, x, dL_dout)
 
-    test_transformer_pp()
+    test_resnet()

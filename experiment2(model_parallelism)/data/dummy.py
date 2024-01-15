@@ -28,12 +28,28 @@ class DummyDataFloat(Dataset):
     def __getitem__(self, idx):
         return torch.rand(size=self.shape)
 
+class DummyImage(Dataset):
+    def __init__(self, length, shape, num_classes):
+        self.length = length
+        self.shape = shape
+        self.num_classes = num_classes
+    
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        return torch.randint(0, 255, self.shape, dtype=torch.float32) / 255.
+    
+    
+
 def get_train_dataloader(length, shape, gbs, dtype=int, accum_freq=1, shuffle=True, vocab_size = -1,  device="cuda"):
 
     if dtype == int:
         dataset = DummyDataInt(length, shape, vocab_size)
     elif dtype == float:
         dataset = DummyDataFloat(length, shape)
+    elif dtype == "image":
+        dataset = DummyImage(length, shape, vocab_size)
     
     local_bs = gbs // accum_freq
 
