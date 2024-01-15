@@ -391,7 +391,7 @@ class Softmax(Activation):
         func = _per_input_backpass
         for i in range(len(dL_dout.shape)-1):
             if i ==1:
-                func = vmap(func, chunk_size=8)
+                func = vmap(func, chunk_size=64)
             else:
                 func = vmap(func)
         return func(dL_dout, self.out)
@@ -1885,26 +1885,6 @@ class GroupedMultiQueryAttention(Layer):
         out = torch.flatten(out, -3, -2)
         out = torch.flatten(out, -2, -1)
         return self.linears["O"](out)
-
-    @staticmethod
-    def _softmax_jacobian(softmax_out: torch.Tensor): #softmax_out.shape -> N | 1xN
-        """
-        Returns the Jacobian of the softmax within the multihead attention
-
-        Args:
-            softmax_out (torch.Tensor): The output of the softmax within the multihead attention
-
-        Returns:
-            torch.Tensor: The Jacobian of the softmax 
-        """
-        softmax_out = torch.squeeze(softmax_out)
-        n = softmax_out.shape[-1]
-        
-        jac_base = -softmax_out.view(n, 1) * softmax_out.view(1, n)
-        diag = softmax_out*(1-softmax_out)
-        jac_base[torch.arange(n), torch.arange(n)] = diag
-        
-        return jac_base
 
     @multi_stage_wrapper
     def backward_p1(self, dL_dout: torch.Tensor):

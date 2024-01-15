@@ -1,11 +1,9 @@
-from abc import ABC, abstractmethod
-
 import torch
 import torch.distributed as dist
 
 import layers
 
-class Model(ABC):
+class Model:
     def __init__(self):
         self.layers: list[layers.Layer] = []
         self.x = ...
@@ -15,50 +13,67 @@ class Model(ABC):
 
     def forward(self, input):
         if dist.get_rank()  == 0:
+            torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Forward")
             for layer in self.layers:
                 input = layer(input)
             dist.send(input, dist.get_rank()+1)
+            torch.cuda.nvtx.range_pop()
+            
             
         elif dist.get_rank() == dist.get_world_size()-1:
             dist.recv(self.f_recv_buffer, dist.get_rank()-1)
+            torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Forward")
             x = self.f_recv_buffer.clone()
             for layer in self.layers:
                 x = layer(x)
+            torch.cuda.nvtx.range_pop()
             return x
         
         else:
             dist.recv(self.f_recv_buffer, dist.get_rank()-1)
+            torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Forward")
             x = self.f_recv_buffer.clone()
             for layer in self.layers:
                 x = layer(x)
             dist.send(x, dist.get_rank()+1)
+            torch.cuda.nvtx.range_pop()
 
     def backward(self, dL_dout):
         if dist.get_rank() == dist.get_world_size()-1:
+            torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Backward P1")
             for layer in self.layers[::-1]:
                 dL_dout = layer.backward_p1(dL_dout)
             dist.send(dL_dout, dist.get_rank()-1)
+            torch.cuda.nvtx.range_pop()
             if layer.multi_stage:
+                torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Backward P2")
                 for layer in self.layers:
                     layer.backward_p2()
+                torch.cuda.nvtx.range_pop()
         
         elif dist.get_rank() == 0:
             dist.recv(self.b_recv_buffer, dist.get_rank()+1)
+            torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Backward")
             dL_dout = self.b_recv_buffer.clone()
             for layer in self.layers[::-1]:
                 dL_dout = layer.backward_p1(dL_dout)
                 if layer.multi_stage:
                     layer.backward_p2()
+            torch.cuda.nvtx.range_pop()
         
         else:
             dist.recv(self.b_recv_buffer, dist.get_rank()+1)
+            torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Backward P1")
             dL_dout = self.b_recv_buffer.clone()
             for layer in self.layers[::-1]:
                 dL_dout = layer.backward_p1(dL_dout)
             dist.send(dL_dout, dist.get_rank()-1)
+            torch.cuda.nvtx.range_pop()
             if layer.multi_stage:
+                torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Backward P2")
                 for layer in self.layers:
                     layer.backward_p2()
+            torch.cuda.nvtx.range_pop()
         torch.cuda.synchronize()
         dist.barrier()
 
@@ -114,19 +129,11 @@ class Transformer(Model):
             layer.init_params()
             self.layers.append(layer)
         if dist.get_rank() == 0:
-            self.layers.insert(0, layers.Embeddings(**self.embedding_kwargs))  # TODO implement embeddings
+            self.layers.insert(0, layers.Embeddings(**self.embedding_kwargs))
             self.layers[0].init_params()
         
         self.f_recv_buffer = torch.zeros(input_shape, device=self.device)
         self.b_recv_buffer = self.f_recv_buffer
-        
-        if dist.get_rank() == dist.get_world_size()-1:
-            self.x = torch.zeros(input_shape, device=self.device)
-        elif dist.get_rank() == 0:
-            self.dL_dout = torch.zeros(input_shape, device=self.device)
-        else:
-            self.x = torch.zeros(input_shape, device=self.device)
-            self.dL_dout = torch.zeros(input_shape, device=self.device)
         
 
 class ResNet50(Model):

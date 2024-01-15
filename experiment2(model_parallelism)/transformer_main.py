@@ -16,23 +16,24 @@ def main():
     torch.cuda.manual_seed(31082005)
 
     
-    dist.init_process_group(backend='gloo')
+    dist.init_process_group(backend='nccl')
     if dist.get_world_size() > 4:
         raise NotImplementedError("nccl backend doesnt support multi node")
     if dist.get_world_size() > 1 and dist.get_backend() != "gloo":
-        torch.cuda.set_device(dist.get_rank())
+        pass
+    torch.cuda.set_device(dist.get_rank())
     
-    gbs = 16
-    dim = 512
-    max_seqlen = 256
+    gbs = 1
+    dim = 2038*2
+    max_seqlen = 512
     vocab_size = 32000
-    device = "cpu"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     
     model = Transformer(
         dim_size=dim,
         num_heads=16,
         num_kv_heads=8,
-        num_blocks=4,
+        num_blocks=12,
         max_seqlen=max_seqlen,
         vocab_size=vocab_size,
         device=device
@@ -41,32 +42,33 @@ def main():
     model.init_params((gbs, max_seqlen, dim))
     model.multi_stage(False)
     
-    train_data = get_train_dataloader(65536, (max_seqlen,), gbs, vocab_size=vocab_size)
-    
+    train_data = get_train_dataloader(64, (max_seqlen,), gbs, vocab_size=vocab_size)
+
     print(model.layers[0].multi_stage)
     
     opt = optimizers.Adam(model, 0.0001)
-    
-    for data in train_data:
-        data = data.to(device)
-        with benchmark("Time For Step"):
-            if dist.get_rank() != 0:
-                data = None
-            y = model.forward(data)
-            if dist.get_rank() == dist.get_world_size()-1:
-                dL_dout = torch.ones_like(y)
-            else:
-                dL_dout = None
-            model.backward(dL_dout)
-            model.update()
-            model.zero_grad()
-    
-    
-    
 
-
+    torch.cuda.cudart().cudaProfilerStart()
     
+    with benchmark("Time For Epoch"):
+        for data in train_data:
+            data = data.to(device)
+            with benchmark("Time For Step"):
+                if dist.get_rank() != 0:
+                    data = None
+                y = model.forward(data)
+                if dist.get_rank() == dist.get_world_size()-1:
+                    dL_dout = torch.ones_like(y)
+                else:
+                    dL_dout = None
+                model.backward(dL_dout)
+                model.update()
+                model.zero_grad()
+                dist.barrier()    
+            break    
 
+    torch.cuda.cudart().cudaProfilerStop()
+    
 
 if __name__ == "__main__":
     with torch.inference_mode():
