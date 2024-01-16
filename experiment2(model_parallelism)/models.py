@@ -44,6 +44,7 @@ class Model:
             for layer in self.layers[::-1]:
                 dL_dout = layer.backward_p1(dL_dout)
             work = dist.isend(dL_dout, dist.get_rank()-1)
+            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
             if layer.multi_stage:
                 torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Backward P2")
@@ -60,6 +61,7 @@ class Model:
                 dL_dout = layer.backward_p1(dL_dout)
                 if layer.multi_stage:
                     layer.backward_p2()
+            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
         
         else:
@@ -69,6 +71,7 @@ class Model:
             for layer in self.layers[::-1]:
                 dL_dout = layer.backward_p1(dL_dout)
             dist.send(dL_dout, dist.get_rank()-1)
+            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
             if layer.multi_stage:
                 torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Backward P2")
