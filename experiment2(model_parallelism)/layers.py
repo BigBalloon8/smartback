@@ -96,6 +96,9 @@ class Activation(Layer):
     """
     Used for Activation functions that dont have parameters
     """
+    def init_params(self):
+        pass
+
     def backward_p2(self):
         pass
 
@@ -379,21 +382,19 @@ class Softmax(Activation):
         super().__init__()
     
     def forward(self, x):
-        self.out = torch.softmax(x, -1)
+        self.out = torch.softmax(x, dim=-1)
         return self.out
     
     @cleanup("out")
     def backward_p1(self, dL_dout:torch.Tensor):
-        def _per_input_backpass(dldout, s_out):
+        def _per_input_backpass(dldout, s):
+            return s * (dldout - torch.sum(s*dldout, dim=-1, keepdim=True))
             J = -torch.outer(s_out, s_out)
             J.diagonal().copy_(s_out*(1-s_out))
             return torch.mm(dldout.unsqueeze(0), J).squeeze(0)
         func = _per_input_backpass
-        for i in range(len(dL_dout.shape)-1):
-            if i ==1:
-                func = vmap(func, chunk_size=64)
-            else:
-                func = vmap(func)
+        for _ in range(len(dL_dout.shape)-1):
+            func = vmap(func)
         return func(dL_dout, self.out)
     
 
@@ -817,9 +818,9 @@ class NLPRMSNorm(Layer):
         Returns:
             torch.Tensor: The output of the NLP RMS norm
         """
-        self.inputs = x
-        self.mean_pow2 = torch.mean(x**2, dim=-1, keepdim=True) + self.eps
-        self.rms_norm_x = x*torch.rsqrt(self.mean_pow2)
+        u_x2 = torch.mean(x**2, dim=-1, keepdim=True) + self.eps
+        self.IRMS = torch.rsqrt(u_x2)  # Inverse Root Mean Square
+        self.rms_norm_x = x*self.IRMS
         return self.rms_norm_x*self.weights
     
     @cleanup("inputs", "mean_pow2")
@@ -850,7 +851,7 @@ class NLPRMSNorm(Layer):
         return vmap(vmap(_diag_set))(jac_base, diag)
 
     @multi_stage_wrapper
-    @cleanup("inputs", "mean_pow2")
+    @cleanup("IRMS")
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the NLP RMS norm output and returns the derivative of the loss with respect to the NLP RMS norm input
@@ -861,13 +862,14 @@ class NLPRMSNorm(Layer):
         Returns:
             torch.Tensor: The derivatives of the loss with respect to the NLP RMS norm inputs
         """
-        def _per_input_backpass(dldout, x, z, mx2):
+        def _per_input_backpass(dldout, irms, z, n):
+            return irms*((-z/n) * sum(dldout*z) + dldout)
             J = ((1/self.dim_size)*-torch.outer(z, x))/mx2
             J.diagonal()[:] += torch.rsqrt(mx2)
             return torch.mm(dldout.unsqueeze(0), J).squeeze(0)
-        self.dL_dout = dL_dout#
-        return vmap(vmap(_per_input_backpass, chunk_size=8))(dL_dout, self.inputs, self.rms_norm_x, self.mean_pow2)
-        print(dL_dout.shape)
+        self.dL_dout = dL_dout
+        return vmap(vmap(_per_input_backpass))(dL_dout, self.IRMS, self.rms_norm_x, n=self.rms_norm_x.size(-1))
+
         J = self._rmsnorm_jacobian()
         return vmap(vmap(torch.mm))(dL_dout.unsqueeze(-2), J).squeeze()
     
@@ -2027,7 +2029,7 @@ class TransformerPPBlock(Layer):
 if __name__ == "__main__":
 
     def test(layer, x, dL_dout):
-        #layer.init_params()
+        layer.init_params()
         with torch.no_grad():
             layer.forward(x)
             my_back = layer.backward_p1(dL_dout)
@@ -2044,7 +2046,7 @@ if __name__ == "__main__":
             print(my_back[:2,:2,:2, :2])
             print(true_back[:2,:2,:2, :2])
         print(my_back.mean())
-        num_correct = (torch.isclose(my_back, true_back, rtol=0.0001)).sum()
+        num_correct = (torch.isclose(my_back, true_back, rtol=0.000001)).sum()
         print(f"Num correct: {num_correct}/{my_back.numel()} ({100*num_correct/my_back.numel():.2f}%)")
         return my_back, true_back
     
@@ -2132,9 +2134,9 @@ if __name__ == "__main__":
         print(torch.allclose(my_back, true_back))
 
     def test_transformer_pp():
-        x = torch.randn(16, 24, 80, device="cuda")
-        dL_dout = torch.ones(16,24,80, device="cuda")
-        layer = TransformerPPBlock(80, 8, 4, 24, device="cuda")
+        x = torch.randn(16, 24, 80, device="cpu")
+        dL_dout = torch.ones(16,24,80, device="cpu")
+        layer = TransformerPPBlock(80, 8, 4, 24, device="cpu")
         test(layer, x, dL_dout)
     
     def test_llamaff():
@@ -2142,5 +2144,12 @@ if __name__ == "__main__":
         dL_dout = torch.ones(16,24,80, device="cuda")
         layer = llamaFF(80, 160, 160, device="cuda")
         test(layer, x, dL_dout)
+    
+    def test_softmax():
+        x = torch.randn(16,24,8,24)
+        dL_dout = torch.ones(16,24,8,24)
+        layer = Softmax()
+        test(layer, x, dL_dout)
 
-    test_resnet()
+
+    test_transformer_pp()
