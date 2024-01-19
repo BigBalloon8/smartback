@@ -40,9 +40,9 @@ def main():
     )
     
     model.init_params((gbs, max_seqlen, dim))
-    model.multi_stage(False)
+    model.multi_stage(True)
     
-    train_data = get_train_dataloader(64, (max_seqlen,), gbs, vocab_size=vocab_size)
+    train_data = get_train_dataloader(16, (max_seqlen,), gbs, vocab_size=vocab_size)
 
     print(model.layers[0].multi_stage)
     
@@ -67,7 +67,7 @@ def main():
                 #torch.cuda.synchronize()
                 model.zero_grad()
                 #dist.barrier()
-            break    
+            
 
     torch.cuda.cudart().cudaProfilerStop()
     

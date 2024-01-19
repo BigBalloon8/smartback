@@ -3,3 +3,6 @@ experiment1/.ipynb_checkpoints/*
 *.pyc
 experiment1/__pycache__/*
 data/*
+experiment2(model_parallelism)/.transformer_main.py.swp
+experiment2(model_parallelism)/nsight_report
+experiment2(model_parallelism)/nsight_report.nsys-rep

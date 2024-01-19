@@ -15,15 +15,16 @@ def main():
     torch.manual_seed(31082005)
     torch.cuda.manual_seed(31082005)
     
-    dist.init_process_group(backend='gloo')
+    dist.init_process_group(backend='nccl')
     if dist.get_world_size() > 4:
         raise NotImplementedError("nccl backend doesnt support multi node")
     if dist.get_world_size() > 1 and dist.get_backend() != "gloo":
-        torch.cuda.set_device(dist.get_rank())
+        pass
+    torch.cuda.set_device(dist.get_rank())
     
-    gbs = 16
+    gbs = 1
     num_classes = 1000
-    device = "cpu"
+    device = "cuda"
     
     model = ResNet50(num_classes=num_classes, device=device)
     model.init_params(gbs)

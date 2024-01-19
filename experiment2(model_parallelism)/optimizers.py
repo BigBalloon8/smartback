@@ -27,7 +27,7 @@ class Optimizer(ABC):
                 for sub_layer in getattr(layer, item):
                     if isinstance(sub_layer, layers.Layer):
                         self._recursive_set_attr(sub_layer, attr)
-            elif isinstance(getattr(layer, item), dict):
+            elif isinstance(getattr(layer, item), dict)  and item != "__dict__":
                 for sub_layer in getattr(layer, item).values():
                     if isinstance(sub_layer, layers.Layer):
                         self._recursive_set_attr(sub_layer, attr)
@@ -43,7 +43,7 @@ class Optimizer(ABC):
                 for sub_layer in getattr(layer, item):
                     if isinstance(sub_layer, layers.Layer):
                         self._recursive_set_update_fn(sub_layer, fn)
-            elif isinstance(getattr(layer, item), dict):
+            elif isinstance(getattr(layer, item), dict)  and item != "__dict__":
                 for sub_layer in getattr(layer, item).values():
                     if isinstance(sub_layer, layers.Layer):
                         self._recursive_set_update_fn(sub_layer, fn)
@@ -63,7 +63,7 @@ class Optimizer(ABC):
                 for sub_layer in getattr(layer, item):
                     if isinstance(sub_layer, layers.Layer):
                         self._recursive_set_empty_opt_states(sub_layer, opt_creation_fn, *args)
-            elif isinstance(getattr(layer, item), dict):
+            elif isinstance(getattr(layer, item), dict) and item != "__dict__":
                 for sub_layer in getattr(layer, item).values():
                     if isinstance(sub_layer, layers.Layer):
                         self._recursive_set_empty_opt_states(sub_layer, opt_creation_fn, *args)

@@ -1,5 +1,7 @@
 from functools import wraps
 
+import torch.distributed as dist
+
 class cleanup(object):
     def __init__(self, *args):
         self.args = args
@@ -16,7 +18,7 @@ def multi_stage_wrapper(func):
     # designed to wrap backward_p1
     @wraps(func)
     def wrapper(self, *args, **kwargs):
-        if not self.multi_stage:
+        if not self.multi_stage or dist.get_rank() == 0:
             out = func(self, *args, **kwargs)
             self.backward_p2_non_recursive()
             if hasattr(self, "dL_dout"):

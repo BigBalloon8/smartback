@@ -54,7 +54,7 @@ class Layer(ABC):
                 for sub_layer in getattr(self, item):
                     if isinstance(sub_layer, Layer):
                         sub_layer.to_(arg)
-            elif isinstance(getattr(self, item), dict):
+            elif isinstance(getattr(self, item), dict) and item != "__dict__":
                 for sub_layer in getattr(self, item).values():
                     if isinstance(sub_layer, Layer):
                          sub_layer.to_(arg)
@@ -69,7 +69,7 @@ class Layer(ABC):
                 for sub_layer in getattr(self, item):
                     if isinstance(sub_layer, Layer):
                         sub_layer.multi_stage_set(_bool)
-            elif isinstance(getattr(self, item), dict):
+            elif isinstance(getattr(self, item), dict) and item != "__dict__":
                 for sub_layer in getattr(self, item).values():
                     if isinstance(sub_layer, Layer):
                         sub_layer.multi_stage_set(_bool)
@@ -86,10 +86,27 @@ class Layer(ABC):
                 for sub_layer in getattr(self, item):
                     if isinstance(sub_layer, Layer):
                         sub_layer.zero_grad()
-            elif isinstance(getattr(self, item), dict):
+            elif isinstance(getattr(self, item), dict) and item != "__dict__":
                 for sub_layer in getattr(self, item).values():
                     if isinstance(sub_layer, Layer):
                         sub_layer.zero_grad()
+    
+    def _get_model_sub_layers(self, sublayers_list: list):
+        if self.grads:
+            sublayers_list.append(self)
+        
+        for item in dir(self):
+            if isinstance(getattr(self, item), Layer):
+                getattr(self, item)._get_model_sub_layers(sublayers_list)
+            elif isinstance(getattr(self, item), list):
+                for sub_layer in getattr(self, item):
+                    if isinstance(sub_layer, Layer):
+                        sub_layer._get_model_sub_layers(sublayers_list)
+            elif isinstance(getattr(self, item), dict) and item != "__dict__":
+                for sub_layer in getattr(self, item).values():
+                    if isinstance(sub_layer, Layer):
+                        sub_layer._get_model_sub_layers(sublayers_list)
+
             
         
 class Activation(Layer):
@@ -359,12 +376,12 @@ class Embeddings(Layer):
     
     @expose_params({"weights": "weights_g"})
     def init_params(self):
-        self.weight = torch.randn(self.num_embeddings, self.dim, device=self.device)
-        self.weight_g = torch.zeros_like(self.weight, device=self.device)
+        self.weights = torch.randn(self.num_embeddings, self.dim, device=self.device)
+        self.weights_g = torch.zeros_like(self.weights, device=self.device)
     
     def forward(self, x):
         self.x = x
-        return self.weight[x]
+        return self.weights[x]
     
     @multi_stage_wrapper
     def backward_p1(self, dL_dout):
@@ -374,7 +391,7 @@ class Embeddings(Layer):
     
     @cleanup("dL_dout", "x")
     def backward_p2(self):
-        self.weight_g[self.x] = self.dL_dout
+        self.weights_g[self.x] = self.dL_dout
 
 
 class Softmax(Activation):
@@ -803,7 +820,7 @@ class NLPRMSNorm(Layer):
         self.eps = eps
         self.device = device
     
-    @expose_params({"gamma": "gamma_g"})
+    @expose_params({"weights": "weights_g"})
     def init_params(self):
         self.weights = torch.ones(self.dim_size, device=self.device)
         self.weights_g = torch.zeros(self.dim_size, device=self.device)
@@ -1434,7 +1451,7 @@ class ResNetBottleneck(Layer):
         if device == "cuda":
             self.streams = []
             self.device = "cuda"
-            for _ in range(len(self.convs) + len(self.batchnorms) + len(self.shortcut)):
+            for _ in range(8):
                 self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
@@ -1567,6 +1584,7 @@ class ResNet(Layer):
         self.in_planes = 64
 
         if device == "cuda":
+            self.streams = []
             self.device = "cuda"
             for _ in range(3):  # conv1, bn1, dense
                 self.streams.append(torch.cuda.Stream())

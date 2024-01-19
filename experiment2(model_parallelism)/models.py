@@ -10,32 +10,39 @@ class Model:
         self.dL_dout = ...
         self.f_recv_buffer = ...
         self.b_recv_buffer = ...
+        self.sub_layers: list[layers.Layer] = []
+        self.streams: list[torch.cuda.Stream] = []
 
     def forward(self, input):
         if dist.get_rank()  == 0:
             torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Forward")
             for layer in self.layers:
                 input = layer(input)
-            work = dist.isend(input, dist.get_rank()+1)
+            dist.send(input, dist.get_rank()+1)
+            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
             
             
         elif dist.get_rank() == dist.get_world_size()-1:
             dist.recv(self.f_recv_buffer, dist.get_rank()-1)
+            torch.cuda.synchronize()
             torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Forward")
             x = self.f_recv_buffer.clone()
             for layer in self.layers:
                 x = layer(x)
+            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
             return x
         
         else:
             dist.recv(self.f_recv_buffer, dist.get_rank()-1)
+            torch.cuda.synchronize()
             torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Forward")
             x = self.f_recv_buffer.clone()
             for layer in self.layers:
                 x = layer(x)
-            work = dist.isend(x, dist.get_rank()+1)
+            dist.send(x, dist.get_rank()+1)
+            torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
 
     def backward(self, dL_dout):
@@ -43,59 +50,67 @@ class Model:
             torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Backward P1")
             for layer in self.layers[::-1]:
                 dL_dout = layer.backward_p1(dL_dout)
-            work = dist.isend(dL_dout, dist.get_rank()-1)
             torch.cuda.synchronize()
+            work = dist.isend(dL_dout, dist.get_rank()-1)
             torch.cuda.nvtx.range_pop()
             if layer.multi_stage:
                 torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Backward P2")
-                for layer in self.layers:
-                    layer.backward_p2()
+                for layer, s in zip(self.sub_layers, self.streams):
+                    with torch.cuda.stream(s):
+                        layer.backward_p2()
+                torch.cuda.synchronize()
                 torch.cuda.nvtx.range_pop()
             work.wait()
         
         elif dist.get_rank() == 0:
             dist.recv(self.b_recv_buffer, dist.get_rank()+1)
+            torch.cuda.synchronize()
             torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Backward")
             dL_dout = self.b_recv_buffer.clone()
             for layer in self.layers[::-1]:
+                # backward_p2 always called on rank 0 with backward_p1 for memory efficiency 
                 dL_dout = layer.backward_p1(dL_dout)
-                if layer.multi_stage:
-                    layer.backward_p2()
             torch.cuda.synchronize()
             torch.cuda.nvtx.range_pop()
         
         else:
             dist.recv(self.b_recv_buffer, dist.get_rank()+1)
+            torch.cuda.synchronize()
             torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Backward P1")
             dL_dout = self.b_recv_buffer.clone()
             for layer in self.layers[::-1]:
                 dL_dout = layer.backward_p1(dL_dout)
-            dist.send(dL_dout, dist.get_rank()-1)
             torch.cuda.synchronize()
+            dist.isend(dL_dout, dist.get_rank()-1)
             torch.cuda.nvtx.range_pop()
             if layer.multi_stage:
                 torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Backward P2")
-                for layer in self.layers:
-                    layer.backward_p2()
-            torch.cuda.nvtx.range_pop()
-        torch.cuda.synchronize()
+                for layer, s in zip(self.sub_layers, self.streams):
+                    with torch.cuda.stream(s):
+                        layer.backward_p2()
+                torch.cuda.synchronize()
+                torch.cuda.nvtx.range_pop()
         dist.barrier()
 
     def update(self):
+        torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Update Grads")
         for layer in self.layers:
             layer.update()
         torch.cuda.synchronize()
         dist.barrier()
+        torch.cuda.nvtx.range_pop()
     
     def multi_stage(self, _bool):
         for layer in self.layers:
             layer.multi_stage_set(_bool)
 
     def zero_grad(self):
+        torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Zero Grad")
         for layer in self.layers:
             layer.zero_grad()
         torch.cuda.synchronize()
         dist.barrier()
+        torch.cuda.nvtx.range_pop()
 
     def save(self, path):
         pass
@@ -140,6 +155,12 @@ class Transformer(Model):
         
         self.f_recv_buffer = torch.zeros(input_shape, device=self.device)
         self.b_recv_buffer = self.f_recv_buffer
+
+        self.sub_layers = []
+        for layer in self.layers:
+            layer._get_model_sub_layers(self.sub_layers)   
+        
+        self.streams = [torch.cuda.Stream() for _ in self.sub_layers]
         torch.cuda.synchronize()
         
 
@@ -194,7 +215,8 @@ class ResNet50(Model):
             dist.send(torch.tensor(x.shape), dist.get_rank()+1)
         
         dist.barrier()
-        torch.cuda.synchronize()    
+        torch.cuda.synchronize()
+        print(f"Rank {dist.get_group_rank()}: {self.f_recv_buffer.shape if hasattr(self, 'f_recv_buffer') else ''}, {self.b_recv_buffer.shape if hasattr(self, 'b_recv_buffer') else ''}")
             
             
         
