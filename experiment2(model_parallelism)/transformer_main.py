@@ -62,9 +62,11 @@ def main():
                 else:
                     dL_dout = None
                 model.backward(dL_dout)
+                #torch.cuda.synchronize()
                 model.update()
+                #torch.cuda.synchronize()
                 model.zero_grad()
-                dist.barrier()    
+                #dist.barrier()
             break    
 
     torch.cuda.cudart().cudaProfilerStop()

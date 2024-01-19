@@ -94,6 +94,8 @@ class Model:
     def zero_grad(self):
         for layer in self.layers:
             layer.zero_grad()
+        torch.cuda.synchronize()
+        dist.barrier()
 
     def save(self, path):
         pass
@@ -138,6 +140,7 @@ class Transformer(Model):
         
         self.f_recv_buffer = torch.zeros(input_shape, device=self.device)
         self.b_recv_buffer = self.f_recv_buffer
+        torch.cuda.synchronize()
         
 
 class ResNet50(Model):
@@ -191,7 +194,7 @@ class ResNet50(Model):
             dist.send(torch.tensor(x.shape), dist.get_rank()+1)
         
         dist.barrier()
-            
+        torch.cuda.synchronize()    
             
             
         
