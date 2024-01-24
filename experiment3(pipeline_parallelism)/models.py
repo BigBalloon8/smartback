@@ -104,6 +104,10 @@ class Model:
     def multi_stage(self, _bool):
         for layer in self.layers:
             layer.multi_stage_set(_bool)
+    
+    def set_batch_size(self, bs):
+        for layer in self.layers:
+            layer.batch_size_set(bs)
 
     def zero_grad(self):
         torch.cuda.nvtx.range_push(f"Rank {dist.get_rank()}: Zero Grad")

@@ -42,6 +42,8 @@ def main():
     model.init_params((gbs, max_seqlen, dim))
     model.multi_stage(True)
     
+    model.get_num_params()
+
     train_data = get_train_dataloader(16, (max_seqlen,), gbs, vocab_size=vocab_size)
 
     print(model.layers[0].multi_stage)

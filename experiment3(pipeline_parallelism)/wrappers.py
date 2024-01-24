@@ -1,9 +1,10 @@
 from functools import wraps
+from typing import Any
 
 import torch.distributed as dist
 import torch
 
-class cleanup(object):
+class cleanup_act(object):
     def __init__(self, *args):
         self.args = args
     def __call__(self, func):
@@ -11,7 +12,7 @@ class cleanup(object):
         def wrapper(*args, **kwargs):
             out = func(*args, **kwargs)
             for arg in self.args:
-                setattr(args[0], arg, None)
+                setattr(args[0], arg, [])
             return out
         return wrapper
 
@@ -46,3 +47,19 @@ class expose_params(object):
                 _self.grads[p] = getattr(_self, g)
             return out
         return wrapper
+
+def pipeline_fwd(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        out = func(self, *args, **kwargs)
+        self.pipe_step += 1
+        return out
+    return wrapper
+
+def pipeline_bwd(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        self.pipe_step -= 1
+        out = func(self, *args, **kwargs)
+        return out
+    return wrapper
