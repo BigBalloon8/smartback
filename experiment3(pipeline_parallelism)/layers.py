@@ -19,6 +19,7 @@ class Layer(ABC):
         self.params: Dict[str, torch.Tensor] = {}
         self.grads: Dict[str, torch.Tensor] = {}
         self.pipe_step = 0
+        self.acts = []
 
     def __call__(self, *args, **kwargs):
         return self.forward(*args, **kwargs)
@@ -43,6 +44,22 @@ class Layer(ABC):
 
     def get_pipe_slice(self):
         return slice(self.pipe_step*self.mini_bs, self.pipe_step*self.mini_bs+self.mini_bs)
+    
+    def clear_acts(self):
+        if self.acts:
+            for act in self.acts:
+                setattr(self, act, [])
+        for item in dir(self):
+            if isinstance(getattr(self, item), Layer):
+                getattr(self, item).clear_acts()
+            elif isinstance(getattr(self, item), list):
+                for sub_layer in getattr(self, item):
+                    if isinstance(sub_layer, Layer):
+                        sub_layer.clear_acts()
+            elif isinstance(getattr(self, item), dict) and item != "__dict__":
+                for sub_layer in getattr(self, item).values():
+                    if isinstance(sub_layer, Layer):
+                         sub_layer.clear_acts()
 
     def to_(self, arg):
         if hasattr(self, "params"):
@@ -143,8 +160,6 @@ class Layer(ABC):
                         sub_layer.get_num_params(num_elm_list)
             
 
-            
-        
 class Activation(Layer):
     """
     Used for Activation functions that dont have parameters
@@ -231,7 +246,7 @@ class Dense(Layer):
         self.bias_ = bias
         self.device = device
     
-    @expose_params({"weights": "weights_g", "bias": "bias_g"})
+    @expose_params({"weights": "weights_g", "bias": "bias_g"}, ["inputs", "dL_dout"])
     def init_params(self):
         m = torch.distributions.normal.Normal(0, 0.01)
         self.weights = m.sample(torch.Size([self.input_size, self.output_size])).to(self.device)
@@ -277,13 +292,17 @@ class Dense(Layer):
         self.dL_dout.append(dL_dout)
         return vmap(lambda dl_dout: torch.matmul(dl_dout, self.weights.T))(dL_dout)
     
-    @cleanup_act(["dL_dout", "inputs"])
+    @cleanup_act("dL_dout", "inputs")
     def backward_p2(self):
         """
         Calculates the gradients of the dense layer's parameters
         """
-        dL_dout = torch.cat(self.dL_dout)
-        inputs = torch.cat(self.inputs)
+        if self.multi_stage:
+            dL_dout = torch.cat(self.dL_dout)
+            inputs = torch.cat(self.inputs)
+        else:
+            dL_dout = self.dL_dout.pop()
+            inputs = self.inputs.pop()
 
         if dL_dout.ndim == 2:
             self.weights_g[:] += torch.sum(
@@ -310,7 +329,9 @@ class Dense(Layer):
 
 class ReLU(Activation):
 
-    def init_params(self):
+    @expose_params(acts=["inputs"])
+    def __init__(self):
+        super().__init__()
         self.inputs = []
 
     @pipeline_fwd
@@ -340,11 +361,13 @@ class ReLU(Activation):
         Returns:
             torch.Tensor: Derivative of the loss with respect to the dense layers input
         """
-        dout_din = torch.where(self.inputs.pop(), 0, 1.0, 0.0)
+        dout_din = torch.where(self.inputs.pop()>0, 1.0, 0.0)
         return dL_dout*dout_din
 
 class GeLU(Activation):
-    def init_params(self):
+    @expose_params(acts=["inputs"])
+    def __init__(self):
+        super().__init__()
         self.inputs = []
     
     @pipeline_fwd
@@ -360,6 +383,7 @@ class GeLU(Activation):
         return dL_dout * (0.5 * (1 + torch.erf(input_at_ps/((2)**(0.5)))) + (input_at_ps)/torch.sqrt(torch.pi) * torch.exp(-torch.pow(input_at_ps, 2)))
 
 class Dropout(Layer):
+    @expose_params(acts=["p_mask"])
     def __init__(self, p: Optional[float]=0.1):
         """
         Initialize a dropout layer
@@ -422,7 +446,7 @@ class Embeddings(Layer):
         self.dim = dim
         self.device = device
     
-    @expose_params({"weights": "weights_g"})
+    @expose_params({"weights": "weights_g"}, ["inputs", "dL_dout"])
     def init_params(self):
         self.weights = torch.randn(self.num_embeddings, self.dim, device=self.device)
         self.weights_g = torch.zeros_like(self.weights, device=self.device)
@@ -431,7 +455,7 @@ class Embeddings(Layer):
     
     @pipeline_fwd
     def forward(self, x):
-        self.inputs(x)
+        self.inputs.append(x)
         return self.weights[x]
     
     @multi_stage_wrapper
@@ -443,13 +467,19 @@ class Embeddings(Layer):
     
     @cleanup_act("dL_dout", "inputs")
     def backward_p2(self):
-        dL_dout = torch.cat(self.dL_dout)
-        inputs = torch.cat(self.inputs)
+        if self.multi_stage:
+            dL_dout = torch.cat(self.dL_dout)
+            inputs = torch.cat(self.inputs)
+        else:
+            dL_dout = self.dL_dout.pop()
+            inputs = self.inputs.pop()
         self.weights_g[inputs] += dL_dout
 
 
 class Softmax(Activation):
-    def init_params(self):
+    @expose_params(acts=["out"])
+    def __init__(self):
+        super().__init__()
         self.out = []
     
     @pipeline_fwd
@@ -508,7 +538,8 @@ class MultiHeadAttention(Layer):
         self.softmax_func = Softmax()
         
         self.device = device
-    
+
+    @expose_params(acts=["lQ", "lK", "lV", "sQK_T"])
     def init_params(self):
         self.linears = {"Q": Dense(self.emb_dim, self.emb_dim, device=self.device),
                         "K": Dense(self.emb_dim, self.emb_dim, device=self.device),
@@ -642,7 +673,7 @@ class BatchNorm2D(Layer):
         self.device = device
         self.training = True
     
-    @expose_params({"gamma": "gamma_g", "beta": "beta_g"})
+    @expose_params({"gamma": "gamma_g", "beta": "beta_g"}, ["x_sub_mean", "var", "norm_x", "dL_dout"])
     def init_params(self):
         self.gamma = torch.ones(self.in_channels, device=self.device)
         self.beta = torch.zeros(self.in_channels, device=self.device)
@@ -717,8 +748,12 @@ class BatchNorm2D(Layer):
         """
         Calculates the gradients of the parameters in the BatchNorm2D
         """
-        dL_dout = torch.cat(self.dL_dout)
-        norm_x = torch.cat(norm_x)
+        if self.multi_stage:
+            dL_dout = torch.cat(self.dL_dout)
+            norm_x = torch.cat(self.norm_x)
+        else:
+            dL_dout = self.dL_dout.pop()
+            norm_x = self.norm_x.pop()
         self.gamma_g[:] += torch.sum(dL_dout*norm_x, dim=[0,2,3])
         self.beta_g[:] += torch.sum(dL_dout, dim=[0,2,3])
         
@@ -753,7 +788,7 @@ class NLPLayerNorm(Layer):
         self.eps = eps
         self.device = device
     
-    @expose_params({"gamma": "gamma_g", "beta": "beta_g"})
+    @expose_params({"gamma": "gamma_g", "beta": "beta_g"}, ["x_sub_mean", "var", "norm_x", "dL_dout"])
     def init_params(self):
         self.gamma = torch.ones(self.dim_size, device=self.device)
         self.bias = torch.zeros(self.dim_size, device=self.device)
@@ -815,8 +850,12 @@ class NLPLayerNorm(Layer):
         """
         Computes the gradients of the parameter in the NLP layer norm
         """
-        dL_dout = torch.cat(self.dL_dout)
-        norm_x = torch.cat(self.norm_x)
+        if self.multi_stage:
+            dL_dout = torch.cat(self.dL_dout)
+            norm_x = torch.cat(self.norm_x)
+        else:
+            dL_dout = self.dL_dout.pop()
+            norm_x = self.norm_x.pop()
         self.bias_g[:] += torch.sum(dL_dout, dim=tuple(range(dL_dout.ndim)[:-1]))
         self.gamma_g[:] += torch.sum(dL_dout*norm_x, dim=tuple(range(dL_dout.ndim)[:-1]))
       
@@ -850,7 +889,7 @@ class NLPRMSNorm(Layer):
         self.eps = eps
         self.device = device
     
-    @expose_params({"weights": "weights_g"})
+    @expose_params({"weights": "weights_g"}, ["IRMS",  "rms_norm_x", "dL_dout"])
     def init_params(self):
         self.weights = torch.ones(self.dim_size, device=self.device)
         self.weights_g = torch.zeros(self.dim_size, device=self.device)
@@ -900,8 +939,12 @@ class NLPRMSNorm(Layer):
         """
         Computes the gradients of the parameter in the NLP layer norm
         """
-        dL_dout = torch.cat(self.dL_dout)
-        rms_norm_x = torch.cat(self.rms_norm_x)
+        if self.multi_stage:
+            dL_dout = torch.cat(self.dL_dout)
+            rms_norm_x = torch.cat(self.rms_norm_x)
+        else:
+            dL_dout = self.dL_dout.pop()
+            rms_norm_x = self.rms_norm_x.pop()
         self.weights_g[:] += torch.sum(dL_dout*rms_norm_x, dim=tuple(range(dL_dout.ndim)[:-1]))
 
 
@@ -1023,7 +1066,6 @@ class BertBlock(Layer):
             torch.Tensor: The derivative of the loss with respect to the BERT block input
 
         """
-
         dL_dff2_d = self.norms["ff"].backward_p1(dL_dout)
         dL_dff2 = self.dropouts["ff"].backward_p1(dL_dff2_d)
         dL_da = self.linears[1].backward_p1(dL_dff2)
@@ -1098,7 +1140,7 @@ class Conv2D(Layer):
             raise NotImplementedError("Stride larger than 3 not implemented")
     
 
-    @expose_params({"kernel":"kernel_g", "bias":"bias_g"})
+    @expose_params({"kernel":"kernel_g", "bias":"bias_g"}, ["inputs", "dL_dout"])
     def init_params(self):
         self.kernel = torch.randn(self.out_channels, self.in_channels, *self.k_size, device=self.device)
         if self.bias_:
@@ -1147,9 +1189,12 @@ class Conv2D(Layer):
         """
         Computes the gradients of the parameter within the Conv2D layer
         """
-
-        dL_dout = torch.cat(self.dL_dout)
-        inputs = torch.cat(self.inputs)
+        if self.multi_stage:
+            dL_dout = torch.cat(self.dL_dout)
+            inputs = torch.cat(self.inputs)
+        else:
+            dL_dout = self.dL_dout.pop()
+            inputs = self.inputs.pop()
 
         if isinstance(self.bias, torch.Tensor):
             self.bias_g[:] += torch.sum(dL_dout, dim=(0, 2, 3))
@@ -1163,6 +1208,7 @@ class Conv2D(Layer):
 
 
 class MaxPool2D(Layer):
+    @expose_params(acts=["indices"])
     def __init__(self, k_size: Union[Sequence[int], int], padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1):
         """
         Initializes a MaxPool2D layer
@@ -1574,7 +1620,9 @@ class ResNet(Layer):
 
 
 class SiLU(Activation):
-    def init_params(self):
+    @expose_params(acts=["inputs"])
+    def __init__(self):
+        super().__init__()
         self.inputs = []
 
     @pipeline_fwd
@@ -1603,6 +1651,7 @@ class llamaFF(Layer):
 
         self.device = device
     
+    @expose_params(acts=["l2", "silu_out"])
     def init_params(self):
         self.linears = [
             Dense(self.dim, self.hidden_dim, bias=False, device=self.device),
@@ -1705,6 +1754,7 @@ class GroupedMultiQueryAttention(Layer):
 
         self.device = device
 
+    @expose_params(acts=["xq", "xk", "xv", "sQK_T"])
     def init_params(self):
         self.linears = {"Q": Dense(self.emb_dim, self.num_heads*self.head_dim, bias=False, device=self.device),
                         "K": Dense(self.emb_dim, self.num_kv_heads*self.head_dim, bias=False, device=self.device),
