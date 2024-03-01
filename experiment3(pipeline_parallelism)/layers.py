@@ -1,5 +1,6 @@
 from typing import Any, Dict, Optional, Union, Sequence, Tuple
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from functools import wraps
 import math
 
@@ -9,16 +10,22 @@ from torch import vmap as vmap
 import torch.distributed as dist
 
 
-from wrappers import cleanup_act, multi_stage_wrapper, expose_params, pipeline_fwd, pipeline_bwd
+from wrappers import cleanup_act, multi_stage_wrapper, expose_params
+
+@contextmanager
+def nvtx_profile(name):
+    torch.cuda.synchronize()
+    torch.cuda.nvtx.range_push(name)
+    yield
+    torch.cuda.synchronize()
+    torch.cuda.nvtx.range_pop()
 
 class Layer(ABC):
     def __init__(self):
         self.multi_stage = True
         self.training = True
-        self.mini_bs = 1
         self.params: Dict[str, torch.Tensor] = {}
         self.grads: Dict[str, torch.Tensor] = {}
-        self.pipe_step = 0
         self.acts = []
 
     def __call__(self, *args, **kwargs):
@@ -35,15 +42,12 @@ class Layer(ABC):
     def backward_p1(self):
         pass
     
-    def backward_p2(self):
+    def backward_p2(self, step=0):
         #p2 is for calculating param grads if theres no params can just pass
         pass
 
     def update(self):
         pass
-
-    def get_pipe_slice(self):
-        return slice(self.pipe_step*self.mini_bs, self.pipe_step*self.mini_bs+self.mini_bs)
     
     def clear_acts(self):
         if self.acts:
@@ -94,21 +98,6 @@ class Layer(ABC):
                 for sub_layer in getattr(self, item).values():
                     if isinstance(sub_layer, Layer):
                         sub_layer.multi_stage_set(_bool)
-    
-    def batch_size_set(self, bs):
-        self.mini_bs = bs // dist.get_world_size()
-
-        for item in dir(self):
-            if isinstance(getattr(self, item), Layer):
-                getattr(self, item).batch_size_set(bs)
-            elif isinstance(getattr(self, item), list):
-                for sub_layer in getattr(self, item):
-                    if isinstance(sub_layer, Layer):
-                        sub_layer.batch_size_set(bs)
-            elif isinstance(getattr(self, item), dict) and item != "__dict__":
-                for sub_layer in getattr(self, item).values():
-                    if isinstance(sub_layer, Layer):
-                        sub_layer.batch_size_set(bs)
     
     def zero_grad(self):
         if self.grads:
@@ -196,9 +185,9 @@ class Sequential:
             x = layer.forward(x)
         return x
     
-    def backward_p1(self, dL_dout: torch.Tensor):
+    def backward_p1(self, dL_dout: torch.Tensor, step=0):
         for layer in self.layers[::-1]:
-            dL_dout = layer.backward_p1(dL_dout)
+            dL_dout = layer.backward_p1(dL_dout, step)
         return dL_dout
     
     def backward_p2(self):
@@ -258,7 +247,6 @@ class Dense(Layer):
         self.inputs = []
         self.dL_dout = []
     
-    @pipeline_fwd
     def forward(self, x: torch.Tensor):
         """
         Performs a forward pass through the dense layer
@@ -278,8 +266,7 @@ class Dense(Layer):
         return out
     
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout: torch.Tensor):
+    def backward_p1(self, dL_dout: torch.Tensor, step=0):
         """
         Takes the derivative of the loss with respect to the dense layers output and returns the derivative of the loss with respect to the dense layers input
 
@@ -293,7 +280,7 @@ class Dense(Layer):
         return vmap(lambda dl_dout: torch.matmul(dl_dout, self.weights.T))(dL_dout)
     
     @cleanup_act("dL_dout", "inputs")
-    def backward_p2(self):
+    def backward_p2(self, step=0):
         """
         Calculates the gradients of the dense layer's parameters
         """
@@ -301,8 +288,8 @@ class Dense(Layer):
             dL_dout = torch.cat(self.dL_dout)
             inputs = torch.cat(self.inputs)
         else:
-            dL_dout = self.dL_dout.pop()
-            inputs = self.inputs.pop()
+            dL_dout = self.dL_dout.pop(0)
+            inputs = self.inputs.pop(step)
 
         if dL_dout.ndim == 2:
             self.weights_g[:] += torch.sum(
@@ -334,7 +321,6 @@ class ReLU(Activation):
         super().__init__()
         self.inputs = []
 
-    @pipeline_fwd
     def forward(self, x: torch.Tensor):
         """
         Performs a forward pass through the relu
@@ -350,8 +336,7 @@ class ReLU(Activation):
         return out
     
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout: torch.Tensor):
+    def backward_p1(self, dL_dout: torch.Tensor, step=0):
         """
         Takes the derivative of the loss with respect to the relus output and returns the derivative of the loss with respect to the relus input
 
@@ -361,7 +346,7 @@ class ReLU(Activation):
         Returns:
             torch.Tensor: Derivative of the loss with respect to the dense layers input
         """
-        dout_din = torch.where(self.inputs.pop()>0, 1.0, 0.0)
+        dout_din = torch.where(self.inputs.pop(step)>0, 1.0, 0.0)
         return dL_dout*dout_din
 
 class GeLU(Activation):
@@ -370,16 +355,14 @@ class GeLU(Activation):
         super().__init__()
         self.inputs = []
     
-    @pipeline_fwd
     def forward(self, x):
         self.inputs.append(x)
         return x * 0.5 * (1 + torch.erf(x/((2)**(0.5))))
 
-    @pipeline_bwd
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout):
+    def backward_p1(self, dL_dout, step=0):
         #TODO clean this up 
-        input_at_ps = self.inputs.pop()
+        input_at_ps = self.inputs.pop(step)
         return dL_dout * (0.5 * (1 + torch.erf(input_at_ps/((2)**(0.5)))) + (input_at_ps)/torch.sqrt(torch.pi) * torch.exp(-torch.pow(input_at_ps, 2)))
 
 class Dropout(Layer):
@@ -401,7 +384,6 @@ class Dropout(Layer):
         self.training = True
         self.p_masks = []
     
-    @pipeline_fwd
     def forward(self, x: torch.Tensor):
         """
         Performs a forward pass through the dropout layer. 
@@ -411,18 +393,19 @@ class Dropout(Layer):
         Returns:
             torch.Tensor: Output tensor after applying the dropout
         """
-        torch.manual_seed(0)
+        #torch.manual_seed(0)
         if not self.training or self.p==0:
+            self.p_masks.append(torch.ones_like(x, device=x.device))
             return x
         if self.p==1:
+            self.p_masks.append(torch.ones_like(x, device=x.device))
             return torch.zeros_like(x)
         p_mask = torch.bernoulli(torch.ones_like(x, device=x.device) -self.p)
         self.p_masks.append(p_mask)
         return x*p_mask
     
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout: torch.Tensor):
+    def backward_p1(self, dL_dout: torch.Tensor, step=0):
         """
         Takes the derivative of the loss with respect to the dropouts output and returns the derivative of the loss with respect to the dropouts input
 
@@ -436,7 +419,7 @@ class Dropout(Layer):
             return dL_dout
         if self.p==1:
             return torch.zeros_like(dL_dout)
-        return dL_dout*self.p_masks.pop()
+        return dL_dout*self.p_masks.pop(step)
 
 
 class Embeddings(Layer):
@@ -453,26 +436,24 @@ class Embeddings(Layer):
         self.inputs = []
         self.dL_dout = []
     
-    @pipeline_fwd
     def forward(self, x):
         self.inputs.append(x)
         return self.weights[x]
     
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout):
+    def backward_p1(self, dL_dout, step=0):
         # Embedding is the first operation so doesnt need a backward pass
         self.dL_dout.append(dL_dout)
         pass
     
     @cleanup_act("dL_dout", "inputs")
-    def backward_p2(self):
+    def backward_p2(self, step=0):
         if self.multi_stage:
             dL_dout = torch.cat(self.dL_dout)
             inputs = torch.cat(self.inputs)
         else:
-            dL_dout = self.dL_dout.pop()
-            inputs = self.inputs.pop()
+            dL_dout = self.dL_dout.pop(0)
+            inputs = self.inputs.pop(step)
         self.weights_g[inputs] += dL_dout
 
 
@@ -481,21 +462,20 @@ class Softmax(Activation):
     def __init__(self):
         super().__init__()
         self.out = []
-    
-    @pipeline_fwd
+
     def forward(self, x):
         out = torch.softmax(x, dim=-1)
         self.out.append(out)
         return out
     
-    @pipeline_bwd
-    def backward_p1(self, dL_dout:torch.Tensor):
+    def backward_p1(self, dL_dout:torch.Tensor, step=0):
+        @torch.jit.script
         def _per_input_backpass(dldout, s):
             return s * (dldout - torch.sum(s*dldout, dim=-1, keepdim=True))
         func = _per_input_backpass
         for _ in range(len(dL_dout.shape)-1):
             func = vmap(func)
-        return func(dL_dout, self.out.pop())
+        return func(dL_dout, self.out.pop(step))
     
 
 
@@ -558,7 +538,6 @@ class MultiHeadAttention(Layer):
         self.lV = []
         self.sQK_T = []
     
-    @pipeline_fwd
     def forward(self, Q, K, V, mask = None):
         """
         Performs a forward pass through the multihead attention
@@ -602,8 +581,7 @@ class MultiHeadAttention(Layer):
 
     
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout: torch.Tensor):
+    def backward_p1(self, dL_dout: torch.Tensor, step=0):
         """
         Takes the derivative of the loss with respect to the multihead attention output and returns the derivative of the loss with respect to the multihead attention input
 
@@ -613,27 +591,27 @@ class MultiHeadAttention(Layer):
         Returns:
             torch.Tensor: The derivatives of the loss with respect to the multihead attention inputs
         """
-        dL_dAtt = self.linears["O"].backward_p1(dL_dout)
+        dL_dAtt = self.linears["O"].backward_p1(dL_dout, step)
         
         dL_dAtt = torch.cat(dL_dAtt.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         
-        dL_dsQKT = vmap(lambda dl_dout, v: torch.bmm(dl_dout, torch.transpose(v, -1,-2)), in_dims=-2, out_dims=-2)(dL_dAtt, self.lV.pop())
+        dL_dsQKT = vmap(lambda dl_dout, v: torch.bmm(dl_dout, torch.transpose(v, -1,-2)), in_dims=-2, out_dims=-2)(dL_dAtt, self.lV.pop(step))
         #self.lV = None
         
         # vmap across 3 dims BxCxH 
-        dL_dQKT = self.softmax_func.backward_p1(dL_dsQKT)* self.inv_sqrt_d
+        dL_dQKT = self.softmax_func.backward_p1(dL_dsQKT, step)* self.inv_sqrt_d
         
         # TODO verifiy this section
-        dL_dlQ = vmap(lambda dl_dqkt, k: torch.bmm(dl_dqkt, k), in_dims=-2, out_dims=-2)(dL_dQKT, self.lK.pop())  # k.T not necessary as its k.T.T
+        dL_dlQ = vmap(lambda dl_dqkt, k: torch.bmm(dl_dqkt, k), in_dims=-2, out_dims=-2)(dL_dQKT, self.lK.pop(step))  # k.T not necessary as its k.T.T
         #self.lK = None
-        dL_dlKT = vmap(lambda dl_dqkt, q: torch.bmm(torch.transpose(q, -1,-2), dl_dqkt), in_dims=-2, out_dims=-2)(dL_dQKT, self.lQ.pop())  
+        dL_dlKT = vmap(lambda dl_dqkt, q: torch.bmm(torch.transpose(q, -1,-2), dl_dqkt), in_dims=-2, out_dims=-2)(dL_dQKT, self.lQ.pop(step))  
         #self.lQ = None
-        dL_dlV = vmap(lambda dl_datt, sqkt: torch.bmm(torch.transpose(sqkt, -2, -1), dl_datt), in_dims=-2, out_dims=-2)(dL_dAtt, self.sQK_T.pop()) 
+        dL_dlV = vmap(lambda dl_datt, sqkt: torch.bmm(torch.transpose(sqkt, -2, -1), dl_datt), in_dims=-2, out_dims=-2)(dL_dAtt, self.sQK_T.pop(step)) 
         #self.sQK_T = None
         
-        dL_dQ = self.linears["Q"].backward_p1(self.dropouts["Q"].backward_p1(torch.flatten(dL_dlQ, -2, -1)))
-        dL_dK = self.linears["K"].backward_p1(self.dropouts["K"].backward_p1(torch.flatten(torch.vmap(lambda dl_dlkt: torch.transpose(dl_dlkt, -1, -2), in_dims=-2, out_dims=-2)(dL_dlKT), -2, -1)))
-        dL_dV = self.linears["V"].backward_p1(self.dropouts["V"].backward_p1(torch.flatten(dL_dlV, -2, -1)))
+        dL_dQ = self.linears["Q"].backward_p1(self.dropouts["Q"].backward_p1(torch.flatten(dL_dlQ, -2, -1), step), step)
+        dL_dK = self.linears["K"].backward_p1(self.dropouts["K"].backward_p1(torch.flatten(torch.vmap(lambda dl_dlkt: torch.transpose(dl_dlkt, -1, -2), in_dims=-2, out_dims=-2)(dL_dlKT), -2, -1), step), step)
+        dL_dV = self.linears["V"].backward_p1(self.dropouts["V"].backward_p1(torch.flatten(dL_dlV, -2, -1), step), step)
         
         return dL_dQ, dL_dK, dL_dV
              
@@ -689,7 +667,6 @@ class BatchNorm2D(Layer):
         self.norm_x = []
         self.dL_dout = []
         
-    @pipeline_fwd
     def forward(self, x: torch.Tensor):
         """
         Performs a forward pass through the batchNorm2D
@@ -718,8 +695,7 @@ class BatchNorm2D(Layer):
         return out
     
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout: torch.Tensor):
+    def backward_p1(self, dL_dout: torch.Tensor, step=0):
         """
         Takes the derivative of the loss with respect to the BatchNorm2D output and returns the derivative of the loss with respect to the BatchNorm2D input
 
@@ -736,15 +712,15 @@ class BatchNorm2D(Layer):
         B = in_shape[0]*in_shape[2]*in_shape[3]
         
         dL_dxnorm = dL_dout * self.gamma.view(1, -1, 1, 1)
-        x_s_m = self.x_sub_mean.pop()
-        v = self.var.pop()
+        x_s_m = self.x_sub_mean.pop(step)
+        v = self.var.pop(step)
         dL_dvar = (-0.5 * dL_dxnorm * (x_s_m)).sum((0, 2, 3), keepdim=True)  * ((v) ** -1.5)
         dL_dmean = (-1.0 / torch.sqrt(v) * dL_dxnorm).sum((0, 2, 3), keepdim=True) + (dL_dvar * (-2.0 * (x_s_m)).sum((0, 2, 3), keepdim=True) / B)
-        return (dL_dxnorm / torch.sqrt(v)) + (2.0 * dL_dvar * (x_s_m) / B) + (dL_dmean / B) 
+        return (dL_dxnorm / torch.sqrt(v)) + (2.0 * dL_dvar * (x_s_m) / B) + (dL_dmean / B)
     
         
     @cleanup_act("dL_dout", "norm_x")
-    def backward_p2(self):
+    def backward_p2(self, step=0):
         """
         Calculates the gradients of the parameters in the BatchNorm2D
         """
@@ -752,8 +728,8 @@ class BatchNorm2D(Layer):
             dL_dout = torch.cat(self.dL_dout)
             norm_x = torch.cat(self.norm_x)
         else:
-            dL_dout = self.dL_dout.pop()
-            norm_x = self.norm_x.pop()
+            dL_dout = self.dL_dout.pop(0)
+            norm_x = self.norm_x.pop(step)
         self.gamma_g[:] += torch.sum(dL_dout*norm_x, dim=[0,2,3])
         self.beta_g[:] += torch.sum(dL_dout, dim=[0,2,3])
         
@@ -801,7 +777,6 @@ class NLPLayerNorm(Layer):
         self.norm_x = []
         self.dL_dout = []
     
-    @pipeline_fwd
     def forward(self, x: torch.Tensor):
         """
         Performs a forward pass through the NLP Layer Norm
@@ -824,8 +799,7 @@ class NLPLayerNorm(Layer):
     
 
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout: torch.Tensor):
+    def backward_p1(self, dL_dout: torch.Tensor, step=0):
         """
         Takes the derivative of the loss with respect to the NLP layer norm output and returns the derivative of the loss with respect to the NLP layer norm input
 
@@ -836,8 +810,8 @@ class NLPLayerNorm(Layer):
             torch.Tensor: The derivatives of the loss with respect to the NLP layer norm inputs
         """
         self.dL_dout.append(dL_dout)
-        x_s_m = self.x_sub_mean.pop()
-        v = self.var.pop()
+        x_s_m = self.x_sub_mean.pop(step)
+        v = self.var.pop(step)
         
         dx_hat = dL_dout * self.gamma.view(1,1,-1)  
         dL_dvar = torch.sum(dx_hat * x_s_m, dim=-1, keepdim=True) * -.5 * v**(-1.5)
@@ -846,7 +820,7 @@ class NLPLayerNorm(Layer):
         
 
     @cleanup_act("dL_dout", "norm_x")
-    def backward_p2(self):
+    def backward_p2(self, step=0):
         """
         Computes the gradients of the parameter in the NLP layer norm
         """
@@ -854,8 +828,8 @@ class NLPLayerNorm(Layer):
             dL_dout = torch.cat(self.dL_dout)
             norm_x = torch.cat(self.norm_x)
         else:
-            dL_dout = self.dL_dout.pop()
-            norm_x = self.norm_x.pop()
+            dL_dout = self.dL_dout.pop(0)
+            norm_x = self.norm_x.pop(step)
         self.bias_g[:] += torch.sum(dL_dout, dim=tuple(range(dL_dout.ndim)[:-1]))
         self.gamma_g[:] += torch.sum(dL_dout*norm_x, dim=tuple(range(dL_dout.ndim)[:-1]))
       
@@ -889,16 +863,16 @@ class NLPRMSNorm(Layer):
         self.eps = eps
         self.device = device
     
-    @expose_params({"weights": "weights_g"}, ["IRMS",  "rms_norm_x", "dL_dout"])
+    @expose_params({"weights": "weights_g"}, ["IRMS",  "rms_norm_x", "rms_norm_x_p2", "dL_dout"])
     def init_params(self):
         self.weights = torch.ones(self.dim_size, device=self.device)
         self.weights_g = torch.zeros(self.dim_size, device=self.device)
 
         self.IRMS = []
         self.rms_norm_x = []
+        self.rms_norm_x_p2 = []
         self.dL_dout = []
 
-    @pipeline_fwd
     def forward(self, x: torch.Tensor):
         """
         Performs a forward pass through the NLP RMS norm
@@ -917,8 +891,7 @@ class NLPRMSNorm(Layer):
         return rms_norm_x*self.weights
 
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout: torch.Tensor):
+    def backward_p1(self, dL_dout: torch.Tensor, step=0):
         """
         Takes the derivative of the loss with respect to the NLP RMS norm output and returns the derivative of the loss with respect to the NLP RMS norm input
 
@@ -928,23 +901,26 @@ class NLPRMSNorm(Layer):
         Returns:
             torch.Tensor: The derivatives of the loss with respect to the NLP RMS norm inputs
         """
+        @torch.jit.script
         def _per_input_backpass(dldout, irms, z, n):
             return irms*((-z/n) * sum(dldout*z) + dldout)
 
         self.dL_dout.append(dL_dout)
-        return vmap(vmap(_per_input_backpass))(dL_dout, self.IRMS.pop(), self.rms_norm_x[self.pipe_step], n=self.rms_norm_x[self.pipe_step].size(-1))
+        rms_norm_x = self.rms_norm_x.pop(step)
+        self.rms_norm_x_p2.append(rms_norm_x)
+        return vmap(vmap(_per_input_backpass))(dL_dout, self.IRMS.pop(0), rms_norm_x, n=torch.tensor(rms_norm_x.size(-1)))
     
-    @cleanup_act("dL_dout", "rms_norm_x")
-    def backward_p2(self):
+    @cleanup_act("dL_dout", "rms_norm_x_p2")
+    def backward_p2(self, step=0):
         """
         Computes the gradients of the parameter in the NLP layer norm
         """
         if self.multi_stage:
             dL_dout = torch.cat(self.dL_dout)
-            rms_norm_x = torch.cat(self.rms_norm_x)
+            rms_norm_x = torch.cat(self.rms_norm_x_p2)
         else:
-            dL_dout = self.dL_dout.pop()
-            rms_norm_x = self.rms_norm_x.pop()
+            dL_dout = self.dL_dout.pop(0)
+            rms_norm_x = self.rms_norm_x_p2.pop(0)
         self.weights_g[:] += torch.sum(dL_dout*rms_norm_x, dim=tuple(range(dL_dout.ndim)[:-1]))
 
 
@@ -970,16 +946,14 @@ class BertEmbeddings(Layer):
         
         self.norm = NLPRMSNorm(-1, 768, device=self.device)
     
-    @pipeline_fwd
     def forward(self, x, seg_mask):
         x = self.token_emb(x) + self.segmnet_emb(seg_mask) + self.pos_emb[:,:x.size(-1)]
         return self.norm(x)
 
-    @pipeline_bwd
-    def backward_p1(self, dL_dout):
-        dL_dout = self.norm.backward_p1(dL_dout)
-        self.token_emb.backward_p1(dL_dout)
-        self.segmnet_emb.backward_p1(dL_dout)
+    def backward_p1(self, dL_dout, step=0):
+        dL_dout = self.norm.backward_p1(dL_dout, step)
+        self.token_emb.backward_p1(dL_dout, step)
+        self.segmnet_emb.backward_p1(dL_dout, step)
         return dL_dout
         
         
@@ -1030,8 +1004,7 @@ class BertBlock(Layer):
             n.init_params()
         self.dropouts = {"multi_head": Dropout(p=self.p),
                          "ff": Dropout(p=self.p)}
-    
-    @pipeline_fwd
+
     def forward(self, x:torch.Tensor):
         """
         Performs a forward pass through the BERT block. 
@@ -1054,8 +1027,7 @@ class BertBlock(Layer):
     
 
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout:torch.Tensor):
+    def backward_p1(self, dL_dout:torch.Tensor, step=0):
         """
         Takes the derivative of the loss with respect to the BERT block output and returns the derivative of the loss with respect to the BERT block input
 
@@ -1066,25 +1038,23 @@ class BertBlock(Layer):
             torch.Tensor: The derivative of the loss with respect to the BERT block input
 
         """
-        dL_dff2_d = self.norms["ff"].backward_p1(dL_dout)
-        dL_dff2 = self.dropouts["ff"].backward_p1(dL_dff2_d)
-        dL_da = self.linears[1].backward_p1(dL_dff2)
-        dL_dff1 = self.ff_act.backward_p1(dL_da)
-        dL_dnormmhout = self.linears[0].backward_p1(dL_dff1) + dL_dff2_d
+        dL_dff2_d = self.norms["ff"].backward_p1(dL_dout, step)
+        dL_dff2 = self.dropouts["ff"].backward_p1(dL_dff2_d, step)
+        dL_da = self.linears[1].backward_p1(dL_dff2, step)
+        dL_dff1 = self.ff_act.backward_p1(dL_da, step)
+        dL_dnormmhout = self.linears[0].backward_p1(dL_dff1, step) + dL_dff2_d
 
-        dL_dmhout_d = self.norms["multi_head"].backward_p1(dL_dnormmhout)
-        dL_dmhout = self.dropouts["multi_head"].backward_p1(dL_dmhout_d)
-        dL_din = torch.sum(torch.stack(self.multihead.backward_p1(dL_dmhout)),dim=0)
+        dL_dmhout_d = self.norms["multi_head"].backward_p1(dL_dnormmhout, step)
+        dL_dmhout = self.dropouts["multi_head"].backward_p1(dL_dmhout_d, step)
+        dL_din = torch.sum(torch.stack(self.multihead.backward_p1(dL_dmhout, step)),dim=0)
         return dL_din + dL_dmhout_d
 
 
 class Flatten(Activation):
-    @pipeline_fwd
     def forward(self, x: torch.Tensor):
         self.shape = x.shape
         return x.view(x.size(0), -1)
 
-    @pipeline_bwd
     def backward_p1(self, dL_dout):
         return dL_dout.view(*self.shape)
 
@@ -1154,7 +1124,6 @@ class Conv2D(Layer):
         self.inputs = []
         self.dL_dout = []
 
-    @pipeline_fwd
     def forward(self, x:torch.Tensor):
         """
         Preforms a forward pass through the Conv2D layer
@@ -1169,8 +1138,7 @@ class Conv2D(Layer):
         return F.conv2d(x, self.kernel, self.bias, stride=self.stride, padding=self.padding)
     
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout: torch.Tensor):
+    def backward_p1(self, dL_dout: torch.Tensor, step=0):
         """
         Takes the derivative of the loss with respect to the Conv2D Layer's output and returns the derivative of the loss with respect to the Conv2D Layer's input
 
@@ -1185,7 +1153,7 @@ class Conv2D(Layer):
         return dL_din
     
     @cleanup_act("dL_dout", "inputs")
-    def backward_p2(self):
+    def backward_p2(self, step=0):
         """
         Computes the gradients of the parameter within the Conv2D layer
         """
@@ -1193,8 +1161,8 @@ class Conv2D(Layer):
             dL_dout = torch.cat(self.dL_dout)
             inputs = torch.cat(self.inputs)
         else:
-            dL_dout = self.dL_dout.pop()
-            inputs = self.inputs.pop()
+            dL_dout = self.dL_dout.pop(0)
+            inputs = self.inputs.pop(step)
 
         if isinstance(self.bias, torch.Tensor):
             self.bias_g[:] += torch.sum(dL_dout, dim=(0, 2, 3))
@@ -1239,7 +1207,6 @@ class MaxPool2D(Layer):
             self.stride = stride
         self.indices = []
     
-    @pipeline_fwd
     def forward(self, x: torch.Tensor):
         """
         Preforms a forward pass through the MaxPool2D layer
@@ -1254,8 +1221,7 @@ class MaxPool2D(Layer):
         self.indices.append(indices)
         return out
     
-    @pipeline_bwd
-    def backward_p1(self, dL_dout: torch.Tensor):
+    def backward_p1(self, dL_dout: torch.Tensor, step=0):
         """
         Takes the derivative of the loss with respect to the MaxPool2D Layer's output and returns the derivative of the loss with respect to the MaxPool2D Layer's input
 
@@ -1265,11 +1231,9 @@ class MaxPool2D(Layer):
         Returns:
             torch.Tensor: derivative of the loss with respect to the MaxPool2D Layer's input
         """
-        out = F.max_unpool2d(dL_dout, self.indices.pop(), kernel_size=self.k_size, stride=self.stride, padding=self.padding)
+        out = F.max_unpool2d(dL_dout, self.indices.pop(step), kernel_size=self.k_size, stride=self.stride, padding=self.padding)
         return out
 
-    def backward_p2(self):
-        pass
 
 
 class AvgPool2D(Layer):
@@ -1307,7 +1271,6 @@ class AvgPool2D(Layer):
         if self.stride[0] != self.k_size[0]:
             raise NotImplementedError("A stride size not equal to the kernel size has not been implmented due to the interpolation used in the backward pass")
     
-    @pipeline_fwd
     def forward(self, x: torch.Tensor):
         """
         Preforms a forward pass through the AvgPool2D layer
@@ -1320,7 +1283,6 @@ class AvgPool2D(Layer):
         """
         return F.avg_pool2d(x, kernel_size=self.k_size, stride=self.stride, padding=self.padding)
     
-    @pipeline_bwd
     def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the AvgPool2D Layer's output and returns the derivative of the loss with respect to the AvgPool2D Layer's input
@@ -1387,7 +1349,6 @@ class BasicResNetBlock(Layer):
         else:
             self.shortcut = []
         
-    @pipeline_fwd
     def forward(self, x: torch.Tensor):
         """
         Preforms a forward pass through the BasicResNetBlock
@@ -1410,8 +1371,7 @@ class BasicResNetBlock(Layer):
     
 
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout: torch.Tensor):
+    def backward_p1(self, dL_dout: torch.Tensor, step=0):
         """
         Takes the derivative of the loss with respect to the BasicResNetBlock's output and returns the derivative of the loss with respect to the BasicResNetBlock's input
 
@@ -1421,16 +1381,16 @@ class BasicResNetBlock(Layer):
         Returns:
             torch.Tensor: derivative of the loss with respect to the BasicResNetBlock's input
         """
-        dL_dshortcut = self.relus[1].backward_p1(dL_dout)
-        dL_dconv1 = self.batchnorms[1].backward_p1(dL_dshortcut)
-        dL_drelu0 = self.convs[1].backward_p1(dL_dconv1)
-        dL_dbn0 = self.relus[0].backward_p1(dL_drelu0)
-        dL_dconv0 = self.batchnorms[0].backward_p1(dL_dbn0)
-        dL_din1 = self.convs[0].backward_p1(dL_dconv0)
+        dL_dshortcut = self.relus[1].backward_p1(dL_dout, step)
+        dL_dconv1 = self.batchnorms[1].backward_p1(dL_dshortcut, step)
+        dL_drelu0 = self.convs[1].backward_p1(dL_dconv1, step)
+        dL_dbn0 = self.relus[0].backward_p1(dL_drelu0, step)
+        dL_dconv0 = self.batchnorms[0].backward_p1(dL_dbn0, step)
+        dL_din1 = self.convs[0].backward_p1(dL_dconv0, step)
         
         dL_din2 = dL_dshortcut
         for layer in self.shortcut[::-1]:
-            dL_din2 = layer.backward_p1(dL_din2)
+            dL_din2 = layer.backward_p1(dL_din2, step)
         
         return dL_din1 + dL_din2
         
@@ -1486,7 +1446,6 @@ class ResNetBottleneck(Layer):
         else:
             self.shortcut = []
     
-    @pipeline_fwd
     def forward(self, x: torch.Tensor):
         """
         Preforms a forward pass through the ResNetBottleneck
@@ -1513,8 +1472,7 @@ class ResNetBottleneck(Layer):
         return self.relus[2](out + x)
     
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout):
+    def backward_p1(self, dL_dout, step=0):
         """
         Takes the derivative of the loss with respect to the ResNetBottleneck's output and returns the derivative of the loss with respect to the ResNetBottleneck's input
 
@@ -1524,19 +1482,19 @@ class ResNetBottleneck(Layer):
         Returns:
             torch.Tensor: derivative of the loss with respect to the ResNetBottleneck's input
         """
-        dL_dshortcut = self.relus[2].backward_p1(dL_dout)
-        dL_dconv2 = self.batchnorms[2].backward_p1(dL_dshortcut)
-        dL_drelu1 = self.convs[2].backward_p1(dL_dconv2)
-        dL_dbn1 = self.relus[1].backward_p1(dL_drelu1)
-        dL_dconv1 = self.batchnorms[1].backward_p1(dL_dbn1)
-        dL_drelu0 = self.convs[1].backward_p1(dL_dconv1)
-        dL_dbn0 = self.relus[0].backward_p1(dL_drelu0)
-        dL_dconv0 = self.batchnorms[0].backward_p1(dL_dbn0)
-        dL_din1 = self.convs[0].backward_p1(dL_dconv0)
+        dL_dshortcut = self.relus[2].backward_p1(dL_dout, step)
+        dL_dconv2 = self.batchnorms[2].backward_p1(dL_dshortcut, step)
+        dL_drelu1 = self.convs[2].backward_p1(dL_dconv2, step)
+        dL_dbn1 = self.relus[1].backward_p1(dL_drelu1, step)
+        dL_dconv1 = self.batchnorms[1].backward_p1(dL_dbn1, step)
+        dL_drelu0 = self.convs[1].backward_p1(dL_dconv1, step)
+        dL_dbn0 = self.relus[0].backward_p1(dL_drelu0, step)
+        dL_dconv0 = self.batchnorms[0].backward_p1(dL_dbn0, step)
+        dL_din1 = self.convs[0].backward_p1(dL_dconv0, step)
         
         dL_din2 = dL_dshortcut
         for layer in self.shortcut[::-1]:
-            dL_din2 = layer.backward_p1(dL_din2)
+            dL_din2 = layer.backward_p1(dL_din2, step)
         
         return dL_din1 + dL_din2
 
@@ -1590,7 +1548,6 @@ class ResNet(Layer):
             self.in_planes = planes * block.expansion
         return Sequential(layers, device=self.device)
     
-    @pipeline_fwd
     def forward(self, x: torch.Tensor):
         out = self.conv1(x)
         out = self.bn1(out)
@@ -1605,18 +1562,17 @@ class ResNet(Layer):
         return out
     
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout):
-        dL_davgpool = self.linear.backward_p1(dL_dout)
-        dL_davgpool = self.flatten.backward_p1(dL_davgpool)
-        dL_dl4 = self.avgpool.backward_p1(dL_davgpool)
-        dL_dl3 = self.layers4.backward_p1(dL_dl4)
-        dL_dl2 = self.layers3.backward_p1(dL_dl3)
-        dL_dl1 = self.layers2.backward_p1(dL_dl2)
-        dL_drelu = self.layers1.backward_p1(dL_dl1)
-        dL_dbn = self.relu.backward_p1(dL_drelu)
-        dL_dconv = self.bn1.backward_p1(dL_dbn)
-        return self.conv1.backward_p1(dL_dconv)
+    def backward_p1(self, dL_dout, step=0):
+        dL_davgpool = self.linear.backward_p1(dL_dout, step)
+        dL_davgpool = self.flatten.backward_p1(dL_davgpool, step)
+        dL_dl4 = self.avgpool.backward_p1(dL_davgpool, step)
+        dL_dl3 = self.layers4.backward_p1(dL_dl4, step)
+        dL_dl2 = self.layers3.backward_p1(dL_dl3, step)
+        dL_dl1 = self.layers2.backward_p1(dL_dl2, step)
+        dL_drelu = self.layers1.backward_p1(dL_dl1, step)
+        dL_dbn = self.relu.backward_p1(dL_drelu, step)
+        dL_dconv = self.bn1.backward_p1(dL_dbn, step)
+        return self.conv1.backward_p1(dL_dconv, step)
 
 
 class SiLU(Activation):
@@ -1625,14 +1581,12 @@ class SiLU(Activation):
         super().__init__()
         self.inputs = []
 
-    @pipeline_fwd
     def forward(self, x: torch.Tensor):
         self.inputs.append(x)
         return x * torch.sigmoid(x)
 
-    @pipeline_bwd
-    def backward_p1(self, dL_dout: torch.Tensor):
-        inputs = self.inputs.pop()
+    def backward_p1(self, dL_dout: torch.Tensor, step=0):
+        inputs = self.inputs.pop(step)
         e_x = torch.exp(-inputs)
         return dL_dout * ((1+e_x) + inputs*e_x)/((1+e_x)**2)
 
@@ -1666,7 +1620,6 @@ class llamaFF(Layer):
         self.l2 = []
         self.silu_out = []
 
-    @pipeline_fwd
     def forward(self, x: torch.Tensor):
         l0 = self.linears[0](x)
         l2 = self.linears[2](x)
@@ -1676,12 +1629,11 @@ class llamaFF(Layer):
         return self.linears[1](silu_out*l2)
     
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout:torch.Tensor):
+    def backward_p1(self, dL_dout:torch.Tensor, step):
         dL_dl2in = self.linears[1].backward_p1(dL_dout)
-        dL_dl0 = self.silu.backward_p1(dL_dl2in * self.l2.pop())
+        dL_dl0 = self.silu.backward_p1(dL_dl2in * self.l2.pop(step))
         dL_dx1 = self.linears[0].backward_p1(dL_dl0) 
-        dL_dx2 = self.linears[2].backward_p1(dL_dl2in * self.silu_out.pop()) 
+        dL_dx2 = self.linears[2].backward_p1(dL_dl2in * self.silu_out.pop(step)) 
         return dL_dx1 + dL_dx2
 
 
@@ -1699,7 +1651,6 @@ class RotaryEmbeddings(Layer):
     def init_params(self):
         self.freqs_cis = self.freqs_cis.to(self.device)
     
-    @pipeline_fwd
     def forward(self, xq: torch.Tensor, xk: torch.Tensor):
         xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
         xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
@@ -1726,17 +1677,13 @@ class RotaryEmbeddings(Layer):
         dL_db = freq_cis[:,:,:,:,0]*dL_dout[:,:,:,:,1] - freq_cis[:,:,:,:,1]*dL_dout[:,:,:,:,0]
         return torch.stack([dL_da, dL_db], dim=-1)
 
-    @pipeline_bwd
-    def backward_p1(self, dL_dxqout, dL_dxkout):
+    def backward_p1(self, dL_dxqout, dL_dxkout, step=0):
         #return self.forward(dL_dxqout, dL_dxkout)
         dL_dxqout_ = dL_dxqout.reshape(*dL_dxqout.shape[:-1], -1, 2)
         dL_dxkout_ = dL_dxkout.reshape(*dL_dxkout.shape[:-1], -1, 2)
         dL_dxq = self._per_grad_backpass(dL_dxqout_).flatten(3)
         dL_dxk = self._per_grad_backpass(dL_dxkout_).flatten(3)
         return dL_dxq, dL_dxk
-    
-    def backward_p2(self):
-        pass
 
         
 class GroupedMultiQueryAttention(Layer):
@@ -1779,7 +1726,6 @@ class GroupedMultiQueryAttention(Layer):
         self.xv = []
         self.sQK_T = []
     
-    @pipeline_fwd
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None):
         batch_size, seqlen, _ = x.shape
 
@@ -1800,7 +1746,6 @@ class GroupedMultiQueryAttention(Layer):
         self.xk.append(xk)
         #self.xq = xq #torch.chunk(xq, self.n_rep, dim=-2)
 
-
         QK_T = vmap(lambda q, k: vmap(lambda _q: torch.bmm(_q, k.transpose(-1,-2)), in_dims=-2, out_dims=-2)(q), in_dims=-2, out_dims=-2)(xq, xk) * self.inv_square_d
         QK_T = torch.flatten(QK_T, -3, -2)
         if mask is not None:
@@ -1817,38 +1762,40 @@ class GroupedMultiQueryAttention(Layer):
         return self.linears["O"](out)
 
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout: torch.Tensor):
+    def backward_p1(self, dL_dout: torch.Tensor, step=0):
         #vmap go fast
-        dL_dAtt = self.linears["O"].backward_p1(dL_dout)
+        dL_dAtt = self.linears["O"].backward_p1(dL_dout, step)
         dL_dAtt = torch.cat(dL_dAtt.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         dL_dAtt = torch.cat(dL_dAtt.unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)  # broadcast for memory efficiency
 
-        dL_dsQKT = vmap(lambda dldatt, v: vmap(lambda _dldatt: torch.bmm(_dldatt, v.transpose(-1,-2)), in_dims=-2, out_dims=-2)(dldatt), in_dims=-2, out_dims=-2)(dL_dAtt, self.xv.pop())
+        dL_dsQKT = vmap(lambda dldatt, v: vmap(lambda _dldatt: torch.bmm(_dldatt, v.transpose(-1,-2)), in_dims=-2, out_dims=-2)(dldatt), in_dims=-2, out_dims=-2)(dL_dAtt, self.xv.pop(step))
         dL_dsQKT = torch.flatten(dL_dsQKT, -3, -2)
 
-        dL_dQKT = self.softmax_fn.backward_p1(dL_dsQKT) * self.inv_square_d
+        dL_dQKT = self.softmax_fn.backward_p1(dL_dsQKT, step) * self.inv_square_d
         
         dL_dQKT =  torch.cat(dL_dQKT.unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
-        
-        dL_dxq = vmap(lambda dldqkt, k: vmap(lambda _dldqkt: torch.bmm(_dldqkt, k), in_dims=-2, out_dims=-2)(dldqkt), in_dims=-2, out_dims=-2)(dL_dQKT, self.xk.pop())
+
+        dL_dxq = vmap(lambda dldqkt, k: vmap(lambda _dldqkt: torch.bmm(_dldqkt, k), in_dims=-2, out_dims=-2)(dldqkt), in_dims=-2, out_dims=-2)(dL_dQKT, self.xk.pop(step))
         dL_dxq = dL_dxq.flatten(-3,-2)
 
-        dL_dxkt = vmap(vmap(lambda q, dldqkt: torch.bmm(q.transpose(-1,-2), dldqkt), in_dims=-2, out_dims=-2), in_dims=-2, out_dims=-2)(self.xq.pop(), dL_dQKT)
+        dL_dxkt = vmap(vmap(lambda q, dldqkt: torch.bmm(q.transpose(-1,-2), dldqkt), in_dims=-2, out_dims=-2), in_dims=-2, out_dims=-2)(self.xq.pop(step), dL_dQKT)
         dL_dxkt = torch.sum(dL_dxkt, -3)
+
         dL_dxk = torch.vmap(lambda dl_dlkt: torch.transpose(dl_dlkt, -1, -2), in_dims=-2, out_dims=-2)(dL_dxkt)
 
-        sQK_T = torch.cat(self.sQK_T.pop().unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
+        sQK_T = torch.cat(self.sQK_T.pop(step).unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
+
         dL_dxv = vmap(vmap(lambda sqkt, dldatt: torch.bmm(sqkt.transpose(-1,-2), dldatt), in_dims=-2, out_dims=-2), in_dims=-2, out_dims=-2)(sQK_T, dL_dAtt)
         dL_dxv = torch.sum(dL_dxv, -3)
 
-        dL_dxq, dL_dxk = self.rotary_emb.backward_p1(dL_dxq, dL_dxk)
+        dL_dxq, dL_dxk = self.rotary_emb.backward_p1(dL_dxq, dL_dxk, step)
 
-        dL_dQ = self.linears["Q"].backward_p1(self.dropouts["Q"].backward_p1(torch.flatten(dL_dxq, -2, -1)))
-        dL_dK = self.linears["K"].backward_p1(self.dropouts["K"].backward_p1(torch.flatten(dL_dxk, -2, -1)))
-        dL_dV = self.linears["V"].backward_p1(self.dropouts["V"].backward_p1(torch.flatten(dL_dxv, -2, -1)))
+        dL_dQ = self.linears["Q"].backward_p1(self.dropouts["Q"].backward_p1(torch.flatten(dL_dxq, -2, -1), step), step)
+        dL_dK = self.linears["K"].backward_p1(self.dropouts["K"].backward_p1(torch.flatten(dL_dxk, -2, -1), step), step)
+        dL_dV = self.linears["V"].backward_p1(self.dropouts["V"].backward_p1(torch.flatten(dL_dxv, -2, -1), step), step)
 
         return dL_dQ + dL_dK + dL_dV
+
     
 
 # Transformer++
@@ -1880,7 +1827,6 @@ class TransformerPPBlock(Layer):
         self.att_norm.init_params()
         self.ff_norm.init_params()
 
-    @pipeline_fwd
     def forward(self, x):
         n_x = self.att_norm(x)
         if self.training:
@@ -1892,12 +1838,13 @@ class TransformerPPBlock(Layer):
         return self.ff_dropout(x)
 
     @multi_stage_wrapper
-    @pipeline_bwd
-    def backward_p1(self, dL_dout):
-        dL_dff = self.ff_dropout.backward_p1(dL_dout)
-        dL_h = self.ff_norm.backward_p1(self.ff.backward_p1(dL_dff)) + dL_dff
-        dL_datt = self.att_dropout.backward_p1(dL_h)
-        return self.att_norm.backward_p1(self.attention.backward_p1(dL_datt)) + dL_datt
+    def backward_p1(self, dL_dout, step=0):
+        dL_dff = self.ff_dropout.backward_p1(dL_dout, step)
+        dL_h = self.ff_norm.backward_p1(self.ff.backward_p1(dL_dff, step), step) + dL_dff
+        dL_datt = self.att_dropout.backward_p1(dL_h, step)
+        dL_dnorm = self.attention.backward_p1(dL_datt, step)
+        out = self.att_norm.backward_p1(dL_dnorm, step) + dL_datt
+        return out
 
 
 if __name__ == "__main__":

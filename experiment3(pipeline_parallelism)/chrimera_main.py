@@ -4,15 +4,18 @@ import time
 import torch
 import torch.distributed as dist
 
-from models import Transformer
+from chimera import Transformer
 from data.dummy import get_train_dataloader, get_val_dataloader
 import layers
 import loss
 import optimizers
 from utils import benchmark
 
+import warnings
+warnings.filterwarnings("ignore")
+
+
 def main():
-    print(torch.__version__)
     torch.manual_seed(31082005)
     torch.cuda.manual_seed(31082005)
     #os.environ["RANK"] = "0"
@@ -20,13 +23,11 @@ def main():
     #os.environ["MASTER_ADDR"] = "localhost"
     #os.environ["MASTER_PORT"] = "12355"
     dist.init_process_group(backend='nccl')
-    if dist.get_world_size() > 4:
-        raise NotImplementedError("nccl backend doesnt support multi node")
     if dist.get_world_size() > 1 and dist.get_backend() != "gloo":
         pass
     torch.cuda.set_device(dist.get_rank())
     
-    gbs = 16
+    gbs = 8
     dim = 4096
     max_seqlen = 1024
     vocab_size = 32000
@@ -36,28 +37,25 @@ def main():
 
     model = Transformer(
         dim_size=dim,
-        num_heads=32,
-        num_kv_heads=32,
-        num_blocks=32,
+        num_heads=16,
+        num_kv_heads=8,
+        num_blocks=16,
         max_seqlen=max_seqlen,
         vocab_size=vocab_size,
         criterion=loss.NLPCrossEntropyLoss(),
-        pipe_algo="1f1b",
         device=device
     )
     
     model.init_params(gbs, (max_seqlen, dim))
-    model.multi_stage(False)
+    model.multi_stage(True)
 
-    train_data = get_train_dataloader(gbs*128, (max_seqlen,), gbs, vocab_size=vocab_size)
+    train_data = get_train_dataloader(gbs*32, (max_seqlen,), gbs, vocab_size=vocab_size, chimera=True)
 
-    n_params = model.get_num_params()
 
     if dist.get_rank() == 0:
-        print(f"No. Params: {n_params:,}")
-        print(model.layers[0].multi_stage)
+        print(model._2bp)
     
-    opt = optimizers.Adam(model, 0.0001)
+    opt = optimizers.SGD(model, 0.0001, chimera=True)
 
     torch.cuda.cudart().cudaProfilerStart()
     
@@ -75,7 +73,6 @@ def main():
     torch.cuda.cudart().cudaProfilerStop()
     time.sleep(1)
     exit()
-    print(dir(torch.cuda.memory))
     #torch.cuda.memory._dump_snapshot("/mnt/ceph_rbd/transformer_out.pickle")
     
 

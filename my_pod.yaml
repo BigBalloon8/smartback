@@ -9,18 +9,18 @@ spec:
     - -w
     - "true"
     - -t 
-    - cuda,nvtx,osrt,cudnn,cublas
+    - nvtx
     - -s
     - none 
     - -o 
-    - /mnt/ceph_rbd/nsight_report 
+    - /mnt/ceph_rbd/nsight_report_TRuE
     - -f
     - "true"
     - -x 
     - "true"
     - torchrun
     - --nproc_per_node=4
-    - resnet_main.py
+    - chrimera_main.py
     command:
     - nsys
     image: bigballoon8/custom-backprop

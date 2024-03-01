@@ -19,7 +19,7 @@ class Optimizer(ABC):
     def _recursive_set_attr(self, layer: layers.Layer, attr: tuple):
         if layer.params:
             setattr(layer, *attr)
-
+        
         for item in dir(layer):
             if isinstance(getattr(layer, item), layers.Layer):
                 self._recursive_set_attr(getattr(layer, item), attr)
@@ -67,18 +67,24 @@ class Optimizer(ABC):
                 for sub_layer in getattr(layer, item).values():
                     if isinstance(sub_layer, layers.Layer):
                         self._recursive_set_empty_opt_states(sub_layer, opt_creation_fn, *args)
-         
 
 class SGD(Optimizer):
-    def __init__(self, model:models.Model, lr:float):
+    def __init__(self, model:models.Model, lr:float, chimera:bool=False):
+        self.chimera = chimera
         super().__init__(model=model, lr=lr)
 
     def update_fn(self):
         def _update_fn(_self: layers.Layer):
             for k in _self.params.keys():
                 _self.params[k][:] =  _self.params[k] - self.lr*_self.grads[k]
-        for layer in self.model.layers:
-            self._recursive_set_update_fn(layer, _update_fn)
+        if self.chimera:
+            for layer in self.model.layers[0]:
+                self._recursive_set_update_fn(layer, _update_fn)
+            for layer in self.model.layers[1]:
+                self._recursive_set_update_fn(layer, _update_fn)
+        else:
+            for layer in self.model.layers:
+                self._recursive_set_update_fn(layer, _update_fn)
 
 
 class Adam(Optimizer):

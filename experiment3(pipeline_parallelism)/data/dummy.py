@@ -6,16 +6,50 @@ import torch.distributed as dist
 
 
 class DummyDataInt(Dataset):
-    def __init__(self, length, shape, vocab_size):
+    def __init__(self, length, shape, vocab_size, chimera=False):
         self.length = length
         self.shape = shape
         self.vocab_size = vocab_size
+        self.chimera = chimera
     
     def __len__(self):
-        return self.length
+        if self.chimera:
+            return self.length // 2
+        else:
+            return self.length
     
     def __getitem__(self, idx):
-        return torch.randint(2, self.vocab_size, self.shape)
+        if  self.chimera:
+            if dist.get_rank() == 0 or dist.get_rank() == dist.get_world_size()-1:
+                x = torch.randint(2, self.vocab_size, self.shape)
+                y = torch.zeros_like(x)
+                y[:-1] = x[1:]
+                y[-1] = 0
+                return x, y
+            else:
+                return 0, 0
+
+
+        if dist.get_world_size() == 1:
+            x = torch.randint(2, self.vocab_size, self.shape)
+            y = torch.zeros_like(x)
+            y[:-1] = x[1:]
+            y[-1] = 0
+            return x, y
+            
+        if dist.get_rank() == 0 or dist.get_rank() == dist.get_world_size()-1:
+            x = torch.randint(2, self.vocab_size, self.shape)
+            if dist.get_rank() == 0:
+                return x, 0
+            else:
+                y = torch.zeros_like(x)
+                y[:-1] = x[1:]
+                y[-1] = 0
+                return 0, y
+        else:
+            return 0, 0
+                
+        
 
 class DummyDataFloat(Dataset):
     def __init__(self, length, shape):
@@ -42,10 +76,11 @@ class DummyImage(Dataset):
     
     
 
-def get_train_dataloader(length, shape, gbs, dtype=int, accum_freq=1, shuffle=True, vocab_size = -1,  device="cuda"):
-
+def get_train_dataloader(length, shape, gbs, dtype=int, accum_freq=1, shuffle=True, vocab_size = -1,  device="cuda", chimera=False):
+    if chimera:
+        gbs = gbs // 2
     if dtype == int:
-        dataset = DummyDataInt(length, shape, vocab_size)
+        dataset = DummyDataInt(length, shape, vocab_size, chimera=chimera)
     elif dtype == float:
         dataset = DummyDataFloat(length, shape)
     elif dtype == "image":

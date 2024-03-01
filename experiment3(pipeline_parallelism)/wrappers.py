@@ -9,21 +9,21 @@ class cleanup_act(object):
         self.args = args
     def __call__(self, func):
         @wraps(func)
-        def wrapper(*args, **kwargs):
-            out = func(*args, **kwargs)
-            if args[0].multi_stage:
-                for arg in self.args:
-                    setattr(args[0], arg, [])
+        def wrapper(_self, *args, **kwargs):
+            out = func(_self, *args, **kwargs)
+            if _self.multi_stage:
+                for arg in _self.acts:
+                    setattr(_self, arg, [])
             return out
         return wrapper
 
 def multi_stage_wrapper(func):
     # designed to wrap backward_p1
     @wraps(func)
-    def wrapper(self, *args, **kwargs):
+    def wrapper(self, *args, step=0, **kwargs):
         if not self.multi_stage: # or dist.get_rank() == 0:
-            out = func(self, *args, **kwargs)
-            self.backward_p2()
+            out = func(self, *args, step, **kwargs)
+            self.backward_p2(step=step)
             return out
         else:
             return func(self, *args, **kwargs)
@@ -51,18 +51,15 @@ class expose_params(object):
 
         return wrapper
 
-def pipeline_fwd(func):
-    @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        out = func(self, *args, **kwargs)
-        self.pipe_step += 1
-        return out
-    return wrapper
-
-def pipeline_bwd(func):
-    @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        self.pipe_step -= 1
-        out = func(self, *args, **kwargs)
-        return out
-    return wrapper
+class nvtx_wrapper:
+    def __init__(self, name: str):
+        self.name = name
+    def __call__(self, func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            out = func(*args, **kwargs)
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_pop()
+            return out
+        return wrapper
+        
