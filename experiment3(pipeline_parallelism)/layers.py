@@ -9,6 +9,11 @@ import torch.nn.functional as F
 from torch import vmap as vmap
 import torch.distributed as dist
 
+from causal_conv1d import causal_conv1d_fn
+import causal_conv1d_cuda
+import selective_scan_cuda
+from einops import rearrange, repeat
+
 
 from wrappers import cleanup_act, multi_stage_wrapper, expose_params
 
@@ -190,23 +195,6 @@ class Sequential:
             dL_dout = layer.backward_p1(dL_dout, step)
         return dL_dout
     
-    def backward_p2(self):
-        if self.device == "cuda":
-            for i, layer in enumerate(self.layers):
-                with torch.cuda.stream(self.streams[i]):
-                    layer.backward_p2()
-        else:
-            for layer in self.layers:
-                layer.backward_p2()
-    
-    def update(self):
-        if self.device == "cuda":
-            for i, layer in enumerate(self.layers):
-                with torch.cuda.stream(self.streams[i]):
-                    layer.backward_p2()
-        else:
-            for layer in self.layers:
-                layer.backward_p2()
 
 
 class Dense(Layer):
@@ -1175,6 +1163,11 @@ class Conv2D(Layer):
         self.kernel_g[:] += torch.sum(vmap(vmap(vmap(_dL_dk_fn, in_dims=(0, None)), in_dims=(None, 0)))(inputs.unsqueeze(-3), dL_dout.unsqueeze(-3).unsqueeze(-3), stride=self.stride, padding=self.padding),dim=0)
 
 
+class Conv2DTranspose(Layer):
+    ...
+    #Have Fun ;)
+
+
 class MaxPool2D(Layer):
     @expose_params(acts=["indices"])
     def __init__(self, k_size: Union[Sequence[int], int], padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1):
@@ -1845,6 +1838,517 @@ class TransformerPPBlock(Layer):
         dL_dnorm = self.attention.backward_p1(dL_datt, step)
         out = self.att_norm.backward_p1(dL_dnorm, step) + dL_datt
         return out
+
+class BilinearUpSample(Layer):
+    def __init__(self, factor):
+        self.factor = 2
+    
+    def forward(self, x):
+        return F.upsample_bilinear(x)
+
+class DiffUpsample(Layer):
+    def __init__(self, in_channels, conv=False):
+        super().__init__()
+        self.in_channels = in_channels
+        self.conv = conv
+    
+    def init_params(self):
+        self.conv0 = Conv2D(self.in_channels, self.in_channels, 3, padding=1, stride=1)
+
+    def forward(self, x):
+        x = F.interpolate(x, scale_factor=2, mode='nearest')
+        if self.conv:
+            x = self.conv0(x)
+        return x
+    
+    @multi_stage_wrapper
+    def backward_p1(self, dL_dout, step=0):
+        if self.conv:
+            dL_dout = self.conv0.backward_p1(dL_dout, step)
+        return F.avg_pool2d(dL_dout, 2, divisor_override=1)
+
+class DiffDownsample(Layer):
+    def init_params(self):
+        self.pool = AvgPool2D(2)
+    def forward(self,x):
+        return self.pool(x)
+    @multi_stage_wrapper
+    def backward_p1(self, dL_dout, step=0):
+        return self.pool.backward_p1(dL_dout, step)
+
+class DiffResnetBlock(Layer):
+    def __init__(self, in_channels, out_channels=None, conv_shortcut=False, dropout=0.0):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = in_channels if out_channels is None else out_channels
+        self.use_conv_shortcut = conv_shortcut
+        self.dropout = dropout
+
+    def init_params(self):
+        self.bn1 = BatchNorm2D(self.in_channels)
+        self.conv1 = Conv2D(self.in_channels, self.out_channels, 3, padding=1, bias=False)
+        self.swish_1 = SiLU()
+        
+        self.bn1.init_params()
+        self.conv1.init_params()
+        
+        self.bn2 = BatchNorm2D(self.out_channels)
+        self.dropout = Dropout(self.dropout)
+        self.conv2 = Conv2D(self.out_channels, self.out_channels, 3, padding=1)
+        self.swish_2 = SiLU()
+        
+        self.bn2.init_params()
+        self.conv2.init_params()
+        
+        if self.in_channels != self.out_channels:
+            if self.use_conv_shortcut:
+                self.conv_shortcut = Conv2D(self.in_channels, self.out_channels, 3, padding=1)
+                self.conv_shortcut.init_params()
+            else:
+                self.nin_shortcut = Conv2D(self.in_channels, self.out_channels, 1, padding=0)
+                self.nin_shortcut.init_params()
+                
+    def forward(self, x):
+        h = x
+        h = self.bn1(h)
+        h = self.swish_1(h)
+        h = self.conv1(h)
+        
+        h = self.bn2(h)
+        h = self.swish_2(h)
+        h = self.dropout(h)
+        h = self.conv2(h)
+        
+        if self.in_channels != self.out_channels:
+            if self.use_conv_shortcut:
+                x = self.conv_shortcut(x)
+            else:
+                x = self.nin_shortcut(x)
+        
+        return x+h
+    
+    @multi_stage_wrapper
+    def backward_p1(self, dL_dout, step=0):
+        dL_dh = self.conv2.backward_p1(dL_dout, step)
+        dL_dh = self.dropout.backward_p1(dL_dh, step)
+        dL_dh = self.swish_2.backward_p1(dL_dh, step)
+        dL_dh = self.bn2.backward_p1(dL_dh, step)
+        dL_dh = self.conv1.backward_p1(dL_dh, step)
+        dL_dh = self.swish_1.backward_p1(dL_dh, step)
+        dL_dh = self.bn1.backward_p1(dL_dh, step)
+        
+        if self.in_channels != self.out_channels:
+            if self.use_conv_shortcut:
+                dL_dx = self.conv_shortcut.backward_p1(dL_dh, step)
+            else:
+                dL_dx = self.nin_shortcut.backward_p1(dL_dh, step)
+        else:
+            dL_dx = dL_dout
+
+        return dL_dh + dL_dx
+    
+        
+class DiffAttention(Layer):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.in_channels = in_channels
+    
+    @expose_params(acts=["q", "k", "v","sqkt"])
+    def init_params(self):
+        self.bn = BatchNorm2D(self.in_channels)
+        self.bn.init_params()
+
+        self.conv_q = Conv2D(self.in_channels, self.in_channels, 1, padding=0)
+        self.conv_k = Conv2D(self.in_channels, self.in_channels, 1, padding=0)
+        self.conv_v = Conv2D(self.in_channels, self.in_channels, 1, padding=0)
+        self.conv_out = Conv2D(self.in_channels, self.in_channels, 1, padding=0)
+
+        self.conv_q.init_params()
+        self.conv_k.init_params()
+        self.conv_v.init_params()
+        self.conv_out.init_params()
+        
+        self.softmax = Softmax()
+        
+        self.inv_sqrt_d = self.in_channels**(-0.5)
+        
+        self.q = []
+        self.k = []
+        self.v = []
+        self.sqkt = []
+    
+    def forward(self, x:torch.Tensor):
+        h_ = x
+        h_ = self.bn(h_)
+        q = self.conv_q(h_)
+        k = self.conv_k(h_)
+        v = self.conv_v(h_)
+        
+        b,c,h,w = q.shape
+        q = q.reshape(b,c,-1)
+        q = q.permute(0, 2, 1)
+        k = k.reshape(b, c, -1)
+        
+        self.q.append(q)
+        self.k.append(k)
+        
+        qk_t = torch.bmm(q, k)*self.inv_sqrt_d
+        
+        sqk_t = self.softmax(qk_t)
+        self.sqkt.append(sqk_t)
+        v = v.reshape(b, c, -1)
+        v = v.permute(0, 2, 1)
+        self.v.append(v)
+        h_ = torch.bmm(v, sqk_t)
+        h_ = h_.reshape(b, c, h, w)
+        
+        h_ = self.conv_out(h_)
+        
+        return x + h_
+    
+    @multi_stage_wrapper
+    def backward_p1(self, dL_dout, step=0):
+        b,c,h,w = dL_dout.shape
+        dL_datt = self.conv_out.backward_p1(dL_dout, step)
+        dL_datt = dL_dout.reshape(b,c,-1)
+        dL_dsqkt = torch.bmm(torch.transpose(self.v.pop(step), -2, -1), dL_datt)
+        dL_dqkt = self.softmax.backward_p1(dL_dsqkt, step=step)
+        dL_dv = torch.bmm(dL_datt, torch.transpose(self.sqkt.pop(step), -2, -1))
+        dL_dq = torch.bmm(dL_dqkt, torch.transpose(self.k.pop(step), -2, -1))
+        dL_dk = torch.bmm(torch.transpose(self.q.pop(step), -2, -1), dL_dqkt)
+        
+        dL_dq = dL_dq.permute(0, 2, 1)
+        dL_dq = self.conv_q.backward_p1(dL_dq.reshape(b, c, h, w), step)
+        dL_dk = self.conv_k.backward_p1(dL_dk.reshape(b, c, h, w), step)
+        dL_dv =self.cnv_v.backward_p1(dL_dv.reshape(b, c, h, w), step)
+        
+        dL_dh = dL_dq + dL_dk + dL_dv
+        dL_dh = self.bn.backward_p1(dL_dh, step)
+        
+        return dL_dh + dL_dout
+
+class DiffUnet(Layer):
+    def __init__(self, *, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks,
+                 attn_resolutions, dropout=0.0, resamp_with_conv=False, in_channels,
+                 resolution, use_linear_attn=False, attn_type="vanilla"):
+        super().__init__()
+        self.ch = ch
+        self.temb_ch = self.ch*4
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
+        self.resolution = resolution
+        self.in_channels = in_channels
+        
+        self.conv_in = torch.nn.Conv2d(in_channels,
+                                       self.ch,
+                                       kernel_size=3,
+                                       stride=1,
+                                       padding=1)
+        
+        #Down
+        curr_res = resolution
+        in_ch_mult = (1,)+tuple(ch_mult)
+        self.down = []
+        for i_level in range(self.num_resolutions):
+            block = []
+            attn = []
+            block_in = ch*in_ch_mult[i_level]
+            block_out = ch*ch_mult[i_level]
+            for i_block in range(self.num_res_blocks):
+                block.append(DiffResnetBlock(in_channels=block_in,
+                                             out_channels=block_out,
+                                             dropout=dropout))
+                block_in = block_out
+                if curr_res in attn_resolutions:
+                    attn.append(DiffAttention(block_in))
+            down = {
+                "block":block,
+                "attn":attn
+            }
+            if i_level != self.num_resolutions-1:
+                down["downsample"] = DiffDownsample(block_in, dropout=dropout)
+                curr_res = curr_res // 2
+            self.down.append(down)
+        
+        #Mid
+        self.mid = {
+            "block_1": DiffResnetBlock(block_in, block_in, dropout=dropout),
+            "attn_1": DiffAttention(block_in),
+            "block_2": DiffResnetBlock(block_in, block_in, dropout=dropout)
+        }
+
+        #Up
+        self.up = []
+        for i_level in reversed(range(self.num_resolutions)):
+            block = []
+            attn = []
+            block_out = ch*ch_mult[i_level]
+            skip_in = ch*ch_mult[i_level]
+            for i_block in range(self.num_res_blocks+1):
+                if i_block == self.num_res_blocks:
+                    skip_in = ch*in_ch_mult[i_level]
+                block.append(DiffResnetBlock(in_channels=block_in+skip_in,
+                                             out_channels=block_out,
+                                             dropout=dropout))
+                block_in = block_out
+                if curr_res in attn_resolutions:
+                    attn.append(DiffAttention(block_in))
+            up = {
+                "block":block,
+                "attn":attn
+            }
+            if i_level != 0:
+                up["upsample"] = DiffUpsample(block_in, dropout=dropout)
+                curr_res = curr_res * 2
+            self.up.insert(0, up)
+        
+        #Out
+        self.bn_out = BatchNorm2D(block_in)
+        self.conv_out = torch.nn.Conv2d(block_in,
+                                        out_ch,
+                                        kernel_size=3,
+                                        stride=1,
+                                        padding=1)
+        
+
+class SelectiveScan(Layer):
+    def __init__(self, delta_softplus=False):
+        super().__init__()
+        self.delta_softplus = delta_softplus
+    
+    @expose_params(acts=["u", "delta", "A", "B", "C", "D", "z", "delta_bias", "x", "out"])
+    def init_params(self):
+        self.u = []
+        self.delta = []
+        self.A = []
+        self.B = []
+        self.C = []
+        self.D = []
+        self.z = []
+        self.delta_bias = []
+        self.x = []
+        self.out = []
+    
+    def _save_params(self, u, delta, A, B, C, D, z, delta_bias, x, out):
+        self.u.append(u)
+        self.delta.append(delta)
+        self.A.append(A)
+        self.B.append(B)
+        self.C.append(C)
+        self.D.append(D)
+        self.z.append(z)
+        self.delta_bias.append(delta_bias)
+        self.x.append(x)
+        self.out.append(out)
+    
+    def _load_parms(self, step=0):
+        u = self.u.pop(step)
+        delta = self.delta.pop(step)
+        A = self.A.pop(step)
+        B = self.B.pop(step)
+        C = self.C.pop(step)
+        D = self.D.pop(step)
+        z = self.z.pop(step)
+        delta_bias = self.delta_bias.pop(step)
+        x = self.x.pop(step)
+        out = self.out.pop(step)
+        return u, delta, A, B, C, D, z, delta_bias, x, out
+    
+    def forward(self, u, delta, A, B, C, D=None, z=None, delta_bias=None):
+        if u.stride(-1) != 1:
+            u = u.contiguous()
+        if delta.stride(-1) != 1:
+            delta = delta.contiguous()
+        if D is not None:
+            D = D.contiguous()
+        if B.stride(-1) != 1:
+            B = B.contiguous()
+        if C.stride(-1) != 1:
+            C = C.contiguous()
+        if z is not None and z.stride(-1) != 1:
+            z = z.contiguous()
+        if B.dim() == 3:
+            B = rearrange(B, "b dstate l -> b 1 dstate l")
+        if C.dim() == 3:
+            C = rearrange(C, "b dstate l -> b 1 dstate l")
+    
+        out, x, *rest = selective_scan_cuda.fwd(u, delta, A, B, C, D, z, delta_bias, self.delta_softplus)
+        
+        self._save_params(u, delta, A, B, C, D, z, delta_bias, x, out)
+        
+        return rest[0]
+    
+    def backward_p1(self, dL_dout, step=0):
+        u, delta, A, B, C, D, z, delta_bias, x, out = self._load_parms(step)
+        if dL_dout.stride(-1) != 1:
+            dL_dout = dL_dout.contiguous()
+        du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = selective_scan_cuda.bwd(u, delta, A, B, C, D, z, delta_bias, out, self.delta_softplus)
+
+        dz = rest[0]
+        
+        dB = dB.squeeze(1) 
+        dC = dC.squeeze(1)
+        
+        return du, ddelta, dA, dB, dC, dD, ddelta_bias, dz
+        
+
+class Mamba(Layer):
+    def __init__(
+        self,
+        d_model,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+        dt_rank="auto",
+        dt_min=0.001,
+        dt_max=0.1,
+        dt_init="random",
+        dt_scale=1.0,
+        dt_init_floor=1e-4,
+        conv_bias=True,
+        bias=False,
+        layer_idx=None,
+        device="cuda",
+    ):
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(self.expand * self.d_model)
+        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
+        self.dt_min = dt_min
+        self.dt_max = dt_max
+        self.dt_init_floor = dt_init_floor
+        self.layer_idx = layer_idx
+        self.device = device
+        
+        self.act = SiLU()
+        
+        self.x_proj = Dense(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, device=device)
+        
+        self.dt_init_std = self.dt_rank**-0.5 * dt_scale
+
+        self.out_proj = Dense(self.d_inner, self.d_model, bias=bias, device=self.device)
+    
+    @expose_params({"conv_kernel":"conv_kernel_grad", 
+                    "conv_bias":"conv_bias_grad", 
+                    "dt_proj_weight":"dt_proj_weight_grad", 
+                    "dt_proj_bias":"dt_proj_bias_grad", "D":"D_grad",
+                    "in_proj_weight":"in_proj_weight_grad",
+                    "in_proj_bias":"in_proj_bias_grad"})
+    def init_params(self):
+        self.scan = SelectiveScan(True)
+
+        self.in_proj_weight = torch.randn(self.d_inner*2, self.d_model, device=self.device)
+        self.in_proj_weight_grad = torch.zeros_like(self.in_proj_weight)
+
+        self.in_proj_bias = torch.zeros(self.d_inner*2, 1)
+        self.in_proj_bias_grad = torch.zeros_like(self.in_proj_bias)        
+
+        self.conv_kernel = torch.ones(self.d_inner, 1, self.d_conv, device=self.device)
+        self.conv_bias = torch.zeros(self.d_inner, device=self.device)
+
+        self.conv_kernel_grad = torch.zeros_like(self.conv_kernel)
+        self.conv_bias_grad = torch.zeros_like(self.conv_bias)
+        
+        m = torch.distributions.uniform.Uniform(-self.dt_init_std, self.dt_init_std)
+        self.dt_proj_weight = m.sample((self.d_inner, self.dt_rank)).to(self.device)
+        self.dt_proj_weight_grad = torch.zeros_like(self.dt_proj_weight)
+        
+        
+        dt = torch.exp(
+            torch.rand(self.d_inner, device=self.device) * (math.log(self.dt_max) - math.log(self.dt_min))
+            + math.log(self.dt_min)
+        ).clamp(min=self.dt_init_floor)
+        
+        self.dt_proj_bias = dt + torch.log(-torch.expm1(-dt)) 
+        self.dt_proj_bias_grad = torch.zeros_like(self.dt_proj_bias)
+        
+        A = repeat(
+            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=self.device),
+            "n -> d n",
+            d=self.d_inner,
+        ).contiguous()
+        
+        self.A_log = torch.log(A)  # Keep A_log in fp32
+        self.D = torch.ones(self.d_inner, device=self.device)  # Keep in fp32
+        self.D_grad = torch.zeros_like(self.D)
+
+        self.x_proj.init_params()
+
+    
+    def forward(self, x:torch.Tensor):
+
+        batch, seqlen, dim = x.shape
+
+        conv_state, ssm_state = None, None
+
+        xz = rearrange(
+            self.in_proj_weight @ rearrange(x, "b l d -> d (b l)"),
+            "d (b l) -> b d l",
+            l=seqlen,
+        )
+
+        xz = xz + self.in_proj_bias
+
+        A = -torch.exp(self.A_log.float())
+
+        x, z = xz.chunk(2, dim=1)
+
+        x = F.conv1d(x, self.conv_kernel, self.conv_bias, groups=self.d_inner, padding=self.d_conv - 1)
+        x = self.act(x)
+
+        x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d)
+
+        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = self.dt_proj_weight @ dt.t()
+        dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
+        B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen)
+        C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen)
+
+        y = self.scan(x, dt, A, B, C, self.D.float(), z=z, delta_bias=self.dt_proj_bias.float())
+
+        y = rearrange(y, "b d l -> b l d")
+
+        return self.out_proj(y)
+
+    @multi_stage_wrapper
+    def backward_p1(self, dL_dout:torch.Tensor, step=0):
+        batch, seqlen, dim = dL_dout.shape
+        dL_dy = self.out_proj.backward_p1(dL_dout, step)
+
+        du, ddelta, dA, dB, dC, dD, ddelta_bias, dz = self.scan.backward_p1(dL_dy, step)
+        dL_dC = rearrange(dC, "b dstate l -> (b l) dstate")
+        dL_dB = rearrange(dB, "b dstate l -> (b l) dstate")
+        dL_dt = rearrange(ddelta, "b d l -> d (b l)")
+
+        dL_dt_t = self.dt_proj_weight.T @ dL_dt
+        dL_dt = dL_dt.t()
+
+        dL_dxdbl = torch.cat([dL_dt, dL_dB, dL_dC], dim=-1)
+
+        dL_dx = self.x_proj.backward_p1(dL_dxdbl, step)
+        dL_dx = rearrange(dL_dx, "(b l) d -> b d l", l=seqlen)
+        dL_dx = self.act.backward_p1(dL_dx, step)
+        dL_dx = F.conv_transpose1d(dL_dx, self.conv_kernel, groups=self.d_inner, padding=self.d_conv - 1)
+
+        dL_dxz = torch.cat(dL_dx, dz)
+        dl_dxz = rearrange(dl_dxz, "b d l -> d (b l)")
+
+        dl_dx = self.in_proj_weight.T @ dl_dxz
+        dl_dx = rearrange(dl_dx, "d (b l) -> b l d", l=seqlen)
+        
+        return dl_dx
+        
+
+
+        
+                
+                
+        
+        
+        
+        
 
 
 if __name__ == "__main__":

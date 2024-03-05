@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from typing import Self
 from termcolor import colored
 
 import torch
@@ -23,6 +24,25 @@ def nvtx_profile(name:str):
     print(colored(name.upper(), COLOURS[dist.get_rank()]))
     torch.cuda.nvtx.range_pop()
 
+
+class CommHandler:
+    def __init__(self, model):
+        self.model = model
+        self.fmb0 = 0
+        self.fmb1 = 0
+        self.bmb0 = 0
+        self.bmb1 = 0
+    def forward(self):
+        if self.model.rank_rep_0 < self.model.rank_rep_1:
+            if self.model.rank_rep_0 == 0:
+                dist.send()
+
+    def backward(self):
+        ...
+
+
+
+
 class Model:
     def __init__(self):
         self.rank = dist.get_rank()
@@ -40,31 +60,23 @@ class Model:
         self.b_recv_buffer = ...
         self.sub_layers: list[list[layers.Layer]] = []
         self.streams: list[torch.cuda.Stream] = []
-    
+
 
     # Forward
     def _rank_0_rep_0_fwd(self, x, mb):
         with nvtx_profile(f"Rank {dist.get_rank()} fwd {mb}"):
             for layer in self.layers[0]:
                 x = layer(x)
-        dist.isend(x, self.rank + 1, tag=mb)
-        #print(f"R0: {self.rank} sent to {self.rank+1}, {mb}")
+        
     
     def _rank_n_rep_0_fwd(self, mb):
-        work = dist.recv(self.f_recv_buffer, self.rank - 1, tag=mb)
-        #work.wait()
-        #print(f"R0: {self.rank} recv from {self.rank-1}, {mb}")
         x = self.f_recv_buffer.clone()
         with nvtx_profile(f"Rank {dist.get_rank()} fwd {mb}"):
             for layer in self.layers[0]:
                 x = layer(x)
-        dist.isend(x, self.rank + 1, tag=mb)
-        #print(f"R0: {self.rank} sent to {self.rank+1}, {mb}")
+        self.to_send = x
     
     def _rank_N_rep_0_fwd(self, y, mb):
-        work = dist.recv(self.f_recv_buffer, self.rank - 1, tag=mb)
-        #work.wait()
-        torch.cuda.synchronize()
         x = self.f_recv_buffer.clone()
         with nvtx_profile(f"Rank {dist.get_rank()} fwd {mb}, ---LOSS---"):
             for layer in self.layers[0]:
@@ -76,25 +88,17 @@ class Model:
         with nvtx_profile(f"Rank {dist.get_rank()} fwd {mb}"):
             for layer in self.layers[1]:
                 x = layer(x)
-        dist.isend(x, self.rank - 1, tag=mb)
+        self.to_send = x
         #print(f"R1: {self.rank} sent to {self.rank-1}, {mb}")
     
     def _rank_n_rep_1_fwd(self, mb):
-        work = dist.recv(self.f_recv_buffer, self.rank + 1, tag=mb)
-        #work.wait()
-        #print(f"R1: {self.rank} recv from {self.rank+1}, {mb}")
         x = self.f_recv_buffer.clone()
         with nvtx_profile(f"Rank {dist.get_rank()} fwd {mb}"):
             for layer in self.layers[1]:
                 x = layer(x)
-        dist.isend(x, self.rank - 1, tag=mb)
-        #torch.cuda.synchronize()
-        #print(f"R1: {self.rank} sent to {self.rank-1}, {mb}")
+        self.to_send = x
     
     def _rank_N_rep_1_fwd(self, y, mb):
-        work = dist.recv(self.f_recv_buffer, self.rank + 1, tag=mb)
-        torch.cuda.synchronize()
-        #work.wait()
         x = self.f_recv_buffer.clone()
         with nvtx_profile(f"Rank {dist.get_rank()} fwd {mb}, ---LOSS---"):
             for layer in self.layers[1]:
@@ -104,55 +108,45 @@ class Model:
     
     #Backward
     def _rank_0_rep_0_bwd(self, step=0, mb=0):
-        work = dist.recv(self.b_recv_buffer, self.rank + 1, tag=self.size+mb)
-        #work.wait()
-        dl_dout = self.b_recv_buffer.clone()
-        with nvtx_profile(f"Rank {dist.get_rank()} bwd {mb}"):
-            for layer in reversed(self.layers[0]):
-                dl_dout = layer.backward_p1(dl_dout, step)   
-    
-    def _rank_n_rep_0_bwd(self, step=0, mb=0):
-        work = dist.recv(self.b_recv_buffer, self.rank + 1, tag=self.size+mb)
-        #work.wait()
         dl_dout = self.b_recv_buffer.clone()
         with nvtx_profile(f"Rank {dist.get_rank()} bwd {mb}"):
             for layer in reversed(self.layers[0]):
                 dl_dout = layer.backward_p1(dl_dout, step)
-        dist.isend(dl_dout.contiguous(), self.rank - 1, tag=self.size+mb)
+    
+    def _rank_n_rep_0_bwd(self, step=0, mb=0):
+        dl_dout = self.b_recv_buffer.clone()
+        with nvtx_profile(f"Rank {dist.get_rank()} bwd {mb}"):
+            for layer in reversed(self.layers[0]):
+                dl_dout = layer.backward_p1(dl_dout, step)
+        self.to_send = dl_dout
             
     def _rank_N_rep_0_bwd(self, step=0, mb=0):
         with nvtx_profile(f"Rank {dist.get_rank()} bwd {mb}"):
             dl_dout = self.criterion.backward()
             for layer in reversed(self.layers[0]):
                 dl_dout = layer.backward_p1(dl_dout, step)
-        dist.isend(dl_dout.contiguous(), self.rank - 1, tag=self.size+mb)
+        self.to_send = dl_dout
         
     def _rank_0_rep_1_bwd(self, step=0, mb=0):
-        work = dist.recv(self.b_recv_buffer, self.rank - 1, tag=self.size+mb)
-        #work.wait()
         dl_dout = self.b_recv_buffer.clone()
         with nvtx_profile(f"Rank {dist.get_rank()} bwd {mb}"):
             for layer in reversed(self.layers[1]):
                 dl_dout = layer.backward_p1(dl_dout, step)
     
     def _rank_n_rep_1_bwd(self, step=0, mb=0):
-        work = dist.recv(self.b_recv_buffer, self.rank - 1, tag=mb)
-        #work.wait()
         dl_dout = self.b_recv_buffer.clone()
         with nvtx_profile(f"Rank {dist.get_rank()} bwd {mb}"):
             for layer in reversed(self.layers[1]):
                 dl_dout = layer.backward_p1(dl_dout, step)
-        dist.isend(dl_dout.contiguous(), self.rank + 1, tag=mb)
+        self.to_send = dl_dout
         
     def _rank_N_rep_1_bwd(self, step=0, mb=0):
-        work = dist.recv(self.b_recv_buffer, self.rank - 1, tag=mb)
-        #work.wait()
         dl_dout = self.b_recv_buffer.clone()
         with nvtx_profile(f"Rank {dist.get_rank()} bwd {mb}"):
             dl_dout = self.criterion.backward()
             for layer in reversed(self.layers[1]):
                 dl_dout = layer.backward_p1(dl_dout, step)
-        dist.isend(dl_dout.contiguous(), self.rank + 1, tag=mb)
+        self.to_send = dl_dout
     
     def _backward_p2(self):
         with nvtx_profile(f"Rank {dist.get_rank()} bwd_p2"):
@@ -195,23 +189,33 @@ class Model:
         fmb_rep_1 = self.size // 2
         bmb_rep_1 = self.size // 2
         
+        HALF_SIZE = self.size // 2
 
-        #print(dist.get_rank(), self.rank_rep_0, self.rank_rep_1)
         if self.rank_rep_0 < self.rank_rep_1:
-            for _ in range(self.size//2 - self.rank_rep_0):
+            # ------------------------------------------------------
+            for _ in range(HALF_SIZE - self.rank_rep_0):
                 if self.rank_rep_0 == 0:
                     self._rank_0_rep_0_fwd(x.pop(0), fmb_rep_0)
+                    if fmb_rep_0 != HALF_SIZE-self.rank_rep_0 -1:
+                        dist.send(self.to_send, self.rank + 1)
                 else:
+                    dist.recv(self.f_recv_buffer, self.rank-1)
                     self._rank_n_rep_0_fwd(fmb_rep_0)
+                    if fmb_rep_0 != HALF_SIZE-self.rank_rep_0 -1:
+                        dist.send(self.to_send, self.rank + 1)
                 fmb_rep_0 += 1
             
+            dist.isend(self.to_send, self.rank + 1, tag=fmb_rep_0)
+
+            # ------------------------------------------------------
             for _ in range(self.rank_rep_0):
+                
                 self._rank_n_rep_1_fwd(fmb_rep_1)
                 self._rank_n_rep_0_fwd(fmb_rep_0)
                 fmb_rep_0 += 1
                 fmb_rep_1 += 1
             
-            base = self.size//2
+            # ------------------------------------------------------
             for i in range(self.size//2 - self.rank_rep_0):
                 if self.rank_rep_0 == 0:
                     self._rank_N_rep_1_fwd(y.pop(0), fmb_rep_1)
@@ -222,12 +226,14 @@ class Model:
                 fmb_rep_1 += 1
                 bmb_rep_1 += 1
             
+            # ------------------------------------------------------
             for i in range(self.rank_rep_0):
                 self._rank_n_rep_0_bwd(step=0, mb=bmb_rep_0)
                 self._rank_n_rep_1_bwd(step=0, mb=bmb_rep_1) # Check Notes
                 bmb_rep_0 += 1
                 bmb_rep_1 += 1
             
+            # ------------------------------------------------------
             for i in range(self.size//2 - self.rank_rep_0):
                 if self.rank_rep_0 == 0:
                     self._rank_0_rep_0_bwd(step=0, mb=bmb_rep_0)
@@ -237,22 +243,30 @@ class Model:
             
                     
         else:
-            for _ in range(self.size//2 - self.rank_rep_1):
+            # ------------------------------------------------------
+
+            for _ in range(HALF_SIZE - self.rank_rep_1):
                 if self.rank_rep_1 == 0:
                     self._rank_0_rep_1_fwd(x.pop(0), fmb_rep_1)
+                    if fmb_rep_1 != HALF_SIZE-self.rank_rep_1 -1:
+                        dist.send(self.to_send, self.rank - 1)
                 else:
+                    dist.recv(self.f_recv_buffer, self.rank + 1)
                     self._rank_n_rep_1_fwd(fmb_rep_1)
+                    if fmb_rep_1 != HALF_SIZE-self.rank_rep_1 -1:
+                        dist.send(self.to_send, self.rank - 1)
                 fmb_rep_1 += 1
+            
+            dist.isend(self.to_send, self.rank - 1, tag=fmb_rep_1)
                 
-                
+            # ------------------------------------------------------
             for _ in range(self.rank_rep_1):
                 self._rank_n_rep_0_fwd(fmb_rep_0)
                 self._rank_n_rep_1_fwd(fmb_rep_1)
                 fmb_rep_0 += 1
                 fmb_rep_1 += 1
             
-
-            base = self.size//2+1
+            # ------------------------------------------------------
             for i in range(self.size//2 - self.rank_rep_1):
                 if self.rank_rep_1 == 0:
                     self._rank_N_rep_0_fwd(y.pop(0), fmb_rep_0)
@@ -263,14 +277,14 @@ class Model:
                 fmb_rep_0 += 1
                 bmb_rep_0 += 1
     
-                
+            # ------------------------------------------------------
             for i in range(self.rank_rep_1):
                 self._rank_n_rep_1_bwd(step=0,  mb=bmb_rep_1)
                 self._rank_n_rep_0_bwd(step=0 , mb=bmb_rep_0) # Check Notes
                 bmb_rep_1 += 1
                 bmb_rep_0 += 1
 
-            
+            # ------------------------------------------------------
             for i in range(self.size//2 - self.rank_rep_0):
                 if self.rank_rep_1 == 0:
                     self._rank_0_rep_1_bwd(step=0, mb=bmb_rep_1)
