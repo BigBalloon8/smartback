@@ -9,13 +9,12 @@ import torch.nn.functional as F
 from torch import vmap as vmap
 import torch.distributed as dist
 
-from causal_conv1d import causal_conv1d_fn
-import causal_conv1d_cuda
 import selective_scan_cuda
 from einops import rearrange, repeat
 
 
 from wrappers import cleanup_act, multi_stage_wrapper, expose_params
+import init_params
 
 @contextmanager
 def nvtx_profile(name):
@@ -225,9 +224,7 @@ class Dense(Layer):
     
     @expose_params({"weights": "weights_g", "bias": "bias_g"}, ["inputs", "dL_dout"])
     def init_params(self):
-        m = torch.distributions.normal.Normal(0, 0.01)
-        self.weights = m.sample(torch.Size([self.input_size, self.output_size])).to(self.device)
-        self.bias = torch.zeros(self.output_size, device=self.device) if self.bias_ else None
+        self.weights, self.bias = init_params(self.input_size, self.output_size, self.bias_, {"device":self.device})
         
         self.weights_g = torch.zeros_like(self.weights, device=self.device)
         self.bias_g = torch.zeros_like(self.bias, device=self.device) if self.bias_ else None
@@ -419,7 +416,7 @@ class Embeddings(Layer):
     
     @expose_params({"weights": "weights_g"}, ["inputs", "dL_dout"])
     def init_params(self):
-        self.weights = torch.randn(self.num_embeddings, self.dim, device=self.device)
+        self.weights = init_params.embedding_params(self.num_embeddings, self.dim, {"device": self.device})
         self.weights_g = torch.zeros_like(self.weights, device=self.device)
         self.inputs = []
         self.dL_dout = []
@@ -1100,11 +1097,8 @@ class Conv2D(Layer):
 
     @expose_params({"kernel":"kernel_g", "bias":"bias_g"}, ["inputs", "dL_dout"])
     def init_params(self):
-        self.kernel = torch.randn(self.out_channels, self.in_channels, *self.k_size, device=self.device)
-        if self.bias_:
-            self.bias = torch.zeros(self.out_channels, device=self.device)
-        else:
-            self.bias = None
+        self.kernel, self.bias = init_params.conv2d_params(self.in_channels, self.out_channels, self.k_size, bias=self.bias_, factory_kwargs={"device": self.device})
+
         self.kernel_g = torch.zeros_like(self.kernel, device=self.device)
         if self.bias_:
             self.bias_g = torch.zeros_like(self.bias, device=self.device)
@@ -2182,7 +2176,7 @@ class SelectiveScan(Layer):
         u, delta, A, B, C, D, z, delta_bias, x, out = self._load_parms(step)
         if dL_dout.stride(-1) != 1:
             dL_dout = dL_dout.contiguous()
-        du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = selective_scan_cuda.bwd(u, delta, A, B, C, D, z, delta_bias, out, self.delta_softplus)
+        du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = selective_scan_cuda.bwd(u, delta, A, B, C, D, z, delta_bias, dL_dout, x, out, None, self.delta_softplus, False)
 
         dz = rest[0]
         
@@ -2210,6 +2204,7 @@ class Mamba(Layer):
         layer_idx=None,
         device="cuda",
     ):
+        super().__init__()
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
@@ -2238,13 +2233,14 @@ class Mamba(Layer):
                     "in_proj_bias":"in_proj_bias_grad"})
     def init_params(self):
         self.scan = SelectiveScan(True)
+        self.scan.init_params()
 
-        self.in_proj_weight = torch.randn(self.d_inner*2, self.d_model, device=self.device)
+        self.in_proj_weight,  = init_params.dense_params(self.d_inner*2, self.d_model, bias=False, factory_kwargs={"device": self.device})
         self.in_proj_weight_grad = torch.zeros_like(self.in_proj_weight)
 
-        self.in_proj_bias = torch.zeros(self.d_inner*2, 1)
+        self.in_proj_bias = torch.zeros(self.d_inner*2, 1, device=self.device)
         self.in_proj_bias_grad = torch.zeros_like(self.in_proj_bias)        
-
+        
         self.conv_kernel = torch.ones(self.d_inner, 1, self.d_conv, device=self.device)
         self.conv_bias = torch.zeros(self.d_inner, device=self.device)
 
@@ -2275,7 +2271,14 @@ class Mamba(Layer):
         self.D_grad = torch.zeros_like(self.D)
 
         self.x_proj.init_params()
+        self.out_proj.init_params()
 
+        self.x = []
+        self.dt_t = []
+        self.dL_dtt = []
+        self.dL_dxz = []
+        self.dL_dact = []
+    
     
     def forward(self, x:torch.Tensor):
 
@@ -2283,8 +2286,11 @@ class Mamba(Layer):
 
         conv_state, ssm_state = None, None
 
+        x = rearrange(x, "b l d -> d (b l)")
+        self.x.append(x)
+
         xz = rearrange(
-            self.in_proj_weight @ rearrange(x, "b l d -> d (b l)"),
+            self.in_proj_weight @ x,
             "d (b l) -> b d l",
             l=seqlen,
         )
@@ -2294,14 +2300,20 @@ class Mamba(Layer):
         A = -torch.exp(self.A_log.float())
 
         x, z = xz.chunk(2, dim=1)
-
+        print(x.shape)
         x = F.conv1d(x, self.conv_kernel, self.conv_bias, groups=self.d_inner, padding=self.d_conv - 1)
+        print(x.shape)
+        x = x[..., :seqlen]
+        print(x.shape)
         x = self.act(x)
+        
 
         x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d)
-
         dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        dt = self.dt_proj_weight @ dt.t()
+        dt_t = dt.t()
+        self.dt_t.append(dt_t)
+        dt = self.dt_proj_weight @ dt_t
+
         dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
         B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen)
         C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen)
@@ -2309,46 +2321,54 @@ class Mamba(Layer):
         y = self.scan(x, dt, A, B, C, self.D.float(), z=z, delta_bias=self.dt_proj_bias.float())
 
         y = rearrange(y, "b d l -> b l d")
-
         return self.out_proj(y)
 
     @multi_stage_wrapper
     def backward_p1(self, dL_dout:torch.Tensor, step=0):
+        print("----------------------------")
         batch, seqlen, dim = dL_dout.shape
         dL_dy = self.out_proj.backward_p1(dL_dout, step)
+        dL_dy = rearrange(dL_dy, "b l d -> b d l")
 
         du, ddelta, dA, dB, dC, dD, ddelta_bias, dz = self.scan.backward_p1(dL_dy, step)
+        self.dt_proj_bias_grad[:] += ddelta_bias
+
         dL_dC = rearrange(dC, "b dstate l -> (b l) dstate")
         dL_dB = rearrange(dB, "b dstate l -> (b l) dstate")
         dL_dt = rearrange(ddelta, "b d l -> d (b l)")
-
+        self.dL_dtt.append(dL_dt)
         dL_dt_t = self.dt_proj_weight.T @ dL_dt
-        dL_dt = dL_dt.t()
-
+        dL_dt = dL_dt_t.t()
         dL_dxdbl = torch.cat([dL_dt, dL_dB, dL_dC], dim=-1)
-
+        #print(dL_dxdbl.shape)
         dL_dx = self.x_proj.backward_p1(dL_dxdbl, step)
         dL_dx = rearrange(dL_dx, "(b l) d -> b d l", l=seqlen)
         dL_dx = self.act.backward_p1(dL_dx, step)
-        dL_dx = F.conv_transpose1d(dL_dx, self.conv_kernel, groups=self.d_inner, padding=self.d_conv - 1)
+        self.dL_dact.append(dL_dx)
+        dL_dx = F.conv1d(dL_dx, self.conv_kernel.flip(-1), padding=self.d_conv - 1, groups=self.d_inner)[..., :seqlen]
+        print(dL_dx.shape)
 
-        dL_dxz = torch.cat(dL_dx, dz)
-        dl_dxz = rearrange(dl_dxz, "b d l -> d (b l)")
+        dL_dxz = torch.cat((dL_dx, dz), dim=1)
+        dL_dxz = rearrange(dL_dxz, "b d l -> d (b l)")
+        self.dL_dxz.append(dL_dxz)
 
-        dl_dx = self.in_proj_weight.T @ dl_dxz
-        dl_dx = rearrange(dl_dx, "d (b l) -> b l d", l=seqlen)
-        
-        return dl_dx
+        dL_dx = self.in_proj_weight.T @ dL_dxz
+        dL_dx = rearrange(dL_dx, "d (b l) -> b l d", l=seqlen)
+
+        return dL_dx
+
+    def backward_p2(self, step=0):
+        # This is just the maths need to stack tensors etc...
+        self.in_proj_weight_grad[:] += torch.sum(torch.matmul(self.dL_dxz, self.x.T), dim=0)
+        self.in_proj_bias[:] += torch.sum(self.dL_dxz, dim=(1,2))
+
+        self.conv_bias_grad[:] += torch.sum(self.dL_dact, dim=(0,1))
+
+        self.conv_kernel_grad[:] += ...
+
+        self.dt_proj_weight_grad[:] += torch.sum(torch.matmul(self.dL_dtt, self.dt_t.T), dim=0)
         
 
-
-        
-                
-                
-        
-        
-        
-        
 
 
 if __name__ == "__main__":
@@ -2356,9 +2376,10 @@ if __name__ == "__main__":
     def test(layer, x, dL_dout):
         layer.init_params()
         with torch.no_grad():
-            layer.forward(x)
+            print(layer.forward(x)[0][0])
+            exit()
             my_back = layer.backward_p1(dL_dout)
-            layer.backward_p2()
+            #layer.backward_p2()
         true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
         print(my_back.shape, true_back.shape)
         if len(x.shape) == 3:
@@ -2370,7 +2391,8 @@ if __name__ == "__main__":
         else:
             print(my_back[:2,:2,:2, :2])
             print(true_back[:2,:2,:2, :2])
-        print(my_back.mean())
+        print("Means: ", my_back.mean(), true_back.mean())
+        print("Stds : ", my_back.std(), true_back.std())
         num_correct = (torch.isclose(my_back, true_back, rtol=0.00001)).sum()
         print(f"Num correct: {num_correct}/{my_back.numel()} ({100*num_correct/my_back.numel():.2f}%)")
         return my_back, true_back
@@ -2482,5 +2504,11 @@ if __name__ == "__main__":
         layer = AvgPool2D(28)
         test(layer, x, dL_dout)
 
+    def test_mamba():
+        torch.manual_seed(1)
+        x = torch.randn(4, 32 , 64, device="cuda")
+        dL_dout = torch.ones(4, 32 , 64, device="cuda")
+        layer = Mamba(64)
+        test(layer, x, dL_dout)
 
-    test_transformer_pp()
+test_mamba()
