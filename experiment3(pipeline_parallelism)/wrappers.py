@@ -9,10 +9,12 @@ class cleanup_act(object):
         self.args = args
     def __call__(self, func):
         @wraps(func)
-        def wrapper(_self, *args, **kwargs):
-            out = func(_self, *args, **kwargs)
-            if _self.multi_stage:
+        def wrapper(_self, inter):
+            out = func(_self, inter)
+            if _self.multi_stage and not inter:
+                #print(_self.__class__.__name__, self.args)
                 for arg in _self.acts:
+                    #print(f"Setting {_self.__class__.__name__}.{arg} to []")
                     setattr(_self, arg, [])
             return out
         return wrapper
@@ -20,10 +22,10 @@ class cleanup_act(object):
 def multi_stage_wrapper(func):
     # designed to wrap backward_p1
     @wraps(func)
-    def wrapper(self, *args, step=0, **kwargs):
+    def wrapper(self, *args, **kwargs):
         if not self.multi_stage: # or dist.get_rank() == 0:
-            out = func(self, *args, step, **kwargs)
-            self.backward_p2(step=step)
+            out = func(self, *args, **kwargs)
+            self.backward_p2(inter=False)
             return out
         else:
             return func(self, *args, **kwargs)

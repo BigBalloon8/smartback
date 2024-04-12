@@ -112,3 +112,30 @@ class Adam(Optimizer):
         for layer in self.model.layers:
             self._recursive_set_update_fn(layer, _update_fn)
             
+
+class AdamW(Optimizer):
+    def __init__(self, model: models.Model, lr: float, beta1=0.9, beta2=0.999, weight_decay=0.01, eps=1e-8):
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.weight_decay = weight_decay
+        self.eps = eps
+
+        for layer in model.layers:
+            self._recursive_set_attr(layer, ("t", 0))
+            self._recursive_set_empty_opt_states(layer, torch.zeros_like, "m", "v")
+        super().__init__(model, lr)
+    
+    def update_fn(self):
+        def _update_fn(_self: layers.Layer):
+            if not hasattr(_self, "params"):
+                return
+            _self.t += 1
+            for k in _self.params.keys():
+                _self.grads[k] = _self.grads[k] + self.weight_decay*_self.params[k]
+                _self.m[k] = self.beta1*_self.m[k] + (1-self.beta1)*_self.grads[k]
+                _self.v[k] = self.beta2*_self.v[k] + (1-self.beta2)*(_self.grads[k]**2)
+                m_hat = _self.m[k]/(1-self.beta1**_self.t)
+                v_hat = _self.v[k]/(1-self.beta2**_self.t)
+                _self.params[k] -= self.lr*(m_hat/(torch.sqrt(v_hat) + self.eps)+self.weight_decay*_self.params[k])
+        for layer in self.model.layers:
+            self._recursive_set_update_fn(layer, _update_fn)

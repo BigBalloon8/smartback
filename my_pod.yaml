@@ -9,7 +9,7 @@ spec:
     - -w
     - "true"
     - -t 
-    - nvtx
+    - nvtx #,cuda
     - -s
     - none 
     - -o 
@@ -20,7 +20,8 @@ spec:
     - "true"
     - torchrun
     - --nproc_per_node=4
-    - chrimera_main.py
+    - resnet_main.py
+    #- --msbp
     command:
     - nsys
     image: bigballoon8/custom-backprop
@@ -28,14 +29,13 @@ spec:
     env:
     - name: OMP_NUM_THREADS
       value: "4"
+    #- name: NCCL_DEBUG
+    #  value: "INFO"
     resources:
       limits:
-        cpu: 16
-        memory: 32Gi
+        cpu: 64
+        memory: 512Gi
         nvidia.com/gpu: 4
-      requests:
-        cpu: 16
-        memory: 16Gi
     volumeMounts:
     - mountPath: /mnt/ceph_rbd
       name: volume
@@ -48,7 +48,7 @@ spec:
   volumes:
   - name: volume
     persistentVolumeClaim:
-      claimName: imagenet-pv
+      claimName: test-claim
   - emptyDir:
       medium: Memory
     name: devshm

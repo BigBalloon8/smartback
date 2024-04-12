@@ -9,10 +9,11 @@ from loss import Loss
 
 @contextmanager
 def nvtx_profile(name):
-    torch.cuda.synchronize()
+    #torch.cuda.synchronize()
+    #print(name)
     torch.cuda.nvtx.range_push(name)
     yield
-    torch.cuda.synchronize()
+    #torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
 
 class Model:
@@ -54,39 +55,42 @@ class Model:
                 x = layer(x)
             return self.criterion(x, y)
     
-    def _rank_0_bwd_p1(self, step=0):
+    def _rank_0_bwd_p1(self):
         dist.recv(self.b_recv_buffer, self.rank+1)
         with nvtx_profile(f"Rank {dist.get_rank()} bwd"):
             dL_dout = self.b_recv_buffer.clone()
             for layer in self.layers[::-1]:
-                dL_dout = layer.backward_p1(dL_dout, step)
+                dL_dout = layer.backward_p1(dL_dout)
     
-    def _rank_n_bwd_p1(self, step=0):
+    def _rank_n_bwd_p1(self):
         dist.recv(self.b_recv_buffer, self.rank+1)
         with nvtx_profile(f"Rank {dist.get_rank()} bwd"):
             dL_dout = self.b_recv_buffer.clone()
             for layer in self.layers[::-1]:
-                dL_dout = layer.backward_p1(dL_dout, step)
+                dL_dout = layer.backward_p1(dL_dout)
             dist.send(dL_dout.contiguous(), self.rank-1)
     
-    def _rank_N_bwd_p1(self, step=0):
+    def _rank_N_bwd_p1(self):
         with nvtx_profile(f"Rank {dist.get_rank()} bwd"):
             dL_dout = self.criterion.backward()
             for layer in self.layers[::-1]:
-                dL_dout = layer.backward_p1(dL_dout, step)
+                dL_dout = layer.backward_p1(dL_dout)
+            if not self._2bp and isinstance(self, Transformer): # needed for memory
+                torch.cuda.empty_cache()
             dist.send(dL_dout.contiguous(), self.rank-1)
     
-    def _backward_p2(self):
+    def _backward_p2(self, inter=False):
         with nvtx_profile(f"Rank {dist.get_rank()} bwd_p2"):
             if self.device == "cuda":
                 for i, layer in enumerate(self.sub_layers):
-                    with torch.cuda.stream(self.streams[i]):
-                        layer.backward_p2()
-                        self.streams[i].synchronize()
-                        
+                    #with torch.cuda.stream(self.streams[i]):
+                    #with nvtx_profile(layer.__class__.__name__):
+                    layer.backward_p2(inter=inter)
             else:
                 for layer in self.layers:
                     layer.backward_p2()
+            torch.cuda.synchronize()
+                
 
     def train_step(self, x, y):
         if dist.get_world_size() == 1:
@@ -180,10 +184,13 @@ class Model:
             for _ in range(self.size - self.rank):
                 if self.rank == 0:
                     self._rank_0_bwd_p1()
+                    self._backward_p2(inter=True)
                 elif self.rank == self.size - 1:
                     self._rank_N_bwd_p1()
+                    self._backward_p2(inter=True)
                 else:
                     self._rank_n_bwd_p1()
+                    self._backward_p2(inter=True)
         
             if self._2bp:
                 self._backward_p2()
@@ -206,6 +213,7 @@ class Model:
                 else:
                     micro_batches.pop()
                     self._rank_n_fwd()
+            
             while len(micro_batches) > 0:
                 if self.rank == 0:
                     self._rank_0_bwd_p1()
@@ -219,16 +227,22 @@ class Model:
                     micro_batches.pop()
                     self._rank_n_bwd_p1()
                     self._rank_n_fwd()
-            for _ in range(self.size - self.rank):
+            
+            for i in range(self.size - self.rank):
                 if self.rank == 0:
                     self._rank_0_bwd_p1()
+                    self._backward_p2(inter=True)
                 elif self.rank == self.size - 1:
                     self._rank_N_bwd_p1()
+                    self._backward_p2(inter=True)
                 else:
                     self._rank_n_bwd_p1()
+                    self._backward_p2(inter=True)
             
-            if self._2bp:
+            if self._2bp and self.rank != 0:
                 self._backward_p2()
+        else:
+            raise NotImplementedError(f"Pipe algo {self.pipe_algo} not implemented please select none|gpipe|1f1b-1|1f1b-2")
  
         dist.barrier()
         return losses
@@ -236,8 +250,8 @@ class Model:
     def update(self):
         with nvtx_profile(f"Rank {dist.get_rank()} Update"):
             for layer, s in zip(self.sub_layers, self.streams):
-                with torch.cuda.stream(s):
-                    layer.update()
+                #with torch.cuda.stream(s):
+                layer.update()
         dist.barrier()
     
     def multi_stage(self, _bool):
@@ -262,8 +276,9 @@ class Model:
         pass
 
     def to(self, arg):
+        raise NotImplementedError("To not supported yet")
         for layer in self.layers:
-            layer.to(arg)
+            layer.to_(arg)
     
     def get_num_params(self):
         tensor_sizes = []
@@ -275,22 +290,25 @@ class Model:
 
     
 class Transformer(Model):
-    def __init__(self, dim_size, num_heads, num_kv_heads, max_seqlen, num_blocks, vocab_size, criterion, pipe_algo="none", device="cuda"):
+    def __init__(self, dim_size, num_heads, num_kv_heads, max_seqlen, num_blocks, vocab_size, criterion, pipe_algo="none", device="cuda", dtype=torch.float32):
         super().__init__()
         self.block_kwargs = {
             "dim": dim_size,
             "num_heads": num_heads, 
             "num_kv_heads": num_kv_heads, 
             "max_seqlen": max_seqlen, 
-            "device": device
+            "device": device,
+            "dtype": dtype
             }
         self.embedding_kwargs ={
             "num_embeddings": vocab_size,
             "dim": dim_size, 
-            "device": device
+            "device": device,
+            "dtype": dtype
         }
         self.num_blocks = num_blocks
         self.device = device
+        self.dtype = dtype
         self.criterion = criterion
         self.pipe_algo = pipe_algo
         
@@ -307,8 +325,8 @@ class Transformer(Model):
             self.layers.insert(0, layers.Embeddings(**self.embedding_kwargs))
             self.layers[0].init_params()
         if dist.get_rank() == dist.get_world_size() - 1:
-            self.layers.append(layers.NLPRMSNorm(-1, self.block_kwargs["dim"], device=self.block_kwargs["device"]))
-            self.layers.append(layers.Dense(self.block_kwargs["dim"], self.embedding_kwargs["num_embeddings"], bias=False, device=self.block_kwargs["device"]))
+            self.layers.append(layers.NLPRMSNorm(-1, self.block_kwargs["dim"], device=self.block_kwargs["device"], dtype=self.dtype))
+            self.layers.append(layers.Dense(self.block_kwargs["dim"], self.embedding_kwargs["num_embeddings"], bias=False, device=self.device, dtype=self.dtype))
             self.layers[-1].init_params()
             self.layers[-2].init_params()
         
@@ -319,7 +337,7 @@ class Transformer(Model):
         else:
             mb_size = (gbs,)
 
-        self.f_recv_buffer = torch.zeros(mb_size + input_shape, device=self.device)
+        self.f_recv_buffer = torch.zeros(mb_size + input_shape, device=self.device, dtype=self.dtype)
         self.b_recv_buffer = self.f_recv_buffer
 
         self.sub_layers = []
@@ -329,27 +347,98 @@ class Transformer(Model):
         self.streams = [torch.cuda.Stream() for _ in self.sub_layers]
         torch.cuda.synchronize()
             
-            
+class Mamba(Model):
+    def __init__(self, d_model, d_state=16, d_conv=4, expand=2, dt_rank="auto", dt_min=0.001, dt_max=0.1, dt_init="random", dt_scale=1.0, dt_init_floor=1e-4, bias=False,
+                 vocab_size=32000, num_blocks=1, criterion=lambda:0, pipe_algo="none", device="cuda", dtype=torch.float32):
+        super().__init__()
+        self.block_kwargs = {
+            "d_model": d_model,
+            "d_state": d_state, 
+            "d_conv": d_conv,
+            "expand": expand,
+            "dt_rank": dt_rank,
+            "dt_min": dt_min,
+            "dt_max": dt_max,
+            "dt_init": dt_init,
+            "dt_scale": dt_scale,
+            "dt_init_floor": dt_init_floor,
+            "layer_idx": 0,
+            "bias": bias,
+            "device": device,
+            "dtype": dtype
+            }
+        self.embedding_kwargs = {
+            "num_embeddings": vocab_size,
+            "dim": d_model, 
+            "device": device,
+            "dtype": dtype
+        }
+        self.num_blocks = num_blocks
+        self.device = device
+        self.dtype = dtype
+        self.criterion = criterion
+        self.pipe_algo = pipe_algo
+        
+    
+    def init_params(self, gbs, input_shape):
+        self.layers = []
+        num_local_blocks = self.num_blocks // dist.get_world_size()
+        for i in range(num_local_blocks):
+            self.block_kwargs["layer_idx"] = i + num_local_blocks*dist.get_rank()
+            layer = layers.MambaBlock(**self.block_kwargs)
+            layer.init_params()
+            self.layers.append(layer)
+        
+        if dist.get_rank() == 0:
+            self.layers.insert(0, layers.Embeddings(**self.embedding_kwargs))
+            self.layers[0].init_params()
+        if dist.get_rank() == dist.get_world_size() - 1:
+            self.layers.append(layers.NLPRMSNorm(-1, self.block_kwargs["d_model"], device=self.block_kwargs["device"], dtype=self.dtype))
+            self.layers.append(layers.Dense(self.block_kwargs["d_model"], self.embedding_kwargs["num_embeddings"], bias=False, device=self.block_kwargs["device"], dtype=self.dtype))
+            self.layers[-1].init_params()
+            self.layers[-2].init_params()
+        
+        if self.pipe_algo in ("gpipe", "1f1b-1"):
+            mb_size = (gbs // dist.get_world_size(),)
+        elif self.pipe_algo == "1f1b-2":
+            mb_size = (gbs // (dist.get_world_size() * 2),)
+        else:
+            mb_size = (gbs,)
 
-class ResNet50(Model):
-    def __init__(self, num_classes, device):
+        self.f_recv_buffer = torch.zeros(mb_size + input_shape, device=self.device, dtype=self.dtype)
+        self.b_recv_buffer = self.f_recv_buffer
+
+        self.sub_layers = []
+        for layer in self.layers:
+            layer._get_model_sub_layers(self.sub_layers)
+        
+        self.streams = [torch.cuda.Stream() for _ in self.sub_layers]
+        torch.cuda.synchronize()
+
+
+
+class ResNet152(Model):
+    def __init__(self, num_classes, criterion=lambda:0, pipe_algo="none", device="cuda", dtype=torch.float32):
         super().__init__()
         self.num_classes = num_classes
+        self.criterion = criterion
+        self.pipe_algo = pipe_algo
         self.device = device
-    
+        self.dtype = dtype
+
     def init_params(self, gmbs):
-        model = layers.ResNet(layers.ResNetBottleneck, [3,4,6,3], device=self.device)
+        model = layers.ResNet(layers.ResNetBottleneck, [3, 8, 36, 3], device=self.device, dtype=self.dtype)
         self.layers = []
-        self.layers.append(layers.Conv2D(3, 64, 3, stride=1, padding=1, bias=False, device=self.device))
-        self.layers.append(layers.BatchNorm2D(64, device=self.device))
+        self.layers.append(layers.Conv2D(3, 64, 3, stride=1, padding=1, bias=False, device=self.device, dtype=self.dtype))
+        self.layers.append(layers.BatchNorm2D(64, device=self.device, dtype=self.dtype))
         self.layers.append(layers.ReLU())
         self.layers += model._make_layer(layers.ResNetBottleneck, 64, 3, stride=1).layers
-        self.layers += model._make_layer(layers.ResNetBottleneck, 128, 4, stride=2).layers
-        self.layers += model._make_layer(layers.ResNetBottleneck, 256, 6, stride=2).layers
+        self.layers += model._make_layer(layers.ResNetBottleneck, 128, 8, stride=2).layers
+        self.layers += model._make_layer(layers.ResNetBottleneck, 256, 36, stride=2).layers
         self.layers += model._make_layer(layers.ResNetBottleneck, 512, 3, stride=2).layers
         self.layers.append(layers.AvgPool2D(28))
         self.layers.append(layers.Flatten())
-        self.layers.append(layers.Dense(512*layers.ResNetBottleneck.expansion, self.num_classes, device=self.device))
+        self.layers.append(layers.Dense(512*layers.ResNetBottleneck.expansion, self.num_classes, device=self.device, dtype=self.dtype))
         
         chunk_size, remainder = divmod(len(self.layers), dist.get_world_size())
         self.layers = [self.layers[i * chunk_size + min(i, remainder):(i + 1) * chunk_size + min(i + 1, remainder)] for i in range(dist.get_world_size())][dist.get_rank()]
@@ -368,19 +457,19 @@ class ResNet50(Model):
             x = torch.ones(gmbs, 3, 224, 224, device=self.device)
             for layer in self.layers:
                 x = layer(x)
-            self.b_recv_buffer = torch.zeros_like(x, device=x.device)
+            self.b_recv_buffer = torch.zeros_like(x)
             dist.send(torch.tensor(x.shape, device=x.device), dist.get_rank()+1)
         
         elif dist.get_rank() == dist.get_world_size()-1:
             temp_buffer = torch.zeros([4], device=self.device, dtype=torch.int64)
             dist.recv(temp_buffer, dist.get_rank()-1)
-            self.f_recv_buffer = torch.zeros(*temp_buffer, device=self.device)
+            self.f_recv_buffer = torch.zeros(*temp_buffer, device=self.device, dtype=self.dtype)
         
         else:
             temp_buffer = torch.zeros([4], device=self.device, dtype=torch.int64)
             dist.recv(temp_buffer, dist.get_rank()-1)
-            self.f_recv_buffer = torch.zeros(*temp_buffer, device=self.device)
-            x = torch.ones(*temp_buffer, device=self.device)
+            self.f_recv_buffer = torch.zeros(*temp_buffer, device=self.device, dtype=self.dtype)
+            x = torch.ones(*temp_buffer, device=self.device, dtype=self.dtype)
             for layer in self.layers:
                 x = layer(x)
             self.b_recv_buffer = torch.zeros_like(x)
@@ -391,7 +480,6 @@ class ResNet50(Model):
         dist.barrier()
         torch.cuda.synchronize()
         #print(f"Rank {dist.get_rank()}: {self.f_recv_buffer.shape if hasattr(self, 'f_recv_buffer') else ''}, {self.b_recv_buffer.shape if hasattr(self, 'b_recv_buffer') else ''}")
-        print(self.layers)
     
 class BertBase(Model):
     def __init__(self, device):
@@ -442,11 +530,6 @@ class BertLarge(Model):
         
         self.streams = [torch.cuda.Stream() for _ in self.sub_layers]
         torch.cuda.synchronize()
-    
-        
-        
-class Unet(Model):
-    
             
             
         

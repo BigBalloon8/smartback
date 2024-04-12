@@ -1,4 +1,3 @@
-import docker
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 import click
@@ -6,10 +5,12 @@ import time
 import yaml
 import json
 import re
+import os
 
 @click.command()
-@click.option("--pod_yaml", type=str)
+@click.option("--pod_yaml", "-p", default="/home/eidf095/eidf095/crae-ml/smartback/my_pod.yaml", type=str)
 def main(pod_yaml):
+    os.system("cd /home/eidf095/eidf095/crae-ml/smartback/; sudo docker build -t=bigballoon8/custom-backprop:latest .; sudo docker push bigballoon8/custom-backprop")
     try:
         namespace = "eidf095ns"
         config.load_kube_config()
@@ -20,23 +21,7 @@ def main(pod_yaml):
 
         base_pod_name = pod_def["metadata"]["generateName"]
 
-        while True:
-            try:
-                v1.create_namespaced_pod(body=pod_def, namespace=namespace)
-            except ApiException as e:
-                body = json.loads(e.body)["message"]
-                if "exceeded quota:" in body:
-                    if "gpu" not in body:
-                        raise ValueError(f"Quota Exceeded See: {e.body}")
-                    num_gpus = pod_def["spec"]["containers"][0]["resources"]["limits"]["nvidia.com/gpu"]
-                    limit = re.search(r'limited: requests.nvidia.com/gpu=(\d+)', body)
-                    if num_gpus > int(limit).group(1):
-                        raise ValueError(f"Requested {num_gpus} GPU, namespace limited to {limit} GPUs")
-                    print("Maximum Quota Resources In Use Trying Again In 60s")
-                    time.sleep(60)
-                    continue
-            break
-                
+        v1.create_namespaced_pod(body=pod_def, namespace=namespace)                
 
         pods = v1.list_namespaced_pod(namespace)
         pod_names = [pod.metadata.name for pod in pods.items]
@@ -72,6 +57,14 @@ def main(pod_yaml):
 
         time.sleep(4)
 
+        try:
+            pod_log = v1.read_namespaced_pod_log(name=pod_name, namespace=namespace)
+            if pod_log[start_idx:]:
+                click.echo(pod_log[start_idx:])
+                start_idx = len(pod_log)
+        except ApiException:
+            pass
+
         pod_log = v1.read_namespaced_pod_log(name=pod_name, namespace=namespace)
         click.echo(pod_log[start_idx:])
 
@@ -81,7 +74,7 @@ def main(pod_yaml):
             for pod_name in pod_names:
                 if base_pod_name in pod_name:
                     pod = pod_name
-                    print(f"Reframe Found Pod:{pod}")
+                    print(f"Found Pod: {pod}")
                     break
             else:
                 raise KeyboardInterrupt()

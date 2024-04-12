@@ -18,10 +18,10 @@ import init_params
 
 @contextmanager
 def nvtx_profile(name):
-    torch.cuda.synchronize()
+    #torch.cuda.synchronize()
     torch.cuda.nvtx.range_push(name)
     yield
-    torch.cuda.synchronize()
+    #torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
 
 class Layer(ABC):
@@ -46,7 +46,7 @@ class Layer(ABC):
     def backward_p1(self):
         pass
     
-    def backward_p2(self, step=0):
+    def backward_p2(self, inter=False):
         #p2 is for calculating param grads if theres no params can just pass
         pass
 
@@ -158,7 +158,7 @@ class Activation(Layer):
     Used for Activation functions that dont have parameters
     """
 
-    def backward_p2(self):
+    def backward_p2(self, inter=False):
         pass
 
 class Sequential:
@@ -189,15 +189,15 @@ class Sequential:
             x = layer.forward(x)
         return x
     
-    def backward_p1(self, dL_dout: torch.Tensor, step=0):
+    def backward_p1(self, dL_dout: torch.Tensor):
         for layer in self.layers[::-1]:
-            dL_dout = layer.backward_p1(dL_dout, step)
+            dL_dout = layer.backward_p1(dL_dout)
         return dL_dout
     
 
 
 class Dense(Layer):
-    def __init__(self, input_size: int, output_size: int, bias: bool = True, device:str = "cuda"):
+    def __init__(self, input_size: int, output_size: int, bias: bool = True, device:str = "cuda", dtype=torch.float32):
         """
         Initialize a Dense Layer
 
@@ -221,10 +221,11 @@ class Dense(Layer):
         self.output_size = output_size
         self.bias_ = bias
         self.device = device
+        self.dtype = dtype
     
     @expose_params({"weights": "weights_g", "bias": "bias_g"}, ["inputs", "dL_dout"])
     def init_params(self):
-        self.weights, self.bias = init_params(self.input_size, self.output_size, self.bias_, {"device":self.device})
+        self.weights, self.bias = init_params.dense_params(self.input_size, self.output_size, self.bias_, {"device":self.device, "dtype":self.dtype})
         
         self.weights_g = torch.zeros_like(self.weights, device=self.device)
         self.bias_g = torch.zeros_like(self.bias, device=self.device) if self.bias_ else None
@@ -251,7 +252,7 @@ class Dense(Layer):
         return out
     
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout: torch.Tensor, step=0):
+    def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the dense layers output and returns the derivative of the loss with respect to the dense layers input
 
@@ -265,16 +266,16 @@ class Dense(Layer):
         return vmap(lambda dl_dout: torch.matmul(dl_dout, self.weights.T))(dL_dout)
     
     @cleanup_act("dL_dout", "inputs")
-    def backward_p2(self, step=0):
+    def backward_p2(self, inter=False):
         """
         Calculates the gradients of the dense layer's parameters
         """
-        if self.multi_stage:
-            dL_dout = torch.cat(self.dL_dout)
-            inputs = torch.cat(self.inputs)
+        if self.multi_stage and not inter:
+            dL_dout = torch.cat(self.dL_dout, dim=0)
+            inputs = torch.cat(self.inputs, dim=0)
         else:
             dL_dout = self.dL_dout.pop(0)
-            inputs = self.inputs.pop(step)
+            inputs = self.inputs.pop(0)
 
         if dL_dout.ndim == 2:
             self.weights_g[:] += torch.sum(
@@ -289,14 +290,11 @@ class Dense(Layer):
                     dL_dout
                 ),
             dim=tuple(range(dL_dout.ndim)[:-2]))
-        else:
-            raise Exception("ndim of input to Dense not supported")
-        #self.inputs = None
         
         if self.bias is not None:
             self.bias_g[:] += torch.sum(dL_dout, dim=tuple(range(dL_dout.ndim)[:-1]))
-        
-        #self.dL_dout = None
+            
+            #self.dL_dout = None
 
 
 class ReLU(Activation):
@@ -321,7 +319,7 @@ class ReLU(Activation):
         return out
     
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout: torch.Tensor, step=0):
+    def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the relus output and returns the derivative of the loss with respect to the relus input
 
@@ -331,7 +329,7 @@ class ReLU(Activation):
         Returns:
             torch.Tensor: Derivative of the loss with respect to the dense layers input
         """
-        dout_din = torch.where(self.inputs.pop(step)>0, 1.0, 0.0)
+        dout_din = torch.where(self.inputs.pop(0)>0, 1.0, 0.0)
         return dL_dout*dout_din
 
 class GeLU(Activation):
@@ -345,9 +343,9 @@ class GeLU(Activation):
         return x * 0.5 * (1 + torch.erf(x/((2)**(0.5))))
 
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout, step=0):
+    def backward_p1(self, dL_dout):
         #TODO clean this up 
-        input_at_ps = self.inputs.pop(step)
+        input_at_ps = self.inputs.pop(0)
         return dL_dout * (0.5 * (1 + torch.erf(input_at_ps/((2)**(0.5)))) + (input_at_ps)/torch.sqrt(torch.pi) * torch.exp(-torch.pow(input_at_ps, 2)))
 
 class Dropout(Layer):
@@ -385,12 +383,13 @@ class Dropout(Layer):
         if self.p==1:
             self.p_masks.append(torch.ones_like(x, device=x.device))
             return torch.zeros_like(x)
-        p_mask = torch.bernoulli(torch.ones_like(x, device=x.device) -self.p)
+        with torch.no_grad():
+            p_mask = torch.bernoulli(torch.ones_like(x, device=x.device) -self.p)
         self.p_masks.append(p_mask)
         return x*p_mask
     
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout: torch.Tensor, step=0):
+    def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the dropouts output and returns the derivative of the loss with respect to the dropouts input
 
@@ -404,19 +403,20 @@ class Dropout(Layer):
             return dL_dout
         if self.p==1:
             return torch.zeros_like(dL_dout)
-        return dL_dout*self.p_masks.pop(step)
+        return dL_dout*self.p_masks.pop(0)
 
 
 class Embeddings(Layer):
-    def __init__(self, num_embeddings, dim, device):
+    def __init__(self, num_embeddings, dim, device, dtype=torch.float32):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.dim = dim
         self.device = device
+        self.dtype = dtype
     
     @expose_params({"weights": "weights_g"}, ["inputs", "dL_dout"])
     def init_params(self):
-        self.weights = init_params.embedding_params(self.num_embeddings, self.dim, {"device": self.device})
+        self.weights = init_params.embedding_params(self.num_embeddings, self.dim, {"device": self.device, "dtype":self.dtype})
         self.weights_g = torch.zeros_like(self.weights, device=self.device)
         self.inputs = []
         self.dL_dout = []
@@ -426,47 +426,51 @@ class Embeddings(Layer):
         return self.weights[x]
     
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout, step=0):
+    def backward_p1(self, dL_dout):
         # Embedding is the first operation so doesnt need a backward pass
         self.dL_dout.append(dL_dout)
         pass
     
     @cleanup_act("dL_dout", "inputs")
-    def backward_p2(self, step=0):
-        if self.multi_stage:
-            dL_dout = torch.cat(self.dL_dout)
-            inputs = torch.cat(self.inputs)
-        else:
+    def backward_p2(self, inter=False):
+        n = len(self.dL_dout) if not inter else 1
+        for _ in range(n):
             dL_dout = self.dL_dout.pop(0)
-            inputs = self.inputs.pop(step)
-        self.weights_g[inputs] += dL_dout
+            inputs = self.inputs.pop(0)
+            self.weights_g[inputs] += dL_dout
 
 
 class Softmax(Activation):
     @expose_params(acts=["out"])
-    def __init__(self):
+    def __init__(self, n_dims=4):
         super().__init__()
         self.out = []
+
+        @torch.jit.script
+        def _per_input_backpass(dldout, s):
+            m = s*dldout
+            return m - s*torch.sum(m, dim=-1, keepdim=True)
+            return s * (dldout - torch.sum(s*dldout, dim=-1, keepdim=True))
+        
+        self.back_fn = _per_input_backpass
+        #for _ in range(n_dims-1):
+            #self.back_fn = vmap(self.back_fn)
 
     def forward(self, x):
         out = torch.softmax(x, dim=-1)
         self.out.append(out)
         return out
     
-    def backward_p1(self, dL_dout:torch.Tensor, step=0):
-        @torch.jit.script
-        def _per_input_backpass(dldout, s):
-            return s * (dldout - torch.sum(s*dldout, dim=-1, keepdim=True))
-        func = _per_input_backpass
-        for _ in range(len(dL_dout.shape)-1):
-            func = vmap(func)
-        return func(dL_dout, self.out.pop(step))
+    
+    
+    def backward_p1(self, dL_dout:torch.Tensor):
+        return self.back_fn(dL_dout, self.out.pop(0))
     
 
 
 class MultiHeadAttention(Layer):
     #TODO self is the first layer in the model you can cache the linear outputs of the first 3 linears
-    def __init__(self, emb_dim: int, num_heads: int, p: Optional[float]=0.1, device="cuda"):
+    def __init__(self, emb_dim: int, num_heads: int, p: Optional[float]=0.1, device="cuda", dtype=torch.float32):
         """
         Initializes the multihead attention
 
@@ -503,13 +507,14 @@ class MultiHeadAttention(Layer):
         self.softmax_func = Softmax()
         
         self.device = device
+        self.dtype = dtype  
 
     @expose_params(acts=["lQ", "lK", "lV", "sQK_T"])
     def init_params(self):
-        self.linears = {"Q": Dense(self.emb_dim, self.emb_dim, device=self.device),
-                        "K": Dense(self.emb_dim, self.emb_dim, device=self.device),
-                        "V": Dense(self.emb_dim, self.emb_dim, device=self.device),
-                        "O": Dense(self.emb_dim, self.emb_dim, device=self.device)
+        self.linears = {"Q": Dense(self.emb_dim, self.emb_dim, device=self.device, dtype=self.dtype),
+                        "K": Dense(self.emb_dim, self.emb_dim, device=self.device, dtype=self.dtype),
+                        "V": Dense(self.emb_dim, self.emb_dim, device=self.device, dtype=self.dtype),
+                        "O": Dense(self.emb_dim, self.emb_dim, device=self.device, dtype=self.dtype)
                         }
         for l in self.linears.values():
             l.init_params()
@@ -566,7 +571,7 @@ class MultiHeadAttention(Layer):
 
     
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout: torch.Tensor, step=0):
+    def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the multihead attention output and returns the derivative of the loss with respect to the multihead attention input
 
@@ -576,27 +581,27 @@ class MultiHeadAttention(Layer):
         Returns:
             torch.Tensor: The derivatives of the loss with respect to the multihead attention inputs
         """
-        dL_dAtt = self.linears["O"].backward_p1(dL_dout, step)
+        dL_dAtt = self.linears["O"].backward_p1(dL_dout)
         
         dL_dAtt = torch.cat(dL_dAtt.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         
-        dL_dsQKT = vmap(lambda dl_dout, v: torch.bmm(dl_dout, torch.transpose(v, -1,-2)), in_dims=-2, out_dims=-2)(dL_dAtt, self.lV.pop(step))
+        dL_dsQKT = vmap(lambda dl_dout, v: torch.bmm(dl_dout, torch.transpose(v, -1,-2)), in_dims=-2, out_dims=-2)(dL_dAtt, self.lV.pop(0))
         #self.lV = None
         
         # vmap across 3 dims BxCxH 
-        dL_dQKT = self.softmax_func.backward_p1(dL_dsQKT, step)* self.inv_sqrt_d
+        dL_dQKT = self.softmax_func.backward_p1(dL_dsQKT)* self.inv_sqrt_d
         
         # TODO verifiy this section
-        dL_dlQ = vmap(lambda dl_dqkt, k: torch.bmm(dl_dqkt, k), in_dims=-2, out_dims=-2)(dL_dQKT, self.lK.pop(step))  # k.T not necessary as its k.T.T
+        dL_dlQ = vmap(lambda dl_dqkt, k: torch.bmm(dl_dqkt, k), in_dims=-2, out_dims=-2)(dL_dQKT, self.lK.pop(0))  # k.T not necessary as its k.T.T
         #self.lK = None
-        dL_dlKT = vmap(lambda dl_dqkt, q: torch.bmm(torch.transpose(q, -1,-2), dl_dqkt), in_dims=-2, out_dims=-2)(dL_dQKT, self.lQ.pop(step))  
+        dL_dlKT = vmap(lambda dl_dqkt, q: torch.bmm(torch.transpose(q, -1,-2), dl_dqkt), in_dims=-2, out_dims=-2)(dL_dQKT, self.lQ.pop(0))  
         #self.lQ = None
-        dL_dlV = vmap(lambda dl_datt, sqkt: torch.bmm(torch.transpose(sqkt, -2, -1), dl_datt), in_dims=-2, out_dims=-2)(dL_dAtt, self.sQK_T.pop(step)) 
+        dL_dlV = vmap(lambda dl_datt, sqkt: torch.bmm(torch.transpose(sqkt, -2, -1), dl_datt), in_dims=-2, out_dims=-2)(dL_dAtt, self.sQK_T.pop(0)) 
         #self.sQK_T = None
         
-        dL_dQ = self.linears["Q"].backward_p1(self.dropouts["Q"].backward_p1(torch.flatten(dL_dlQ, -2, -1), step), step)
-        dL_dK = self.linears["K"].backward_p1(self.dropouts["K"].backward_p1(torch.flatten(torch.vmap(lambda dl_dlkt: torch.transpose(dl_dlkt, -1, -2), in_dims=-2, out_dims=-2)(dL_dlKT), -2, -1), step), step)
-        dL_dV = self.linears["V"].backward_p1(self.dropouts["V"].backward_p1(torch.flatten(dL_dlV, -2, -1), step), step)
+        dL_dQ = self.linears["Q"].backward_p1(self.dropouts["Q"].backward_p1(torch.flatten(dL_dlQ, -2, -1)))
+        dL_dK = self.linears["K"].backward_p1(self.dropouts["K"].backward_p1(torch.flatten(torch.vmap(lambda dl_dlkt: torch.transpose(dl_dlkt, -1, -2), in_dims=-2, out_dims=-2)(dL_dlKT), -2, -1)))
+        dL_dV = self.linears["V"].backward_p1(self.dropouts["V"].backward_p1(torch.flatten(dL_dlV, -2, -1)))
         
         return dL_dQ, dL_dK, dL_dV
              
@@ -604,7 +609,7 @@ class MultiHeadAttention(Layer):
 
 #TODO will have to update for 3D parallelism (DP)
 class BatchNorm2D(Layer):
-    def __init__(self, in_channels: int, eps: float=1e-05, momentum =0.1, device:str = "cuda"):
+    def __init__(self, in_channels: int, eps: float=1e-05, momentum =0.1, device:str = "cuda", dtype=torch.float32):
         """
         Initializes a BatchNorm2D layer
 
@@ -634,15 +639,16 @@ class BatchNorm2D(Layer):
         self.momentum = momentum
         self.in_channels = in_channels
         self.device = device
+        self.dtype = dtype
         self.training = True
     
     @expose_params({"gamma": "gamma_g", "beta": "beta_g"}, ["x_sub_mean", "var", "norm_x", "dL_dout"])
     def init_params(self):
-        self.gamma = torch.ones(self.in_channels, device=self.device)
-        self.beta = torch.zeros(self.in_channels, device=self.device)
+        self.gamma = torch.ones(self.in_channels, device=self.device, dtype=self.dtype)
+        self.beta = torch.zeros(self.in_channels, device=self.device, dtype=self.dtype)
         
-        self.gamma_g = torch.zeros(self.in_channels, device=self.device)
-        self.beta_g = torch.zeros(self.in_channels, device=self.device)
+        self.gamma_g = torch.zeros_like(self.gamma)
+        self.beta_g = torch.zeros_like(self.beta)
         
         self.r_mean = torch.zeros(1, self.in_channels, 1, 1, device=self.device)
         self.r_var = torch.ones(1, self.in_channels, 1, 1, device=self.device)
@@ -680,7 +686,7 @@ class BatchNorm2D(Layer):
         return out
     
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout: torch.Tensor, step=0):
+    def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the BatchNorm2D output and returns the derivative of the loss with respect to the BatchNorm2D input
 
@@ -697,30 +703,28 @@ class BatchNorm2D(Layer):
         B = in_shape[0]*in_shape[2]*in_shape[3]
         
         dL_dxnorm = dL_dout * self.gamma.view(1, -1, 1, 1)
-        x_s_m = self.x_sub_mean.pop(step)
-        v = self.var.pop(step)
+        x_s_m = self.x_sub_mean.pop(0)
+        v = self.var.pop(0)
         dL_dvar = (-0.5 * dL_dxnorm * (x_s_m)).sum((0, 2, 3), keepdim=True)  * ((v) ** -1.5)
         dL_dmean = (-1.0 / torch.sqrt(v) * dL_dxnorm).sum((0, 2, 3), keepdim=True) + (dL_dvar * (-2.0 * (x_s_m)).sum((0, 2, 3), keepdim=True) / B)
         return (dL_dxnorm / torch.sqrt(v)) + (2.0 * dL_dvar * (x_s_m) / B) + (dL_dmean / B)
     
         
     @cleanup_act("dL_dout", "norm_x")
-    def backward_p2(self, step=0):
+    def backward_p2(self, inter=False):
         """
         Calculates the gradients of the parameters in the BatchNorm2D
         """
-        if self.multi_stage:
-            dL_dout = torch.cat(self.dL_dout)
-            norm_x = torch.cat(self.norm_x)
-        else:
+        n = len(self.dL_dout) if not inter else 1
+        for _ in range(n):
             dL_dout = self.dL_dout.pop(0)
-            norm_x = self.norm_x.pop(step)
-        self.gamma_g[:] += torch.sum(dL_dout*norm_x, dim=[0,2,3])
-        self.beta_g[:] += torch.sum(dL_dout, dim=[0,2,3])
+            norm_x = self.norm_x.pop(0)
+            self.gamma_g[:] += torch.sum(dL_dout*norm_x, dim=[0,2,3])
+            self.beta_g[:] += torch.sum(dL_dout, dim=[0,2,3])
         
       
 class NLPLayerNorm(Layer):
-    def __init__(self, dim: int, dim_size: int, eps:Optional[float]=1e-08, device: Optional[str]="cuda"):
+    def __init__(self, dim: int, dim_size: int, eps:Optional[float]=1e-08, device: Optional[str]="cuda", dtype=torch.float32):
         """
         Initializes the NLP Layer Norm
 
@@ -748,14 +752,15 @@ class NLPLayerNorm(Layer):
         self.dim_size = dim_size
         self.eps = eps
         self.device = device
+        self.dtype = dtype
     
     @expose_params({"gamma": "gamma_g", "beta": "beta_g"}, ["x_sub_mean", "var", "norm_x", "dL_dout"])
     def init_params(self):
-        self.gamma = torch.ones(self.dim_size, device=self.device)
-        self.bias = torch.zeros(self.dim_size, device=self.device)
+        self.gamma = torch.ones(self.dim_size, device=self.device, dtype=self.dtype)
+        self.bias = torch.zeros(self.dim_size, device=self.device, dtype=self.dtype)
         
-        self.gamma_g = torch.zeros(self.dim_size, device=self.device)
-        self.bias_g = torch.zeros(self.dim_size, device=self.device)
+        self.gamma_g = torch.zeros_like(self.gamma)
+        self.bias_g = torch.zeros_like(self.bias)
 
         self.x_sub_mean = []
         self.var = []
@@ -784,7 +789,7 @@ class NLPLayerNorm(Layer):
     
 
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout: torch.Tensor, step=0):
+    def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the NLP layer norm output and returns the derivative of the loss with respect to the NLP layer norm input
 
@@ -795,8 +800,8 @@ class NLPLayerNorm(Layer):
             torch.Tensor: The derivatives of the loss with respect to the NLP layer norm inputs
         """
         self.dL_dout.append(dL_dout)
-        x_s_m = self.x_sub_mean.pop(step)
-        v = self.var.pop(step)
+        x_s_m = self.x_sub_mean.pop(0)
+        v = self.var.pop(0)
         
         dx_hat = dL_dout * self.gamma.view(1,1,-1)  
         dL_dvar = torch.sum(dx_hat * x_s_m, dim=-1, keepdim=True) * -.5 * v**(-1.5)
@@ -805,22 +810,20 @@ class NLPLayerNorm(Layer):
         
 
     @cleanup_act("dL_dout", "norm_x")
-    def backward_p2(self, step=0):
+    def backward_p2(self, inter=False):
         """
         Computes the gradients of the parameter in the NLP layer norm
         """
-        if self.multi_stage:
-            dL_dout = torch.cat(self.dL_dout)
-            norm_x = torch.cat(self.norm_x)
-        else:
+        n = len(self.dL_dout) if not inter else 1
+        for _ in range(n):
             dL_dout = self.dL_dout.pop(0)
-            norm_x = self.norm_x.pop(step)
-        self.bias_g[:] += torch.sum(dL_dout, dim=tuple(range(dL_dout.ndim)[:-1]))
-        self.gamma_g[:] += torch.sum(dL_dout*norm_x, dim=tuple(range(dL_dout.ndim)[:-1]))
+            norm_x = self.norm_x.pop(0)
+            self.bias_g[:] += torch.sum(dL_dout, dim=tuple(range(dL_dout.ndim)[:-1]))
+            self.gamma_g[:] += torch.sum(dL_dout*norm_x, dim=tuple(range(dL_dout.ndim)[:-1]))
       
         
 class NLPRMSNorm(Layer):
-    def __init__(self, dim: int, dim_size: int, eps: float= 1e-08, device: Optional[str]= "cuda"):
+    def __init__(self, dim: int, dim_size: int, eps: float= 1e-08, device: Optional[str]= "cuda", dtype=torch.float32):
         """
         Initializes the NLP RMS Norm
 
@@ -847,11 +850,19 @@ class NLPRMSNorm(Layer):
         self.dim_size = dim_size
         self.eps = eps
         self.device = device
+        self.dtype = dtype
+        
+        @torch.jit.script
+        def _per_input_backpass(dldout, irms, z):
+            n = dldout.size(-1)
+            return irms*((-z/n) * torch.sum(dldout*z, dim=-1, keepdim=True) + dldout)
+    
+        self.back_fn = _per_input_backpass
     
     @expose_params({"weights": "weights_g"}, ["IRMS",  "rms_norm_x", "rms_norm_x_p2", "dL_dout"])
     def init_params(self):
-        self.weights = torch.ones(self.dim_size, device=self.device)
-        self.weights_g = torch.zeros(self.dim_size, device=self.device)
+        self.weights = torch.ones(self.dim_size, device=self.device, dtype=self.dtype)
+        self.weights_g = torch.zeros_like(self.weights)
 
         self.IRMS = []
         self.rms_norm_x = []
@@ -876,7 +887,7 @@ class NLPRMSNorm(Layer):
         return rms_norm_x*self.weights
 
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout: torch.Tensor, step=0):
+    def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the NLP RMS norm output and returns the derivative of the loss with respect to the NLP RMS norm input
 
@@ -886,21 +897,19 @@ class NLPRMSNorm(Layer):
         Returns:
             torch.Tensor: The derivatives of the loss with respect to the NLP RMS norm inputs
         """
-        @torch.jit.script
-        def _per_input_backpass(dldout, irms, z, n):
-            return irms*((-z/n) * sum(dldout*z) + dldout)
 
         self.dL_dout.append(dL_dout)
-        rms_norm_x = self.rms_norm_x.pop(step)
+        rms_norm_x = self.rms_norm_x.pop(0)
         self.rms_norm_x_p2.append(rms_norm_x)
-        return vmap(vmap(_per_input_backpass))(dL_dout, self.IRMS.pop(0), rms_norm_x, n=torch.tensor(rms_norm_x.size(-1)))
+        return self.back_fn(dL_dout, self.IRMS.pop(0), rms_norm_x)
     
     @cleanup_act("dL_dout", "rms_norm_x_p2")
-    def backward_p2(self, step=0):
+    def backward_p2(self, inter=False):
         """
         Computes the gradients of the parameter in the NLP layer norm
         """
-        if self.multi_stage:
+        #for _ in range(len(self.dL_dout)):
+        if self.multi_stage and not inter:
             dL_dout = torch.cat(self.dL_dout)
             rms_norm_x = torch.cat(self.rms_norm_x_p2)
         else:
@@ -910,17 +919,18 @@ class NLPRMSNorm(Layer):
 
 
 class BertEmbeddings(Layer):
-    def __init__(self, dim, vocab_size, seq_len, device="cuda"):
+    def __init__(self, dim, vocab_size, seq_len, device="cuda", dtype=torch.float32):
         super().__init__()
         self.dim = dim
         self.vocab_size = vocab_size
         self.seq_len = seq_len
         self.device = device
+        self.dtype = dtype
     
     def init_params(self):
-        self.token_emb = Embeddings(self.vocab_size, self.dim, device=self.device)
-        self.segmnet_emb = Embeddings(2, self.dim, device=self.device)
-        self.pos_emb = torch.zeros(self.seq_len, self.dim, device=self.device)
+        self.token_emb = Embeddings(self.vocab_size, self.dim, device=self.device, dtype=self.dtype)
+        self.segmnet_emb = Embeddings(2, self.dim, device=self.device, dtype=self.dtype)
+        self.pos_emb = torch.zeros(self.seq_len, self.dim, device=self.device, dtype=self.dtype)
         
         for pos in range(self.seq_len):
             for i in range(0, self.dim, 2):
@@ -935,16 +945,16 @@ class BertEmbeddings(Layer):
         x = self.token_emb(x) + self.segmnet_emb(seg_mask) + self.pos_emb[:,:x.size(-1)]
         return self.norm(x)
 
-    def backward_p1(self, dL_dout, step=0):
-        dL_dout = self.norm.backward_p1(dL_dout, step)
-        self.token_emb.backward_p1(dL_dout, step)
-        self.segmnet_emb.backward_p1(dL_dout, step)
+    def backward_p1(self, dL_dout):
+        dL_dout = self.norm.backward_p1(dL_dout)
+        self.token_emb.backward_p1(dL_dout)
+        self.segmnet_emb.backward_p1(dL_dout)
         return dL_dout
         
         
         
 class BertBlock(Layer):
-    def __init__(self, emb_dim: int, num_heads: int, dim_ff:int, activation:Layer=ReLU, eps:float=1e-08, p:float=0.1, device = "cuda"):
+    def __init__(self, emb_dim: int, num_heads: int, dim_ff:int, activation:Layer=ReLU, eps:float=1e-08, p:float=0.1, device = "cuda", dtype=torch.float32):
         """
         Initialize BERT block
 
@@ -974,17 +984,18 @@ class BertBlock(Layer):
         self.eps = eps
         self.p = p
         self.device = device
+        self.dtype = dtype
     
     def init_params(self):
-        self.multihead = MultiHeadAttention(emb_dim=self.emb_dim, num_heads=self.num_heads, device=self.device)
+        self.multihead = MultiHeadAttention(emb_dim=self.emb_dim, num_heads=self.num_heads, device=self.device, dtype=self.dtype)
         self.multihead.init_params()
-        self.linears = {0: Dense(self.emb_dim, self.dim_ff, device=self.device),
-                        1: Dense(self.dim_ff, self.emb_dim, device=self.device)}
+        self.linears = {0: Dense(self.emb_dim, self.dim_ff, device=self.device, dtype=self.dtype),
+                        1: Dense(self.dim_ff, self.emb_dim, device=self.device, dtype=self.dtype)}
         for l in self.linears.values():
             l.init_params()
         self.ff_act: Activation = self.activation()
-        self.norms = {"multi_head": NLPRMSNorm(-1, self.emb_dim, eps=self.eps, device=self.device),
-                      "ff": NLPRMSNorm(-1, self.emb_dim, eps=self.eps, device=self.device)}
+        self.norms = {"multi_head": NLPRMSNorm(-1, self.emb_dim, eps=self.eps, device=self.device, dtype=self.dtype),
+                      "ff": NLPRMSNorm(-1, self.emb_dim, eps=self.eps, device=self.device, dtype=self.dtype)}
         for n in self.norms.values():
             n.init_params()
         self.dropouts = {"multi_head": Dropout(p=self.p),
@@ -1012,7 +1023,7 @@ class BertBlock(Layer):
     
 
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout:torch.Tensor, step=0):
+    def backward_p1(self, dL_dout:torch.Tensor):
         """
         Takes the derivative of the loss with respect to the BERT block output and returns the derivative of the loss with respect to the BERT block input
 
@@ -1023,15 +1034,15 @@ class BertBlock(Layer):
             torch.Tensor: The derivative of the loss with respect to the BERT block input
 
         """
-        dL_dff2_d = self.norms["ff"].backward_p1(dL_dout, step)
-        dL_dff2 = self.dropouts["ff"].backward_p1(dL_dff2_d, step)
-        dL_da = self.linears[1].backward_p1(dL_dff2, step)
-        dL_dff1 = self.ff_act.backward_p1(dL_da, step)
-        dL_dnormmhout = self.linears[0].backward_p1(dL_dff1, step) + dL_dff2_d
+        dL_dff2_d = self.norms["ff"].backward_p1(dL_dout)
+        dL_dff2 = self.dropouts["ff"].backward_p1(dL_dff2_d)
+        dL_da = self.linears[1].backward_p1(dL_dff2)
+        dL_dff1 = self.ff_act.backward_p1(dL_da)
+        dL_dnormmhout = self.linears[0].backward_p1(dL_dff1) + dL_dff2_d
 
-        dL_dmhout_d = self.norms["multi_head"].backward_p1(dL_dnormmhout, step)
-        dL_dmhout = self.dropouts["multi_head"].backward_p1(dL_dmhout_d, step)
-        dL_din = torch.sum(torch.stack(self.multihead.backward_p1(dL_dmhout, step)),dim=0)
+        dL_dmhout_d = self.norms["multi_head"].backward_p1(dL_dnormmhout)
+        dL_dmhout = self.dropouts["multi_head"].backward_p1(dL_dmhout_d)
+        dL_din = torch.sum(torch.stack(self.multihead.backward_p1(dL_dmhout)),dim=0)
         return dL_din + dL_dmhout_d
 
 
@@ -1045,7 +1056,7 @@ class Flatten(Activation):
 
 
 class Conv2D(Layer):
-    def __init__(self, in_channels: int, out_channels: int, k_size: Union[Sequence[int], int], bias: bool=True,  padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1, device: Optional[str]="cuda"):
+    def __init__(self, in_channels: int, out_channels: int, k_size: Union[Sequence[int], int], bias: bool=True,  padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1, device: Optional[str]="cuda", dtype=torch.float32):
         """
         Initializes Conv2D layer
 
@@ -1080,6 +1091,7 @@ class Conv2D(Layer):
             self.k_size = (k_size, k_size)
         
         self.device = device
+        self.dtype = dtype
         
         if isinstance(padding, bool):
             self.padding = 1 if padding else 0
@@ -1097,11 +1109,11 @@ class Conv2D(Layer):
 
     @expose_params({"kernel":"kernel_g", "bias":"bias_g"}, ["inputs", "dL_dout"])
     def init_params(self):
-        self.kernel, self.bias = init_params.conv2d_params(self.in_channels, self.out_channels, self.k_size, bias=self.bias_, factory_kwargs={"device": self.device})
+        self.kernel, self.bias = init_params.conv2d_params(self.in_channels, self.out_channels, self.k_size, bias=self.bias_, factory_kwargs={"device": self.device, "dtype":self.dtype})
 
-        self.kernel_g = torch.zeros_like(self.kernel, device=self.device)
+        self.kernel_g = torch.zeros_like(self.kernel)
         if self.bias_:
-            self.bias_g = torch.zeros_like(self.bias, device=self.device)
+            self.bias_g = torch.zeros_like(self.bias)
         
         self.inputs = []
         self.dL_dout = []
@@ -1120,7 +1132,7 @@ class Conv2D(Layer):
         return F.conv2d(x, self.kernel, self.bias, stride=self.stride, padding=self.padding)
     
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout: torch.Tensor, step=0):
+    def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the Conv2D Layer's output and returns the derivative of the loss with respect to the Conv2D Layer's input
 
@@ -1135,26 +1147,24 @@ class Conv2D(Layer):
         return dL_din
     
     @cleanup_act("dL_dout", "inputs")
-    def backward_p2(self, step=0):
+    def backward_p2(self, inter=False):
         """
         Computes the gradients of the parameter within the Conv2D layer
         """
-        if self.multi_stage:
-            dL_dout = torch.cat(self.dL_dout)
-            inputs = torch.cat(self.inputs)
-        else:
+        n = len(self.dL_dout) if not inter else 1
+        for _ in range(n):
             dL_dout = self.dL_dout.pop(0)
-            inputs = self.inputs.pop(step)
+            inputs = self.inputs.pop(0)
 
-        if isinstance(self.bias, torch.Tensor):
-            self.bias_g[:] += torch.sum(dL_dout, dim=(0, 2, 3))
+            if isinstance(self.bias, torch.Tensor):
+                self.bias_g[:] += torch.sum(dL_dout, dim=(0, 2, 3))
 
-        def _dL_dk_fn(feature, kernal, stride, padding):
-            new_stride = (stride[0]*kernal.shape[2], stride[1]*kernal.shape[3])
-            out = F.conv2d(feature, kernal, stride=new_stride, padding=padding).squeeze(0)
-            return out
-        # witchcraft (apply a conv between each input and output channel and sum)
-        self.kernel_g[:] += torch.sum(vmap(vmap(vmap(_dL_dk_fn, in_dims=(0, None)), in_dims=(None, 0)))(inputs.unsqueeze(-3), dL_dout.unsqueeze(-3).unsqueeze(-3), stride=self.stride, padding=self.padding),dim=0)
+            def _dL_dk_fn(feature, kernal, stride, padding):
+                new_stride = (stride[0]*kernal.shape[2], stride[1]*kernal.shape[3])
+                out = F.conv2d(feature, kernal, stride=new_stride, padding=padding).squeeze(0)
+                return out
+            # witchcraft (apply a conv between each input and output channel and sum)
+            self.kernel_g[:] += torch.sum(vmap(vmap(vmap(_dL_dk_fn, in_dims=(0, None)), in_dims=(None, 0)))(inputs.unsqueeze(-3), dL_dout.unsqueeze(-3).unsqueeze(-3), stride=self.stride, padding=self.padding),dim=0)
 
 
 class Conv2DTranspose(Layer):
@@ -1208,7 +1218,7 @@ class MaxPool2D(Layer):
         self.indices.append(indices)
         return out
     
-    def backward_p1(self, dL_dout: torch.Tensor, step=0):
+    def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the MaxPool2D Layer's output and returns the derivative of the loss with respect to the MaxPool2D Layer's input
 
@@ -1218,7 +1228,7 @@ class MaxPool2D(Layer):
         Returns:
             torch.Tensor: derivative of the loss with respect to the MaxPool2D Layer's input
         """
-        out = F.max_unpool2d(dL_dout, self.indices.pop(step), kernel_size=self.k_size, stride=self.stride, padding=self.padding)
+        out = F.max_unpool2d(dL_dout, self.indices.pop(0), kernel_size=self.k_size, stride=self.stride, padding=self.padding)
         return out
 
 
@@ -1284,13 +1294,11 @@ class AvgPool2D(Layer):
         dL_dout = F.interpolate(dL_dout, size=intrp_size)
         return dL_dout * (1/(self.k_size[0]*self.k_size[1]))
     
-    def backward_p2(self):
-        pass
 
 
 class BasicResNetBlock(Layer):
     expansion = 1
-    def __init__(self, in_channels: int, out_channels: int, stride: int=1, device: str="cuda"):
+    def __init__(self, in_channels: int, out_channels: int, stride: int=1, device: str="cuda", dtype=torch.float32):
         """
         Initializes a Basic ResNet Block.
 
@@ -1314,22 +1322,23 @@ class BasicResNetBlock(Layer):
         self.stride = stride
         
         self.device = device
+        self.dtype = dtype
     
     def init_params(self):
-        self.convs = [Conv2D(self.in_channels, self.out_channels, 3, stride=self.stride, padding=1, bias=False, device=self.device),
-                      Conv2D(self.out_channels, self.out_channels, 3, stride=1, padding=1, bias=False, device=self.device)
+        self.convs = [Conv2D(self.in_channels, self.out_channels, 3, stride=self.stride, padding=1, bias=False, device=self.device, dtype=self.dtype),
+                      Conv2D(self.out_channels, self.out_channels, 3, stride=1, padding=1, bias=False, device=self.device, dtype=self.dtype)
                       ]
         for c in self.convs:
             c.init_params()
-        self.batchnorms = [BatchNorm2D(self.out_channels, device=self.device),
-                           BatchNorm2D(self.out_channels, device=self.device)
+        self.batchnorms = [BatchNorm2D(self.out_channels, device=self.device, dtype=self.dtype),
+                           BatchNorm2D(self.out_channels, device=self.device, dtype=self.dtype)
                            ]
         for b in self.batchnorms:
             b.init_params()
         self.relus = [ReLU(), ReLU()]
         if self.stride != 1 or self.in_channels != self.out_channels*self.expansion:
-            self.shortcut = [Conv2D(self.in_channels, self.out_channels*self.expansion, 1, stride=self.stride, bias=False, device=self.device),
-                             BatchNorm2D(self.out_channels*self.expansion, device=self.device)
+            self.shortcut = [Conv2D(self.in_channels, self.out_channels*self.expansion, 1, stride=self.stride, bias=False, device=self.device, dtype=self.dtype),
+                             BatchNorm2D(self.out_channels*self.expansion, device=self.device, dtype=self.dtype)
                              ]
             for l in self.shortcut:
                 l.init_params()
@@ -1358,7 +1367,7 @@ class BasicResNetBlock(Layer):
     
 
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout: torch.Tensor, step=0):
+    def backward_p1(self, dL_dout: torch.Tensor):
         """
         Takes the derivative of the loss with respect to the BasicResNetBlock's output and returns the derivative of the loss with respect to the BasicResNetBlock's input
 
@@ -1368,23 +1377,23 @@ class BasicResNetBlock(Layer):
         Returns:
             torch.Tensor: derivative of the loss with respect to the BasicResNetBlock's input
         """
-        dL_dshortcut = self.relus[1].backward_p1(dL_dout, step)
-        dL_dconv1 = self.batchnorms[1].backward_p1(dL_dshortcut, step)
-        dL_drelu0 = self.convs[1].backward_p1(dL_dconv1, step)
-        dL_dbn0 = self.relus[0].backward_p1(dL_drelu0, step)
-        dL_dconv0 = self.batchnorms[0].backward_p1(dL_dbn0, step)
-        dL_din1 = self.convs[0].backward_p1(dL_dconv0, step)
+        dL_dshortcut = self.relus[1].backward_p1(dL_dout)
+        dL_dconv1 = self.batchnorms[1].backward_p1(dL_dshortcut)
+        dL_drelu0 = self.convs[1].backward_p1(dL_dconv1)
+        dL_dbn0 = self.relus[0].backward_p1(dL_drelu0)
+        dL_dconv0 = self.batchnorms[0].backward_p1(dL_dbn0)
+        dL_din1 = self.convs[0].backward_p1(dL_dconv0)
         
         dL_din2 = dL_dshortcut
         for layer in self.shortcut[::-1]:
-            dL_din2 = layer.backward_p1(dL_din2, step)
+            dL_din2 = layer.backward_p1(dL_din2)
         
         return dL_din1 + dL_din2
         
 
 class ResNetBottleneck(Layer):
     expansion = 4
-    def __init__(self, in_channels: int, out_channels: int, stride: int=1, device: str="cuda"):
+    def __init__(self, in_channels: int, out_channels: int, stride: int=1, device: str="cuda", dtype=torch.float32):
         """
         Initializes a Basic ResNet Block.
 
@@ -1408,25 +1417,26 @@ class ResNetBottleneck(Layer):
         self.stride = stride
         
         self.device = device
+        self.dtype = dtype
     
 
     def init_params(self):
-        self.convs = [Conv2D(self.in_channels, self.out_channels, 1, bias=False, device=self.device),
-                      Conv2D(self.out_channels, self.out_channels, 3, stride=self.stride, padding=1, bias=False, device=self.device),
-                      Conv2D(self.out_channels, self.expansion*self.out_channels, 1, bias=False, device=self.device)
+        self.convs = [Conv2D(self.in_channels, self.out_channels, 1, bias=False, device=self.device, dtype=self.dtype),
+                      Conv2D(self.out_channels, self.out_channels, 3, stride=self.stride, padding=1, bias=False, device=self.device, dtype=self.dtype),
+                      Conv2D(self.out_channels, self.expansion*self.out_channels, 1, bias=False, device=self.device, dtype=self.dtype)
                       ]
         for c in self.convs:
             c.init_params()
-        self.batchnorms = [BatchNorm2D(self.out_channels, device=self.device),
-                           BatchNorm2D(self.out_channels, device=self.device),
-                           BatchNorm2D(self.expansion*self.out_channels, device=self.device)
+        self.batchnorms = [BatchNorm2D(self.out_channels, device=self.device, dtype=self.dtype),
+                           BatchNorm2D(self.out_channels, device=self.device, dtype=self.dtype),
+                           BatchNorm2D(self.expansion*self.out_channels, device=self.device, dtype=self.dtype)
                            ]
         for b in self.batchnorms:
             b.init_params()
         self.relus = [ReLU(), ReLU(), ReLU()]
         if self.stride != 1 or self.in_channels != self.out_channels*self.expansion:
-            self.shortcut = [Conv2D(self.in_channels, self.out_channels*self.expansion, 1, stride=self.stride, bias=False, device=self.device),
-                             BatchNorm2D(self.out_channels*self.expansion, device=self.device)
+            self.shortcut = [Conv2D(self.in_channels, self.out_channels*self.expansion, 1, stride=self.stride, bias=False, device=self.device, dtype=self.dtype),
+                             BatchNorm2D(self.out_channels*self.expansion, device=self.device, dtype=self.dtype)
                              ]
             for l in self.shortcut:
                 l.init_params()
@@ -1459,7 +1469,7 @@ class ResNetBottleneck(Layer):
         return self.relus[2](out + x)
     
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout, step=0):
+    def backward_p1(self, dL_dout):
         """
         Takes the derivative of the loss with respect to the ResNetBottleneck's output and returns the derivative of the loss with respect to the ResNetBottleneck's input
 
@@ -1469,19 +1479,19 @@ class ResNetBottleneck(Layer):
         Returns:
             torch.Tensor: derivative of the loss with respect to the ResNetBottleneck's input
         """
-        dL_dshortcut = self.relus[2].backward_p1(dL_dout, step)
-        dL_dconv2 = self.batchnorms[2].backward_p1(dL_dshortcut, step)
-        dL_drelu1 = self.convs[2].backward_p1(dL_dconv2, step)
-        dL_dbn1 = self.relus[1].backward_p1(dL_drelu1, step)
-        dL_dconv1 = self.batchnorms[1].backward_p1(dL_dbn1, step)
-        dL_drelu0 = self.convs[1].backward_p1(dL_dconv1, step)
-        dL_dbn0 = self.relus[0].backward_p1(dL_drelu0, step)
-        dL_dconv0 = self.batchnorms[0].backward_p1(dL_dbn0, step)
-        dL_din1 = self.convs[0].backward_p1(dL_dconv0, step)
+        dL_dshortcut = self.relus[2].backward_p1(dL_dout)
+        dL_dconv2 = self.batchnorms[2].backward_p1(dL_dshortcut)
+        dL_drelu1 = self.convs[2].backward_p1(dL_dconv2)
+        dL_dbn1 = self.relus[1].backward_p1(dL_drelu1)
+        dL_dconv1 = self.batchnorms[1].backward_p1(dL_dbn1)
+        dL_drelu0 = self.convs[1].backward_p1(dL_dconv1)
+        dL_dbn0 = self.relus[0].backward_p1(dL_drelu0)
+        dL_dconv0 = self.batchnorms[0].backward_p1(dL_dbn0)
+        dL_din1 = self.convs[0].backward_p1(dL_dconv0)
         
         dL_din2 = dL_dshortcut
         for layer in self.shortcut[::-1]:
-            dL_din2 = layer.backward_p1(dL_din2, step)
+            dL_din2 = layer.backward_p1(dL_din2)
         
         return dL_din1 + dL_din2
 
@@ -1489,26 +1499,21 @@ class ResNetBottleneck(Layer):
 class ResNet(Layer):
     # For Reference https://github.com/henryqin1997/CIFAR10-ResNet50-PyTorch/blob/master/models/resnet.py
     # Needs to be parallised just for testing
-    def __init__(self, block: Union[BasicResNetBlock , ResNetBottleneck], num_blocks: list, num_classes: int=10, device:str = "cuda"):
+    def __init__(self, block: Union[BasicResNetBlock , ResNetBottleneck], num_blocks: list, num_classes: int=10, device:str = "cuda", dtype=torch.float32):
         super().__init__()
         self.in_planes = 64
 
-        if device == "cuda":
-            self.streams = []
-            self.device = "cuda"
-            for _ in range(3):  # conv1, bn1, dense
-                self.streams.append(torch.cuda.Stream())
-        else:
-            self.device = "cpu"
+        self.device = device
     
         self.block = block
         self.num_blocks = num_blocks
         self.num_classes = num_classes
+        self.dtype = dtype
     
     def init_params(self):
-        self.conv1 = Conv2D(3, 64, 3, stride=1, padding=1, bias=False, device=self.device)
+        self.conv1 = Conv2D(3, 64, 3, stride=1, padding=1, bias=False, device=self.device, dtype=self.dtype)
         self.conv1.init_params()
-        self.bn1 = BatchNorm2D(64, device=self.device)
+        self.bn1 = BatchNorm2D(64, device=self.device, dtype=self.dtype)
         self.bn1.init_params()
         
         self.layers1 = self._make_layer(self.block, 64, self.num_blocks[0], stride=1)
@@ -1520,7 +1525,7 @@ class ResNet(Layer):
         self.layers4 = self._make_layer(self.block, 512, self.num_blocks[3], stride=2)
         self.layers4.init_params()
         
-        self.linear = Dense(512*self.block.expansion, self.num_classes, device=self.device)
+        self.linear = Dense(512*self.block.expansion, self.num_classes, device=self.device, dtype=self.dtype)
         self.linear.init_params()
         self.flatten = Flatten()
         self.relu = ReLU()
@@ -1531,7 +1536,7 @@ class ResNet(Layer):
         strides = [stride] + [1]*(num_blocks-1)
         layers = []
         for stride in strides:
-            layers.append(block(self.in_planes, planes, stride, device=self.device))
+            layers.append(block(self.in_planes, planes, stride, device=self.device, dtype=self.dtype))
             self.in_planes = planes * block.expansion
         return Sequential(layers, device=self.device)
     
@@ -1549,17 +1554,17 @@ class ResNet(Layer):
         return out
     
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout, step=0):
-        dL_davgpool = self.linear.backward_p1(dL_dout, step)
-        dL_davgpool = self.flatten.backward_p1(dL_davgpool, step)
-        dL_dl4 = self.avgpool.backward_p1(dL_davgpool, step)
-        dL_dl3 = self.layers4.backward_p1(dL_dl4, step)
-        dL_dl2 = self.layers3.backward_p1(dL_dl3, step)
-        dL_dl1 = self.layers2.backward_p1(dL_dl2, step)
-        dL_drelu = self.layers1.backward_p1(dL_dl1, step)
-        dL_dbn = self.relu.backward_p1(dL_drelu, step)
-        dL_dconv = self.bn1.backward_p1(dL_dbn, step)
-        return self.conv1.backward_p1(dL_dconv, step)
+    def backward_p1(self, dL_dout):
+        dL_davgpool = self.linear.backward_p1(dL_dout)
+        dL_davgpool = self.flatten.backward_p1(dL_davgpool)
+        dL_dl4 = self.avgpool.backward_p1(dL_davgpool)
+        dL_dl3 = self.layers4.backward_p1(dL_dl4)
+        dL_dl2 = self.layers3.backward_p1(dL_dl3)
+        dL_dl1 = self.layers2.backward_p1(dL_dl2)
+        dL_drelu = self.layers1.backward_p1(dL_dl1)
+        dL_dbn = self.relu.backward_p1(dL_drelu)
+        dL_dconv = self.bn1.backward_p1(dL_dbn)
+        return self.conv1.backward_p1(dL_dconv)
 
 
 class SiLU(Activation):
@@ -1572,14 +1577,14 @@ class SiLU(Activation):
         self.inputs.append(x)
         return x * torch.sigmoid(x)
 
-    def backward_p1(self, dL_dout: torch.Tensor, step=0):
-        inputs = self.inputs.pop(step)
+    def backward_p1(self, dL_dout: torch.Tensor):
+        inputs = self.inputs.pop(0)
         e_x = torch.exp(-inputs)
         return dL_dout * ((1+e_x) + inputs*e_x)/((1+e_x)**2)
 
 
 class llamaFF(Layer):
-    def __init__(self, dim, hidden_dim, multiple_of, ffn_dim_multiplier = None, device:str = "cuda"):
+    def __init__(self, dim, hidden_dim, multiple_of, ffn_dim_multiplier = None, device:str = "cuda", dtype=torch.float32):
         super().__init__()
         hidden_dim = int(2 * hidden_dim / 3)
         
@@ -1591,13 +1596,14 @@ class llamaFF(Layer):
         self.hidden_dim = hidden_dim
 
         self.device = device
+        self.dtype = dtype
     
     @expose_params(acts=["l2", "silu_out"])
     def init_params(self):
         self.linears = [
-            Dense(self.dim, self.hidden_dim, bias=False, device=self.device),
-            Dense(self.hidden_dim, self.dim, bias=False, device=self.device),
-            Dense(self.dim, self.hidden_dim, bias=False, device=self.device)
+            Dense(self.dim, self.hidden_dim, bias=False, device=self.device, dtype=self.dtype),
+            Dense(self.hidden_dim, self.dim, bias=False, device=self.device, dtype=self.dtype),
+            Dense(self.dim, self.hidden_dim, bias=False, device=self.device, dtype=self.dtype)
         ]
         for l in self.linears:
             l.init_params()
@@ -1616,11 +1622,11 @@ class llamaFF(Layer):
         return self.linears[1](silu_out*l2)
     
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout:torch.Tensor, step):
+    def backward_p1(self, dL_dout:torch.Tensor):
         dL_dl2in = self.linears[1].backward_p1(dL_dout)
-        dL_dl0 = self.silu.backward_p1(dL_dl2in * self.l2.pop(step))
-        dL_dx1 = self.linears[0].backward_p1(dL_dl0) 
-        dL_dx2 = self.linears[2].backward_p1(dL_dl2in * self.silu_out.pop(step)) 
+        dL_dl0 = self.silu.backward_p1(dL_dl2in * self.l2.pop(0))
+        dL_dx1 = self.linears[0].backward_p1(dL_dl0)
+        dL_dx2 = self.linears[2].backward_p1(dL_dl2in * self.silu_out.pop(0)) 
         return dL_dx1 + dL_dx2
 
 
@@ -1660,11 +1666,12 @@ class RotaryEmbeddings(Layer):
         """
 
         freq_cis = torch.view_as_real(self.freqs_cis)
-        dL_da = dL_dout[:,:,:,:,0]*freq_cis[:,:,:,:,0] + dL_dout[:,:,:,:,1]*freq_cis[:,:,:,:,1]
-        dL_db = freq_cis[:,:,:,:,0]*dL_dout[:,:,:,:,1] - freq_cis[:,:,:,:,1]*dL_dout[:,:,:,:,0]
-        return torch.stack([dL_da, dL_db], dim=-1)
+        _dL_dout = dL_dout.float()
+        dL_da = _dL_dout[:,:,:,:,0]*freq_cis[:,:,:,:,0] + _dL_dout[:,:,:,:,1]*freq_cis[:,:,:,:,1]
+        dL_db = freq_cis[:,:,:,:,0]*_dL_dout[:,:,:,:,1] - freq_cis[:,:,:,:,1]*_dL_dout[:,:,:,:,0]
+        return torch.stack([dL_da, dL_db], dim=-1).type_as(dL_dout)
 
-    def backward_p1(self, dL_dxqout, dL_dxkout, step=0):
+    def backward_p1(self, dL_dxqout, dL_dxkout):
         #return self.forward(dL_dxqout, dL_dxkout)
         dL_dxqout_ = dL_dxqout.reshape(*dL_dxqout.shape[:-1], -1, 2)
         dL_dxkout_ = dL_dxkout.reshape(*dL_dxkout.shape[:-1], -1, 2)
@@ -1674,7 +1681,7 @@ class RotaryEmbeddings(Layer):
 
         
 class GroupedMultiQueryAttention(Layer):
-    def __init__(self, emb_dim: int, num_heads: int, num_kv_heads:int, max_seq_len:int, theta:float=10000.0, p:float=0.1, device:str="cuda"):
+    def __init__(self, emb_dim: int, num_heads: int, num_kv_heads:int, max_seq_len:int, theta:float=10000.0, p:float=0.0, device:str="cuda", dtype=torch.float32):
         super().__init__()
         self.num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         self.emb_dim = emb_dim
@@ -1687,13 +1694,14 @@ class GroupedMultiQueryAttention(Layer):
         self.inv_square_d = 1/torch.sqrt(torch.tensor(self.head_dim, device=device))
 
         self.device = device
+        self.dtype = dtype
 
     @expose_params(acts=["xq", "xk", "xv", "sQK_T"])
     def init_params(self):
-        self.linears = {"Q": Dense(self.emb_dim, self.num_heads*self.head_dim, bias=False, device=self.device),
-                        "K": Dense(self.emb_dim, self.num_kv_heads*self.head_dim, bias=False, device=self.device),
-                        "V": Dense(self.emb_dim, self.num_kv_heads*self.head_dim, bias=False, device=self.device),
-                        "O": Dense(self.num_heads*self.head_dim, self.emb_dim, bias=False, device=self.device)
+        self.linears = {"Q": Dense(self.emb_dim, self.num_heads*self.head_dim, bias=False, device=self.device, dtype=self.dtype),
+                        "K": Dense(self.emb_dim, self.num_kv_heads*self.head_dim, bias=False, device=self.device, dtype=self.dtype),
+                        "V": Dense(self.emb_dim, self.num_kv_heads*self.head_dim, bias=False, device=self.device, dtype=self.dtype),
+                        "O": Dense(self.num_heads*self.head_dim, self.emb_dim, bias=False, device=self.device, dtype=self.dtype)
                         }
         for l in self.linears.keys():
             self.linears[l].init_params()
@@ -1749,37 +1757,44 @@ class GroupedMultiQueryAttention(Layer):
         return self.linears["O"](out)
 
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout: torch.Tensor, step=0):
+    def backward_p1(self, dL_dout: torch.tensor):
         #vmap go fast
-        dL_dAtt = self.linears["O"].backward_p1(dL_dout, step)
+        #with nvtx_profile("output_linear"):
+        dL_dAtt = self.linears["O"].backward_p1(dL_dout)
         dL_dAtt = torch.cat(dL_dAtt.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
         dL_dAtt = torch.cat(dL_dAtt.unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)  # broadcast for memory efficiency
 
-        dL_dsQKT = vmap(lambda dldatt, v: vmap(lambda _dldatt: torch.bmm(_dldatt, v.transpose(-1,-2)), in_dims=-2, out_dims=-2)(dldatt), in_dims=-2, out_dims=-2)(dL_dAtt, self.xv.pop(step))
+        #with nvtx_profile("sqk back"):
+        dL_dsQKT = vmap(lambda dldatt, v: vmap(lambda _dldatt: torch.bmm(_dldatt, v.transpose(-1,-2)), in_dims=-2, out_dims=-2)(dldatt), in_dims=-2, out_dims=-2)(dL_dAtt, self.xv.pop(0))
         dL_dsQKT = torch.flatten(dL_dsQKT, -3, -2)
 
-        dL_dQKT = self.softmax_fn.backward_p1(dL_dsQKT, step) * self.inv_square_d
+        #with nvtx_profile("softmax"):
+        dL_dQKT = self.softmax_fn.backward_p1(dL_dsQKT) * self.inv_square_d
         
         dL_dQKT =  torch.cat(dL_dQKT.unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
 
-        dL_dxq = vmap(lambda dldqkt, k: vmap(lambda _dldqkt: torch.bmm(_dldqkt, k), in_dims=-2, out_dims=-2)(dldqkt), in_dims=-2, out_dims=-2)(dL_dQKT, self.xk.pop(step))
+        #with nvtx_profile("q back"):
+        dL_dxq = vmap(lambda dldqkt, k: vmap(lambda _dldqkt: torch.bmm(_dldqkt, k), in_dims=-2, out_dims=-2)(dldqkt), in_dims=-2, out_dims=-2)(dL_dQKT, self.xk.pop(0))
         dL_dxq = dL_dxq.flatten(-3,-2)
 
-        dL_dxkt = vmap(vmap(lambda q, dldqkt: torch.bmm(q.transpose(-1,-2), dldqkt), in_dims=-2, out_dims=-2), in_dims=-2, out_dims=-2)(self.xq.pop(step), dL_dQKT)
+        #with nvtx_profile("k back"):
+        dL_dxkt = vmap(vmap(lambda q, dldqkt: torch.bmm(q.transpose(-1,-2), dldqkt), in_dims=-2, out_dims=-2), in_dims=-2, out_dims=-2)(self.xq.pop(0), dL_dQKT)
         dL_dxkt = torch.sum(dL_dxkt, -3)
 
         dL_dxk = torch.vmap(lambda dl_dlkt: torch.transpose(dl_dlkt, -1, -2), in_dims=-2, out_dims=-2)(dL_dxkt)
 
-        sQK_T = torch.cat(self.sQK_T.pop(step).unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
-
+        sQK_T = torch.cat(self.sQK_T.pop(0).unsqueeze(-3).chunk(self.n_rep, dim=-2), dim=-3)
+        #with nvtx_profile("v back"):
         dL_dxv = vmap(vmap(lambda sqkt, dldatt: torch.bmm(sqkt.transpose(-1,-2), dldatt), in_dims=-2, out_dims=-2), in_dims=-2, out_dims=-2)(sQK_T, dL_dAtt)
         dL_dxv = torch.sum(dL_dxv, -3)
+        
+        #with nvtx_profile("RotaryEmbeddings"):
+        dL_dxq, dL_dxk = self.rotary_emb.backward_p1(dL_dxq, dL_dxk)
 
-        dL_dxq, dL_dxk = self.rotary_emb.backward_p1(dL_dxq, dL_dxk, step)
-
-        dL_dQ = self.linears["Q"].backward_p1(self.dropouts["Q"].backward_p1(torch.flatten(dL_dxq, -2, -1), step), step)
-        dL_dK = self.linears["K"].backward_p1(self.dropouts["K"].backward_p1(torch.flatten(dL_dxk, -2, -1), step), step)
-        dL_dV = self.linears["V"].backward_p1(self.dropouts["V"].backward_p1(torch.flatten(dL_dxv, -2, -1), step), step)
+        #ƒwith nvtx_profile("Linears"):
+        dL_dQ = self.linears["Q"].backward_p1(self.dropouts["Q"].backward_p1(torch.flatten(dL_dxq, -2, -1)))
+        dL_dK = self.linears["K"].backward_p1(self.dropouts["K"].backward_p1(torch.flatten(dL_dxk, -2, -1)))
+        dL_dV = self.linears["V"].backward_p1(self.dropouts["V"].backward_p1(torch.flatten(dL_dxv, -2, -1)))
 
         return dL_dQ + dL_dK + dL_dV
 
@@ -1787,7 +1802,7 @@ class GroupedMultiQueryAttention(Layer):
 
 # Transformer++
 class TransformerPPBlock(Layer):
-    def __init__(self, dim, num_heads, num_kv_heads, max_seqlen, theta=10000.0, p=0.1, device="cuda"):
+    def __init__(self, dim, num_heads, num_kv_heads, max_seqlen, theta=10000.0, p=0.1, device="cuda", dtype=torch.float32):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -1797,17 +1812,18 @@ class TransformerPPBlock(Layer):
         self.p = p
 
         self.device = device
+        self.dtype = dtype
     
     def init_params(self):
-        self.attention = GroupedMultiQueryAttention(self.dim, self.num_heads, self.num_kv_heads, self.max_seqlen, theta=self.theta, p=self.p, device=self.device)
-        self.ff = llamaFF(self.dim, self.dim*4, 256, device=self.device)
-        self.att_norm = NLPRMSNorm(-1, self.dim, device=self.device)
-        self.ff_norm = NLPRMSNorm(-1, self.dim, device=self.device)
+        self.attention = GroupedMultiQueryAttention(self.dim, self.num_heads, self.num_kv_heads, self.max_seqlen, theta=self.theta, p=self.p, device=self.device, dtype=self.dtype)
+        self.ff = llamaFF(self.dim, self.dim*4, 256, device=self.device, dtype=self.dtype)
+        self.att_norm = NLPRMSNorm(-1, self.dim, device=self.device, dtype=self.dtype)
+        self.ff_norm = NLPRMSNorm(-1, self.dim, device=self.device, dtype=self.dtype)
         self.att_dropout = Dropout(self.p)
         self.ff_dropout = Dropout(self.p)
 
-        mask = torch.zeros(self.max_seqlen, self.max_seqlen, device=self.device)
-        self.mask = mask.masked_fill(torch.triu(torch.ones(self.max_seqlen, self.max_seqlen, device=self.device), diagonal=1).bool(), float('-inf'))
+        mask = torch.zeros(self.max_seqlen, self.max_seqlen, device=self.device, dtype=self.dtype)
+        self.mask = mask.masked_fill(torch.triu(torch.ones(self.max_seqlen, self.max_seqlen, device=self.device, dtype=self.dtype), diagonal=1).bool(), float('-inf'))
     
         self.attention.init_params()
         self.ff.init_params()
@@ -1825,12 +1841,16 @@ class TransformerPPBlock(Layer):
         return self.ff_dropout(x)
 
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout, step=0):
-        dL_dff = self.ff_dropout.backward_p1(dL_dout, step)
-        dL_h = self.ff_norm.backward_p1(self.ff.backward_p1(dL_dff, step), step) + dL_dff
-        dL_datt = self.att_dropout.backward_p1(dL_h, step)
-        dL_dnorm = self.attention.backward_p1(dL_datt, step)
-        out = self.att_norm.backward_p1(dL_dnorm, step) + dL_datt
+    def backward_p1(self, dL_dout):
+        #with nvtx_profile("ff_dropout"):
+        dL_dff = self.ff_dropout.backward_p1(dL_dout)
+        #with nvtx_profile("ff_back"):
+        dL_h = self.ff_norm.backward_p1(self.ff.backward_p1(dL_dff)) + dL_dff
+        #with nvtx_profile("att_dropout"):
+        dL_datt = self.att_dropout.backward_p1(dL_h)
+        dL_dnorm = self.attention.backward_p1(dL_datt)
+        #with nvtx_profile("att_norm"):
+        out = self.att_norm.backward_p1(dL_dnorm) + dL_datt
         return out
 
 class BilinearUpSample(Layer):
@@ -1856,9 +1876,9 @@ class DiffUpsample(Layer):
         return x
     
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout, step=0):
+    def backward_p1(self, dL_dout):
         if self.conv:
-            dL_dout = self.conv0.backward_p1(dL_dout, step)
+            dL_dout = self.conv0.backward_p1(dL_dout)
         return F.avg_pool2d(dL_dout, 2, divisor_override=1)
 
 class DiffDownsample(Layer):
@@ -1867,8 +1887,8 @@ class DiffDownsample(Layer):
     def forward(self,x):
         return self.pool(x)
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout, step=0):
-        return self.pool.backward_p1(dL_dout, step)
+    def backward_p1(self, dL_dout):
+        return self.pool.backward_p1(dL_dout)
 
 class DiffResnetBlock(Layer):
     def __init__(self, in_channels, out_channels=None, conv_shortcut=False, dropout=0.0):
@@ -1922,20 +1942,20 @@ class DiffResnetBlock(Layer):
         return x+h
     
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout, step=0):
-        dL_dh = self.conv2.backward_p1(dL_dout, step)
-        dL_dh = self.dropout.backward_p1(dL_dh, step)
-        dL_dh = self.swish_2.backward_p1(dL_dh, step)
-        dL_dh = self.bn2.backward_p1(dL_dh, step)
-        dL_dh = self.conv1.backward_p1(dL_dh, step)
-        dL_dh = self.swish_1.backward_p1(dL_dh, step)
-        dL_dh = self.bn1.backward_p1(dL_dh, step)
+    def backward_p1(self, dL_dout):
+        dL_dh = self.conv2.backward_p1(dL_dout)
+        dL_dh = self.dropout.backward_p1(dL_dh)
+        dL_dh = self.swish_2.backward_p1(dL_dh)
+        dL_dh = self.bn2.backward_p1(dL_dh)
+        dL_dh = self.conv1.backward_p1(dL_dh)
+        dL_dh = self.swish_1.backward_p1(dL_dh)
+        dL_dh = self.bn1.backward_p1(dL_dh)
         
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
-                dL_dx = self.conv_shortcut.backward_p1(dL_dh, step)
+                dL_dx = self.conv_shortcut.backward_p1(dL_dh)
             else:
-                dL_dx = self.nin_shortcut.backward_p1(dL_dh, step)
+                dL_dx = self.nin_shortcut.backward_p1(dL_dh)
         else:
             dL_dx = dL_dout
 
@@ -2001,23 +2021,23 @@ class DiffAttention(Layer):
         return x + h_
     
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout, step=0):
+    def backward_p1(self, dL_dout):
         b,c,h,w = dL_dout.shape
-        dL_datt = self.conv_out.backward_p1(dL_dout, step)
+        dL_datt = self.conv_out.backward_p1(dL_dout)
         dL_datt = dL_dout.reshape(b,c,-1)
-        dL_dsqkt = torch.bmm(torch.transpose(self.v.pop(step), -2, -1), dL_datt)
-        dL_dqkt = self.softmax.backward_p1(dL_dsqkt, step=step)
-        dL_dv = torch.bmm(dL_datt, torch.transpose(self.sqkt.pop(step), -2, -1))
-        dL_dq = torch.bmm(dL_dqkt, torch.transpose(self.k.pop(step), -2, -1))
-        dL_dk = torch.bmm(torch.transpose(self.q.pop(step), -2, -1), dL_dqkt)
+        dL_dsqkt = torch.bmm(torch.transpose(self.v.pop(0), -2, -1), dL_datt)
+        dL_dqkt = self.softmax.backward_p1(dL_dsqkt)
+        dL_dv = torch.bmm(dL_datt, torch.transpose(self.sqkt.pop(0), -2, -1))
+        dL_dq = torch.bmm(dL_dqkt, torch.transpose(self.k.pop(0), -2, -1))
+        dL_dk = torch.bmm(torch.transpose(self.q.pop(0), -2, -1), dL_dqkt)
         
         dL_dq = dL_dq.permute(0, 2, 1)
-        dL_dq = self.conv_q.backward_p1(dL_dq.reshape(b, c, h, w), step)
-        dL_dk = self.conv_k.backward_p1(dL_dk.reshape(b, c, h, w), step)
-        dL_dv =self.cnv_v.backward_p1(dL_dv.reshape(b, c, h, w), step)
+        dL_dq = self.conv_q.backward_p1(dL_dq.reshape(b, c, h, w))
+        dL_dk = self.conv_k.backward_p1(dL_dk.reshape(b, c, h, w))
+        dL_dv =self.cnv_v.backward_p1(dL_dv.reshape(b, c, h, w))
         
         dL_dh = dL_dq + dL_dk + dL_dv
-        dL_dh = self.bn.backward_p1(dL_dh, step)
+        dL_dh = self.bn.backward_p1(dL_dh)
         
         return dL_dh + dL_dout
 
@@ -2135,17 +2155,18 @@ class SelectiveScan(Layer):
         self.x.append(x)
         self.out.append(out)
     
-    def _load_parms(self, step=0):
-        u = self.u.pop(step)
-        delta = self.delta.pop(step)
-        A = self.A.pop(step)
-        B = self.B.pop(step)
-        C = self.C.pop(step)
-        D = self.D.pop(step)
-        z = self.z.pop(step)
-        delta_bias = self.delta_bias.pop(step)
-        x = self.x.pop(step)
-        out = self.out.pop(step)
+    #@cleanup_act("u", "delta", "A", "B", "C", "D", "z", "delta_bias", "x", "out")
+    def _load_parms(self):
+        u = self.u.pop(0)
+        delta = self.delta.pop(0)
+        A = self.A.pop(0)
+        B = self.B.pop(0)
+        C = self.C.pop(0)
+        D = self.D.pop(0)
+        z = self.z.pop(0)
+        delta_bias = self.delta_bias.pop(0)
+        x = self.x.pop(0)
+        out = self.out.pop(0)
         return u, delta, A, B, C, D, z, delta_bias, x, out
     
     def forward(self, u, delta, A, B, C, D=None, z=None, delta_bias=None):
@@ -2172,8 +2193,8 @@ class SelectiveScan(Layer):
         
         return rest[0]
     
-    def backward_p1(self, dL_dout, step=0):
-        u, delta, A, B, C, D, z, delta_bias, x, out = self._load_parms(step)
+    def backward_p1(self, dL_dout):
+        u, delta, A, B, C, D, z, delta_bias, x, out = self._load_parms()
         if dL_dout.stride(-1) != 1:
             dL_dout = dL_dout.contiguous()
         du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = selective_scan_cuda.bwd(u, delta, A, B, C, D, z, delta_bias, dL_dout, x, out, None, self.delta_softplus, False)
@@ -2199,10 +2220,10 @@ class Mamba(Layer):
         dt_init="random",
         dt_scale=1.0,
         dt_init_floor=1e-4,
-        conv_bias=True,
         bias=False,
         layer_idx=None,
         device="cuda",
+        dtype=torch.float32
     ):
         super().__init__()
         self.d_model = d_model
@@ -2216,44 +2237,47 @@ class Mamba(Layer):
         self.dt_init_floor = dt_init_floor
         self.layer_idx = layer_idx
         self.device = device
+        self.dtype = dtype
         
         self.act = SiLU()
         
-        self.x_proj = Dense(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, device=device)
+        self.x_proj = Dense(self.d_inner, self.dt_rank + self.d_state * 2, bias=False, device=device, dtype=self.dtype)
         
         self.dt_init_std = self.dt_rank**-0.5 * dt_scale
 
-        self.out_proj = Dense(self.d_inner, self.d_model, bias=bias, device=self.device)
+        self.out_proj = Dense(self.d_inner, self.d_model, bias=bias, device=self.device, dtype=self.dtype)
     
     @expose_params({"conv_kernel":"conv_kernel_grad", 
                     "conv_bias":"conv_bias_grad", 
                     "dt_proj_weight":"dt_proj_weight_grad", 
                     "dt_proj_bias":"dt_proj_bias_grad", "D":"D_grad",
                     "in_proj_weight":"in_proj_weight_grad",
-                    "in_proj_bias":"in_proj_bias_grad"})
+                    "in_proj_bias":"in_proj_bias_grad",
+                    "D":"D_grad",
+                    "A_log":"A_log_grad"},
+                   ["dL_dxz", "x", "conv_in", "dL_dact", "dL_dtt", "dt_t", "dA"])
     def init_params(self):
         self.scan = SelectiveScan(True)
         self.scan.init_params()
 
-        self.in_proj_weight,  = init_params.dense_params(self.d_inner*2, self.d_model, bias=False, factory_kwargs={"device": self.device})
+        self.in_proj_weight, self.in_proj_bias = init_params.dense_params(self.d_model, self.d_inner*2, factory_kwargs={"device": self.device, "dtype":self.dtype})
+        self.in_proj_weight = self.in_proj_weight.T.contiguous()
+        self.in_proj_bias = self.in_proj_bias.unsqueeze(-1)
         self.in_proj_weight_grad = torch.zeros_like(self.in_proj_weight)
-
-        self.in_proj_bias = torch.zeros(self.d_inner*2, 1, device=self.device)
         self.in_proj_bias_grad = torch.zeros_like(self.in_proj_bias)        
         
-        self.conv_kernel = torch.ones(self.d_inner, 1, self.d_conv, device=self.device)
-        self.conv_bias = torch.zeros(self.d_inner, device=self.device)
+        self.conv_kernel, self.conv_bias = init_params.mamba_conv1d_params(self.d_inner, self.d_conv, factory_kwargs={"device": self.device, "dtype":self.dtype})
 
         self.conv_kernel_grad = torch.zeros_like(self.conv_kernel)
         self.conv_bias_grad = torch.zeros_like(self.conv_bias)
         
         m = torch.distributions.uniform.Uniform(-self.dt_init_std, self.dt_init_std)
-        self.dt_proj_weight = m.sample((self.d_inner, self.dt_rank)).to(self.device)
+        self.dt_proj_weight = m.sample((self.d_inner, self.dt_rank)).to(self.device).to(self.dtype)
         self.dt_proj_weight_grad = torch.zeros_like(self.dt_proj_weight)
         
         
         dt = torch.exp(
-            torch.rand(self.d_inner, device=self.device) * (math.log(self.dt_max) - math.log(self.dt_min))
+            torch.rand(self.d_inner, device=self.device, dtype=self.dtype) * (math.log(self.dt_max) - math.log(self.dt_min))
             + math.log(self.dt_min)
         ).clamp(min=self.dt_init_floor)
         
@@ -2267,6 +2291,7 @@ class Mamba(Layer):
         ).contiguous()
         
         self.A_log = torch.log(A)  # Keep A_log in fp32
+        self.A_log_grad = torch.zeros_like(self.A_log)
         self.D = torch.ones(self.d_inner, device=self.device)  # Keep in fp32
         self.D_grad = torch.zeros_like(self.D)
 
@@ -2274,17 +2299,17 @@ class Mamba(Layer):
         self.out_proj.init_params()
 
         self.x = []
+        self.conv_in = []
         self.dt_t = []
         self.dL_dtt = []
         self.dL_dxz = []
         self.dL_dact = []
+        self.dA = []
     
     
     def forward(self, x:torch.Tensor):
 
         batch, seqlen, dim = x.shape
-
-        conv_state, ssm_state = None, None
 
         x = rearrange(x, "b l d -> d (b l)")
         self.x.append(x)
@@ -2300,11 +2325,9 @@ class Mamba(Layer):
         A = -torch.exp(self.A_log.float())
 
         x, z = xz.chunk(2, dim=1)
-        print(x.shape)
+        self.conv_in.append(x)
         x = F.conv1d(x, self.conv_kernel, self.conv_bias, groups=self.d_inner, padding=self.d_conv - 1)
-        print(x.shape)
         x = x[..., :seqlen]
-        print(x.shape)
         x = self.act(x)
         
 
@@ -2324,14 +2347,15 @@ class Mamba(Layer):
         return self.out_proj(y)
 
     @multi_stage_wrapper
-    def backward_p1(self, dL_dout:torch.Tensor, step=0):
-        print("----------------------------")
+    def backward_p1(self, dL_dout:torch.Tensor):
         batch, seqlen, dim = dL_dout.shape
-        dL_dy = self.out_proj.backward_p1(dL_dout, step)
+        dL_dy = self.out_proj.backward_p1(dL_dout)
         dL_dy = rearrange(dL_dy, "b l d -> b d l")
 
-        du, ddelta, dA, dB, dC, dD, ddelta_bias, dz = self.scan.backward_p1(dL_dy, step)
+        du, ddelta, dA, dB, dC, dD, ddelta_bias, dz = self.scan.backward_p1(dL_dy)
+        self.dA.append(dA)
         self.dt_proj_bias_grad[:] += ddelta_bias
+        self.D_grad[:] += dD
 
         dL_dC = rearrange(dC, "b dstate l -> (b l) dstate")
         dL_dB = rearrange(dB, "b dstate l -> (b l) dstate")
@@ -2341,12 +2365,12 @@ class Mamba(Layer):
         dL_dt = dL_dt_t.t()
         dL_dxdbl = torch.cat([dL_dt, dL_dB, dL_dC], dim=-1)
         #print(dL_dxdbl.shape)
-        dL_dx = self.x_proj.backward_p1(dL_dxdbl, step)
-        dL_dx = rearrange(dL_dx, "(b l) d -> b d l", l=seqlen)
-        dL_dx = self.act.backward_p1(dL_dx, step)
+        dL_dx = self.x_proj.backward_p1(dL_dxdbl)
+        dL_dx = rearrange(dL_dx, "(b l) d -> b d l", l=seqlen) + du
+        dL_dx = self.act.backward_p1(dL_dx)
         self.dL_dact.append(dL_dx)
-        dL_dx = F.conv1d(dL_dx, self.conv_kernel.flip(-1), padding=self.d_conv - 1, groups=self.d_inner)[..., :seqlen]
-        print(dL_dx.shape)
+        dL_dx = F.pad(dL_dx, (0, self.d_conv - 1))
+        dL_dx = F.conv1d(dL_dx, self.conv_kernel.flip(-1), groups=self.d_inner)
 
         dL_dxz = torch.cat((dL_dx, dz), dim=1)
         dL_dxz = rearrange(dL_dxz, "b d l -> d (b l)")
@@ -2357,43 +2381,102 @@ class Mamba(Layer):
 
         return dL_dx
 
-    def backward_p2(self, step=0):
-        # This is just the maths need to stack tensors etc...
-        self.in_proj_weight_grad[:] += torch.sum(torch.matmul(self.dL_dxz, self.x.T), dim=0)
-        self.in_proj_bias[:] += torch.sum(self.dL_dxz, dim=(1,2))
-
-        self.conv_bias_grad[:] += torch.sum(self.dL_dact, dim=(0,1))
-
-        self.conv_kernel_grad[:] += ...
-
-        self.dt_proj_weight_grad[:] += torch.sum(torch.matmul(self.dL_dtt, self.dt_t.T), dim=0)
+    @cleanup_act("dL_dxz", "x", "conv_in", "dL_dact", "dL_dtt", "dt_t", "dA")
+    def backward_p2(self, inter=False):
+        #for _ in range(len(self.dL_dxz)):
+        if self.multi_stage and not inter:
+            dL_dxz = torch.stack(self.dL_dxz)
+            x = torch.stack(self.x)
+            conv_in = torch.cat(self.conv_in)
+            dL_dact = torch.cat(self.dL_dact)
+            dL_dtt = torch.stack(self.dL_dtt)
+            dt_t = torch.stack(self.dt_t)
+            dA = torch.stack(self.dA)
+        else: 
+            dL_dxz = self.dL_dxz.pop(0).unsqueeze(0)
+            x = self.x.pop(0).unsqueeze(0)
+            conv_in = self.conv_in.pop(0)
+            dL_dact = self.dL_dact.pop(0)
+            dL_dtt = self.dL_dtt.pop(0).unsqueeze(0)
+            dt_t = self.dt_t.pop(0).unsqueeze(0)
+            dA = self.dA.pop(0).unsqueeze(0)
         
+        self.in_proj_weight_grad[:] += torch.sum(dL_dxz @ x.mT, dim=0)
+        self.in_proj_bias_grad[:] += torch.sum(dL_dxz, dim=(0,2)).unsqueeze(-1)
+    
+        self.conv_bias_grad[:] += torch.sum(dL_dact, dim=(0,2))
+        conv_in = F.pad(conv_in, (self.d_conv - 1,  0))
+        # Witchcraft
+        self.conv_kernel_grad[:] += torch.sum(vmap(vmap(F.conv1d,in_dims=(1,0)))(conv_in.unsqueeze(1).unsqueeze(-2), dL_dact.unsqueeze(-2).unsqueeze(-2)), dim=(0, -2))
 
+        self.dt_proj_weight_grad[:] += torch.sum(dL_dtt @ dt_t.mT, dim=0)
+        self.A_log_grad[:] = torch.sum(dA * -torch.exp(self.A_log.float()), dim=0)
+
+class MambaBlock(Layer):
+    def __init__(
+        self,
+        d_model,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+        dt_rank="auto",
+        dt_min=0.001,
+        dt_max=0.1,
+        dt_init="random",
+        dt_scale=1.0,
+        dt_init_floor=1e-4,
+        bias=False,
+        layer_idx=None,
+        device="cuda", 
+        dtype=torch.float32
+    ):  
+        super().__init__()
+        self.mamba = Mamba(d_model, d_state, d_conv, expand, dt_rank, dt_min, dt_max, dt_init, dt_scale, dt_init_floor, bias, layer_idx, device, dtype)
+        self.norm = NLPRMSNorm(-1, d_model, device=device, dtype=dtype)
+    
+    def init_params(self):
+        self.mamba.init_params()
+        self.norm.init_params()
+    
+    def forward(self, hidden_states):
+        residual = hidden_states
+        hidden_states = self.norm(hidden_states)
+        hidden_states = self.mamba(hidden_states)
+        return hidden_states + residual
+
+    @multi_stage_wrapper
+    def backward_p1(self, dL_dout):
+        dL_dnorm = self.mamba.backward_p1(dL_dout)
+        dL_din = self.norm.backward_p1(dL_dnorm)
+        return dL_din + dL_dout
 
 
 if __name__ == "__main__":
-
-    def test(layer, x, dL_dout):
+    def test(layer: Layer, x, dL_dout):
+        import random
+        print(layer.__class__.__name__, "\n")
+        layer.clear_acts()
         layer.init_params()
         with torch.no_grad():
-            print(layer.forward(x)[0][0])
-            exit()
+            layer.forward(x)
+            torch.manual_seed(0)
+            layer.forward(x)
+            layer.backward_p1(dL_dout)
             my_back = layer.backward_p1(dL_dout)
-            #layer.backward_p2()
+            layer.backward_p2()
+        torch.manual_seed(0)
         true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
-        print(my_back.shape, true_back.shape)
-        if len(x.shape) == 3:
-            print(my_back[:2,:2,:2])
-            print(true_back[:2,:2,:2])
-        elif len(x.shape) == 2:
-            print(my_back[:2,:2])
-            print(true_back[:2,:2])
-        else:
-            print(my_back[:2,:2,:2, :2])
-            print(true_back[:2,:2,:2, :2])
-        print("Means: ", my_back.mean(), true_back.mean())
-        print("Stds : ", my_back.std(), true_back.std())
-        num_correct = (torch.isclose(my_back, true_back, rtol=0.00001)).sum()
+        idxs = [random.randint(0, true_back.flatten().shape[0]) for _ in range(20)]
+ 
+        print("Predicted Grads")
+        print(my_back.flatten()[idxs])
+        print("-"*40)
+        print("True Grads")
+        print(true_back.flatten()[idxs])
+        print("        Predicted          True")
+        print("Means: ", my_back.mean().item(), true_back.mean().item())
+        print("Stds : ", my_back.std().item(), true_back.std().item())
+        num_correct = (torch.isclose(my_back, true_back, rtol=0.0001)).sum()
         print(f"Num correct: {num_correct}/{my_back.numel()} ({100*num_correct/my_back.numel():.2f}%)")
         return my_back, true_back
     
@@ -2426,7 +2509,7 @@ if __name__ == "__main__":
         true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
         print(my_back[0,0])
         print(true_back[0,0])
-        num_correct = (torch.isclose(my_back, true_back, rtol=0.0001)).sum()
+        num_correct = (torch.isclose(my_back, true_back, rtol=0.00001)).sum()
         print(f"Num correct: {num_correct}/{my_back.numel()} ({100*num_correct/my_back.numel():.2f}%)")
         print(torch.allclose(my_back, true_back))
     
@@ -2443,9 +2526,9 @@ if __name__ == "__main__":
         test(layer, x, dL_dout)
     
     def test_conv2D():
-        image = torch.randn(16, 3, 80, 80)
+        image = torch.randn(16, 3, 80, 80, device="cuda")
         conv = Conv2D(3, 16, 3)
-        test(conv, image, torch.ones(16,16,78,78))
+        test(conv, image, torch.ones(16,16,78,78, device="cuda"))
     
     def test_batchnorm():
         m = torch.distributions.Uniform(1, 3)
@@ -2453,8 +2536,8 @@ if __name__ == "__main__":
         test(BatchNorm2D(3), image, torch.ones(16,3,80,80))
 
     def test_dense():
-        x = torch.randn(16, 80)
-        test(Dense(80, 160), x, torch.ones(16,160))
+        x = torch.randn(16, 80, device="cuda")
+        test(Dense(80, 160), x, torch.ones(16,160, device="cuda"))
     
     def test_resnet():
         image = torch.randn(16, 3, 32, 32)
@@ -2508,7 +2591,8 @@ if __name__ == "__main__":
         torch.manual_seed(1)
         x = torch.randn(4, 32 , 64, device="cuda")
         dL_dout = torch.ones(4, 32 , 64, device="cuda")
-        layer = Mamba(64)
+        layer = MambaBlock(64)
         test(layer, x, dL_dout)
 
-test_mamba()
+if __name__ == "__main__":
+    test_transformer_pp()
