@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  generateName: resnet-custom-backprop-
+spec:
+  containers: 
+  - args:
+    - |
+      torchrun --nproc_per_node=4 resnet_main.py --algo none ;
+      torchrun --nproc_per_node=4 resnet_main.py --algo none --msbp ;
+      torchrun --nproc_per_node=4 resnet_main.py --algo gpipe ;
+      torchrun --nproc_per_node=4 resnet_main.py --algo gpipe --msbp ;
+      torchrun --nproc_per_node=4 resnet_main.py --algo 1f1b-1 ;
+      torchrun --nproc_per_node=4 resnet_main.py --algo 1f1b-1 --msbp ;
+      torchrun --nproc_per_node=4 resnet_main.py --algo 1f1b-2 ;
+      torchrun --nproc_per_node=4 resnet_main.py --algo 1f1b-2 --msbp ;
+    command: [/bin/bash, -c, --]
+    image: bigballoon8/custom-backprop
+    name: custom-backprop
+    env:
+    - name: OMP_NUM_THREADS
+      value: "8"
+    #- name: NCCL_DEBUG
+    #  value: "INFO"
+    resources:
+      limits:
+        cpu: 32
+        memory: 64Gi
+        nvidia.com/gpu: 4
+    volumeMounts:
+    - mountPath: /dev/shm
+      name: devshm
+    workingDir: /workspace/experiment3(pipeline_parallelism)/
+  nodeSelector:
+    nvidia.com/gpu.product: NVIDIA-A100-SXM4-40GB
+  restartPolicy: Never
+  volumes:
+  - emptyDir:
+      medium: Memory
+    name: devshm

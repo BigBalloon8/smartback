@@ -3,8 +3,8 @@ from kubernetes.client.rest import ApiException
 import click
 import time
 import yaml
-import json
-import re
+import random
+import string
 import os
 
 @click.command()
@@ -18,7 +18,9 @@ def main(pod_yaml):
 
         with open(pod_yaml, "r") as stream:
             pod_def = yaml.safe_load(stream)
-
+        
+        base_identifier =''.join(random.choices(string.ascii_lowercase, k=8))
+        pod_def["metadata"]["generateName"] = f"{pod_def['metadata']['generateName']}{base_identifier}-"
         base_pod_name = pod_def["metadata"]["generateName"]
 
         v1.create_namespaced_pod(body=pod_def, namespace=namespace)                

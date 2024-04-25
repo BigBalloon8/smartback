@@ -76,7 +76,7 @@ class SGD(Optimizer):
     def update_fn(self):
         def _update_fn(_self: layers.Layer):
             for k in _self.params.keys():
-                _self.params[k][:] =  _self.params[k] - self.lr*_self.grads[k]
+                _self.params[k].copy_(_self.params[k] - self.lr*_self.grads[k])
         if self.chimera:
             for layer in self.model.layers[0]:
                 self._recursive_set_update_fn(layer, _update_fn)

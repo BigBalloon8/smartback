@@ -9,11 +9,13 @@ from loss import Loss
 
 @contextmanager
 def nvtx_profile(name):
-    #torch.cuda.synchronize()
+    yield 
+    return
+    torch.cuda.synchronize()
     #print(name)
     torch.cuda.nvtx.range_push(name)
     yield
-    #torch.cuda.synchronize()
+    torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
 
 class Model:
@@ -36,22 +38,25 @@ class Model:
     def _rank_0_fwd(self, x:torch.Tensor):
         with nvtx_profile(f"Rank {dist.get_rank()} fwd"):
             for layer in self.layers:
+                #with nvtx_profile(layer.__class__.__name__):
                 x = layer(x)
-            dist.send(x.contiguous(), self.rank+1)
+            dist.isend(x.contiguous(), self.rank+1)
     
     def _rank_n_fwd(self):
         dist.recv(self.f_recv_buffer, self.rank-1)
         x = self.f_recv_buffer.clone()
         with nvtx_profile(f"Rank {dist.get_rank()} fwd"):
             for layer in self.layers:
+                #with nvtx_profile(layer.__class__.__name__):
                 x = layer(x)
-            dist.send(x.contiguous(), self.rank+1)
+            dist.isend(x.contiguous(), self.rank+1)
     
     def _rank_N_fwd(self, y):
         dist.recv(self.f_recv_buffer, self.rank-1)
         with nvtx_profile(f"Rank {dist.get_rank()} fwd"):
             x = self.f_recv_buffer.clone()
             for layer in self.layers:
+                #with nvtx_profile(layer.__class__.__name__):
                 x = layer(x)
             return self.criterion(x, y)
     
@@ -60,6 +65,7 @@ class Model:
         with nvtx_profile(f"Rank {dist.get_rank()} bwd"):
             dL_dout = self.b_recv_buffer.clone()
             for layer in self.layers[::-1]:
+                #with nvtx_profile(layer.__class__.__name__):
                 dL_dout = layer.backward_p1(dL_dout)
     
     def _rank_n_bwd_p1(self):
@@ -67,25 +73,29 @@ class Model:
         with nvtx_profile(f"Rank {dist.get_rank()} bwd"):
             dL_dout = self.b_recv_buffer.clone()
             for layer in self.layers[::-1]:
+                #with nvtx_profile(layer.__class__.__name__):
                 dL_dout = layer.backward_p1(dL_dout)
-            dist.send(dL_dout.contiguous(), self.rank-1)
+            dist.isend(dL_dout.contiguous(), self.rank-1)
     
     def _rank_N_bwd_p1(self):
         with nvtx_profile(f"Rank {dist.get_rank()} bwd"):
             dL_dout = self.criterion.backward()
             for layer in self.layers[::-1]:
+                #with nvtx_profile(layer.__class__.__name__):
                 dL_dout = layer.backward_p1(dL_dout)
             if not self._2bp and isinstance(self, Transformer): # needed for memory
                 torch.cuda.empty_cache()
-            dist.send(dL_dout.contiguous(), self.rank-1)
+            dist.isend(dL_dout.contiguous(), self.rank-1)
     
     def _backward_p2(self, inter=False):
         with nvtx_profile(f"Rank {dist.get_rank()} bwd_p2"):
             if self.device == "cuda":
                 for i, layer in enumerate(self.sub_layers):
                     #with torch.cuda.stream(self.streams[i]):
-                    #with nvtx_profile(layer.__class__.__name__):
-                    layer.backward_p2(inter=inter)
+                    #if layer.__class__.__name__ == "Conv2D":
+                    #   extra_info = f" {layer.}"
+                    with nvtx_profile(layer.__class__.__name__):
+                        layer.backward_p2(inter=inter)
             else:
                 for layer in self.layers:
                     layer.backward_p2()
@@ -184,13 +194,16 @@ class Model:
             for _ in range(self.size - self.rank):
                 if self.rank == 0:
                     self._rank_0_bwd_p1()
-                    self._backward_p2(inter=True)
+                    if self._2bp:
+                        self._backward_p2(inter=True)
                 elif self.rank == self.size - 1:
                     self._rank_N_bwd_p1()
-                    self._backward_p2(inter=True)
+                    if self._2bp:
+                        self._backward_p2(inter=True)
                 else:
                     self._rank_n_bwd_p1()
-                    self._backward_p2(inter=True)
+                    if self._2bp:
+                        self._backward_p2(inter=True)
         
             if self._2bp:
                 self._backward_p2()
@@ -231,13 +244,16 @@ class Model:
             for i in range(self.size - self.rank):
                 if self.rank == 0:
                     self._rank_0_bwd_p1()
-                    self._backward_p2(inter=True)
+                    if self._2bp:
+                        self._backward_p2(inter=True)
                 elif self.rank == self.size - 1:
                     self._rank_N_bwd_p1()
-                    self._backward_p2(inter=True)
+                    if self._2bp:
+                        self._backward_p2(inter=True)
                 else:
                     self._rank_n_bwd_p1()
-                    self._backward_p2(inter=True)
+                    if self._2bp:
+                        self._backward_p2(inter=True)
             
             if self._2bp and self.rank != 0:
                 self._backward_p2()
@@ -252,7 +268,6 @@ class Model:
             for layer, s in zip(self.sub_layers, self.streams):
                 #with torch.cuda.stream(s):
                 layer.update()
-        dist.barrier()
     
     def multi_stage(self, _bool):
         for layer in self.layers:
@@ -426,22 +441,33 @@ class ResNet152(Model):
         self.device = device
         self.dtype = dtype
 
-    def init_params(self, gmbs):
+    def init_params(self, gbs):
+        if self.pipe_algo == "none":
+            gmbs = gbs
+        elif self.pipe_algo in ("gpipe", "1f1b-1"):
+            gmbs = gbs // dist.get_world_size()
+        elif self.pipe_algo == "1f1b-2":
+            gmbs = gbs // (dist.get_world_size() * 2)
         model = layers.ResNet(layers.ResNetBottleneck, [3, 8, 36, 3], device=self.device, dtype=self.dtype)
         self.layers = []
-        self.layers.append(layers.Conv2D(3, 64, 3, stride=1, padding=1, bias=False, device=self.device, dtype=self.dtype))
+        self.layers.append(layers.Conv2D(3, 64, 7, stride=2, padding=3, bias=False, device=self.device, dtype=self.dtype))
         self.layers.append(layers.BatchNorm2D(64, device=self.device, dtype=self.dtype))
         self.layers.append(layers.ReLU())
+        self.layers.append(layers.MaxPool2D(3, 1, 2))
         self.layers += model._make_layer(layers.ResNetBottleneck, 64, 3, stride=1).layers
         self.layers += model._make_layer(layers.ResNetBottleneck, 128, 8, stride=2).layers
         self.layers += model._make_layer(layers.ResNetBottleneck, 256, 36, stride=2).layers
         self.layers += model._make_layer(layers.ResNetBottleneck, 512, 3, stride=2).layers
-        self.layers.append(layers.AvgPool2D(28))
+        self.layers.append(layers.AvgPool2D(7))
         self.layers.append(layers.Flatten())
         self.layers.append(layers.Dense(512*layers.ResNetBottleneck.expansion, self.num_classes, device=self.device, dtype=self.dtype))
+        splits = [14, 14, 14, 15]
+        idxs = [sum(splits[:i]) for i in range(len(splits)+1)]
+        self.layers = self.layers[idxs[dist.get_rank()]:idxs[dist.get_rank()+1]]
+
+        #chunk_size, remainder = divmod(len(self.layers), dist.get_world_size())
+        #self.layers = [self.layers[i * chunk_size + min(i, remainder):(i + 1) * chunk_size + min(i + 1, remainder)] for i in range(dist.get_world_size())][dist.get_rank()]
         
-        chunk_size, remainder = divmod(len(self.layers), dist.get_world_size())
-        self.layers = [self.layers[i * chunk_size + min(i, remainder):(i + 1) * chunk_size + min(i + 1, remainder)] for i in range(dist.get_world_size())][dist.get_rank()]
         for layer in self.layers:
             layer.init_params()
         
@@ -454,7 +480,7 @@ class ResNet152(Model):
         dist.barrier()
         
         if dist.get_rank() == 0:
-            x = torch.ones(gmbs, 3, 224, 224, device=self.device)
+            x = torch.ones(gmbs, 3, 224, 224, device=self.device, dtype=self.dtype)
             for layer in self.layers:
                 x = layer(x)
             self.b_recv_buffer = torch.zeros_like(x)
@@ -476,9 +502,9 @@ class ResNet152(Model):
             dist.send(torch.tensor(x.shape, device=x.device), dist.get_rank()+1)
 
         self.zero_act()
-        
         dist.barrier()
         torch.cuda.synchronize()
+    
         #print(f"Rank {dist.get_rank()}: {self.f_recv_buffer.shape if hasattr(self, 'f_recv_buffer') else ''}, {self.b_recv_buffer.shape if hasattr(self, 'b_recv_buffer') else ''}")
     
 class BertBase(Model):
@@ -501,7 +527,7 @@ class BertBase(Model):
         
         self.sub_layers = []
         for layer in self.layers:
-            layer._get_model_sub_layers(self.sub_layers)  
+            layer._get_model_sub_layers(self.sub_layers)
         
         self.streams = [torch.cuda.Stream() for _ in self.sub_layers]
         torch.cuda.synchronize()

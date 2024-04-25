@@ -7,6 +7,8 @@ RUN pip install packaging
 RUN pip install mamba-ssm
 RUN pip install tqdm
 RUN pip install click
+RUN pip install fft-conv-pytorch
+RUN pip install torch-summary
 RUN apt update
 RUN apt-get install libglib2.0-dev -y
 RUN apt install wget -y 

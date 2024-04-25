@@ -1,5 +1,6 @@
 import os
 import time
+import click
 
 import torch
 import torch.distributed as dist
@@ -9,9 +10,12 @@ from models import Mamba
 from data.dummy import get_train_dataloader, get_val_dataloader
 import loss
 import optimizers
-from utils import benchmark
+from utils import benchmark, share_var
 
-def main():
+@click.command()
+@click.option("--msbp", is_flag=True, default=False)
+@click.option("--algo", default="none")
+def main(msbp, algo):
     torch.manual_seed(31082005)
     torch.cuda.manual_seed(31082005)
     #os.environ["RANK"] = "0"
@@ -25,7 +29,7 @@ def main():
         pass
     torch.cuda.set_device(dist.get_rank())
     
-    gbs = 8
+    gbs = 16 if algo == "1f1b-2" else 8
     dim = 2048
     max_seqlen = 1024
     vocab_size = 32000
@@ -36,29 +40,30 @@ def main():
         num_blocks=48,
         d_model=dim,
         vocab_size=vocab_size,
-        pipe_algo="1f1b-1",
+        pipe_algo=algo,
         criterion=loss.NLPCrossEntropyLoss(),
         device=device,
-        dtype=torch.bfloat16
+        dtype=torch.float16
     )
     
     model.init_params(gbs, (max_seqlen, dim))
-    model.multi_stage(True)
+    model.multi_stage(msbp)
 
-    train_data = get_train_dataloader(gbs*16, (max_seqlen,), gbs, vocab_size=vocab_size)
-    if dist.get_rank() == 0:
-        train_data = tqdm(train_data, unit_scale=gbs*max_seqlen)
+    train_data = get_train_dataloader(4096, (max_seqlen,), gbs, vocab_size=vocab_size)
     
     n_params = model.get_num_params()
     
     opt = optimizers.AdamW(model, 0.0001)
 
+    param_mem = share_var(torch.cuda.memory_allocated())
+
     if dist.get_rank() == 0:
         print(f"Model: {model.__class__.__name__}")
         print(f"No. Params: {n_params:,}")
         print(f"Pipe Algo: {model.pipe_algo}")
+        print(f"Global Batch Size: {gbs}")
         print(f"Multi Stage: {model.layers[0].multi_stage}")
-        print(f"Memory Parameters: {torch.cuda.memory_allocated()/1e9:.4f}GB")
+        print(f"Memory Parameters: {param_mem/1024**3:.4f}GB")
         print(f"Dtype: {model.layers[0].weights.dtype}")
 
     torch.cuda.cudart().cudaProfilerStart()
@@ -68,17 +73,21 @@ def main():
         losses = model.train_step(x, y)
         model.update()
         model.zero_grad()
+        torch.cuda.empty_cache()
         break
     
-    with benchmark("Time For Epoch"):
+    with benchmark("Time For Epoch", 4096*max_seqlen):
         for x,y in train_data:
             x, y = x.to(device), y.to(device)
             losses = model.train_step(x, y)
             model.update()
             model.zero_grad()
     
+    max_mem = share_var(torch.cuda.max_memory_allocated(), op=dist.ReduceOp.MAX)
+
     if dist.get_rank() == 0:
-        print(f"Memory Required: {torch.cuda.max_memory_allocated()/1e9:.4f}GB")
+        print(f"Memory Required: {max_mem/1024**3:.4f}GB")
+        print(f"---------------------------------------------")
     
     
     torch.cuda.cudart().cudaProfilerStop()

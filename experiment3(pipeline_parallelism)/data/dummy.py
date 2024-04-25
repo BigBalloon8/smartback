@@ -29,7 +29,6 @@ class DummyDataInt(Dataset):
             else:
                 return 0, 0
 
-
         if dist.get_world_size() == 1:
             x = torch.randint(2, self.vocab_size, self.shape)
             y = torch.zeros_like(x)
@@ -72,7 +71,7 @@ class DummyImage(Dataset):
         return self.length
 
     def __getitem__(self, idx):
-        return torch.randint(0, 255, self.shape, dtype=torch.float32) / 255.
+        return torch.randint(0, 255, self.shape, dtype=torch.float32) / 255., torch.nn.functional.one_hot(torch.randint(0, self.num_classes, (1,)).squeeze(), self.num_classes)
     
     
 

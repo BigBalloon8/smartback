@@ -34,10 +34,12 @@ class CrossEntropyLoss(Loss):
         self.y = []
 
     def forward(self, y_hat, y):
-        logits = torch.softmax(y_hat, dim=-1)
+        loss, logits = _nlp_loss_op(y_hat, y)
         self.logits.append(logits)
         self.y.append(y)
-        return torch.nn.functional.cross_entropy(self.logits, y)
+        #print(self.logits, y)
+        return loss
+        return torch.sum(-y*torch.log(logits))
 
     def backward(self):
         return self.logits.pop(0) - self.y.pop(0)

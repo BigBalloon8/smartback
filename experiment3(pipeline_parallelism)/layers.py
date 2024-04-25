@@ -1,7 +1,7 @@
-from typing import Any, Dict, Optional, Union, Sequence, Tuple
+from typing import Any, Dict, Optional, Union, Sequence, Tuple, List, Final
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from functools import wraps
+from functools import wraps, partial
 import math
 
 import torch
@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import vmap as vmap
 import torch.distributed as dist
 
+from fft_conv_pytorch.fft_conv import fft_conv
 import selective_scan_cuda
 from einops import rearrange, repeat
 
@@ -18,6 +19,8 @@ import init_params
 
 @contextmanager
 def nvtx_profile(name):
+    yield
+    return
     #torch.cuda.synchronize()
     torch.cuda.nvtx.range_push(name)
     yield
@@ -171,9 +174,6 @@ class Sequential:
 
         if device == "cuda":
             self.device = "cuda"
-            self.streams = []
-            for _ in self.layers:
-                self.streams.append(torch.cuda.Stream())
         else:
             self.device = "cpu"
         
@@ -277,13 +277,13 @@ class Dense(Layer):
             dL_dout = self.dL_dout.pop(0)
             inputs = self.inputs.pop(0)
 
-        if dL_dout.ndim == 2:
+        if inputs.ndim == 2:
             self.weights_g[:] += torch.sum(
                 torch.bmm(inputs.unsqueeze(2), 
                             dL_dout.unsqueeze(1)
                     ),
             dim=0)
-        elif dL_dout.ndim == 3:
+        elif inputs.ndim == 3:
             self.weights_g[:] += torch.sum(
                 torch.bmm(
                     torch.transpose(inputs, -2, -1),
@@ -302,7 +302,12 @@ class ReLU(Activation):
     @expose_params(acts=["inputs"])
     def __init__(self):
         super().__init__()
-        self.inputs = []
+        self.mask = []
+        @torch.jit.script
+        def _fwd_op(x:torch.Tensor):
+            mask = (x>0)
+            return x.mul_(mask), mask
+        self.fwd_op = _fwd_op
 
     def forward(self, x: torch.Tensor):
         """
@@ -314,8 +319,9 @@ class ReLU(Activation):
         Returns:
             torch.Tensor: Output tensor after applying relu
         """
-        self.inputs.append(x)
-        out = torch.maximum(x, torch.tensor(0.0, dtype=x.dtype, device=x.device))
+        out, mask = self.fwd_op(x)
+        #mask = (x>0)
+        self.mask.append(mask)
         return out
     
     @multi_stage_wrapper
@@ -329,8 +335,7 @@ class ReLU(Activation):
         Returns:
             torch.Tensor: Derivative of the loss with respect to the dense layers input
         """
-        dout_din = torch.where(self.inputs.pop(0)>0, 1.0, 0.0)
-        return dL_dout*dout_din
+        return dL_dout.mul_(self.mask.pop(0))
 
 class GeLU(Activation):
     @expose_params(acts=["inputs"])
@@ -503,7 +508,6 @@ class MultiHeadAttention(Layer):
         self.inv_sqrt_d = (emb_dim / num_heads)**(-1/2)
         self.p = p
 
-        self.inputs = {"Q": None, "K": None, "V": None}
         self.softmax_func = Softmax()
         
         self.device = device
@@ -541,9 +545,6 @@ class MultiHeadAttention(Layer):
         Returns:
             torch.Tensor: Output tensor of multihead attention
         """
-        self.inputs["Q"] = Q
-        self.inputs["K"] = K
-        self.inputs["V"] = V
         
         lQ = self.dropouts["Q"](self.linears["Q"](Q))
         lK = self.dropouts["K"](self.linears["K"](K))
@@ -641,8 +642,29 @@ class BatchNorm2D(Layer):
         self.device = device
         self.dtype = dtype
         self.training = True
+        
+        @torch.jit.script
+        def _fwd_op(x, gamma, beta, eps:float):
+            mean, inv_std = torch.batch_norm_stats(x, eps)
+            x_s_m = x-mean
+            norm_x = x_s_m*inv_std
+            return gamma.view(1, -1, 1, 1)*norm_x + beta.view(1, -1, 1, 1)
+        
+        self.fwd_op = _fwd_op
+
+        @torch.jit.script
+        def _bwd_op(dL_dout, gamma, x_s_m, std_inv, B_inv:float):
+            dL_dxnorm = dL_dout * gamma.view(1, -1, 1, 1)
+            dstd_dxnorm = dL_dxnorm * std_inv
+            dL_dvar = (-0.5 * dL_dxnorm * (x_s_m)).sum((0, 2, 3), keepdim=True)  * ((std_inv) ** 3)
+            dL_dmean = (-dstd_dxnorm).sum((0, 2, 3), keepdim=True) + (dL_dvar * (-2.0 * (x_s_m)).sum((0, 2, 3), keepdim=True) *B_inv)
+            return (dstd_dxnorm) + (2.0 * x_s_m.mul_(dL_dvar).mul_(B_inv)) + (dL_dmean.mul_(B_inv))
+
+        self.bwd_op = _bwd_op
+
+
     
-    @expose_params({"gamma": "gamma_g", "beta": "beta_g"}, ["x_sub_mean", "var", "norm_x", "dL_dout"])
+    @expose_params({"gamma": "gamma_g", "beta": "beta_g"}, ["norm_x", "dL_dout"])
     def init_params(self):
         self.gamma = torch.ones(self.in_channels, device=self.device, dtype=self.dtype)
         self.beta = torch.zeros(self.in_channels, device=self.device, dtype=self.dtype)
@@ -653,8 +675,6 @@ class BatchNorm2D(Layer):
         self.r_mean = torch.zeros(1, self.in_channels, 1, 1, device=self.device)
         self.r_var = torch.ones(1, self.in_channels, 1, 1, device=self.device)
 
-        self.x_sub_mean = []
-        self.var = []
         self.norm_x = []
         self.dL_dout = []
         
@@ -668,22 +688,30 @@ class BatchNorm2D(Layer):
         Returns:
             torch.Tensor: The output of the BAtchNorm2D Layer
         """
+        #out = self.fwd_op(x, self.gamma, self.beta, self.eps)
+        
+        with torch.enable_grad():
+            # NOTE This is the fastest way to do it
+            x.requires_grad = True
+            out, _, _, _ = torch.cudnn_batch_norm(x, self.gamma, self.beta, None, None, True, 0, epsilon=self.eps)
+            self.back_op = out.grad_fn
+            out = out.detach()
+        self.norm_x.append(out)
+        return out
         if self.training:
             mean = x.mean(dim=[0,2,3], keepdim=True)
             var = ((x-mean)**2).mean(dim=[0,2,3], keepdim=True)
-            self.r_mean = (1 - self.momentum) * self.r_mean + self.momentum * mean
-            self.r_var = (1 - self.momentum) * self.r_var + self.momentum * var
+            #self.r_mean = (1 - self.momentum) * self.r_mean + self.momentum * mean
+            #self.r_var = (1 - self.momentum) * self.r_var + self.momentum * var
         else:
             mean, var = self.r_mean, self.r_var
         
         x_sub_mean = x - mean
         self.x_sub_mean.append(x_sub_mean)
-        var = var + self.eps
-        self.var.append(var)
-        norm_x = (x_sub_mean)/torch.sqrt(var)
-        self.norm_x.append(norm_x)
+        #var = var + self.eps
+        norm_x = F.batch_norm(x) #(x_sub_mean)/torch.sqrt(var)
         out = self.gamma.view(1, self.in_channels, 1, 1)*norm_x + self.beta.view(1, self.in_channels, 1, 1)
-        return out
+        return F.batch_norm(x)
     
     @multi_stage_wrapper
     def backward_p1(self, dL_dout: torch.Tensor):
@@ -696,15 +724,22 @@ class BatchNorm2D(Layer):
         Returns:
             torch.Tensor: The derivatives of the loss with respect to the BatchNorm2D inputs
         """
-        in_shape = dL_dout.shape
-        self.dL_dout.append(dL_dout)
-        # https://stackoverflow.com/questions/67968913/derivative-of-batchnorm2d-in-pytorch
         
+        self.dL_dout.append(dL_dout)
+        return self.back_op(dL_dout)[0]
+
+        # https://stackoverflow.com/questions/67968913/derivative-of-batchnorm2d-in-pytorch
+        in_shape = dL_dout.shape
         B = in_shape[0]*in_shape[2]*in_shape[3]
+
+        #x_s_m = self.x_sub_mean.pop(0)
+        #std_inv = self.std_inv.pop(0)
+        return self.bwd_op(dL_dout, self.gamma, x_s_m, std_inv, 1/B)
         
         dL_dxnorm = dL_dout * self.gamma.view(1, -1, 1, 1)
-        x_s_m = self.x_sub_mean.pop(0)
-        v = self.var.pop(0)
+        
+        v = (x_s_m**2).mean(dim=[0,2,3], keepdim=True) + self.eps
+        self.norm_x.append((x_s_m)/torch.sqrt(v))
         dL_dvar = (-0.5 * dL_dxnorm * (x_s_m)).sum((0, 2, 3), keepdim=True)  * ((v) ** -1.5)
         dL_dmean = (-1.0 / torch.sqrt(v) * dL_dxnorm).sum((0, 2, 3), keepdim=True) + (dL_dvar * (-2.0 * (x_s_m)).sum((0, 2, 3), keepdim=True) / B)
         return (dL_dxnorm / torch.sqrt(v)) + (2.0 * dL_dvar * (x_s_m) / B) + (dL_dmean / B)
@@ -715,13 +750,17 @@ class BatchNorm2D(Layer):
         """
         Calculates the gradients of the parameters in the BatchNorm2D
         """
-        n = len(self.dL_dout) if not inter else 1
-        for _ in range(n):
+        #n = len(self.dL_dout) if not inter else 1
+        if self.multi_stage and not inter:
+            dL_dout = torch.cat(self.dL_dout, dim=0)
+            norm_x = torch.cat(self.norm_x, dim=0)
+        else:
             dL_dout = self.dL_dout.pop(0)
             norm_x = self.norm_x.pop(0)
-            self.gamma_g[:] += torch.sum(dL_dout*norm_x, dim=[0,2,3])
-            self.beta_g[:] += torch.sum(dL_dout, dim=[0,2,3])
-        
+
+        self.gamma_g[:] += torch.sum(dL_dout*norm_x, dim=[0,2,3])
+        self.beta_g[:] += torch.sum(dL_dout, dim=[0,2,3])
+
       
 class NLPLayerNorm(Layer):
     def __init__(self, dim: int, dim_size: int, eps:Optional[float]=1e-08, device: Optional[str]="cuda", dtype=torch.float32):
@@ -1054,6 +1093,144 @@ class Flatten(Activation):
     def backward_p1(self, dL_dout):
         return dL_dout.view(*self.shape)
 
+def complex_matmul(a: torch.Tensor, b: torch.Tensor, groups: int = 1) -> torch.Tensor:
+    """Multiplies two complex-valued tensors."""
+    # Scalar matrix multiplication of two tensors, over only the first channel
+    # dimensions. Dimensions 3 and higher will have the same shape after multiplication.
+    # We also allow for "grouped" multiplications, where multiple sections of channels
+    # are multiplied independently of one another (required for group convolutions).
+    a = a.view(a.size(0), groups, -1, *a.shape[2:])
+    b = b.view(groups, -1, *b.shape[1:])
+
+    a = torch.movedim(a, 2, a.dim() - 1).unsqueeze(-2)
+    b = torch.movedim(b, (1, 2), (b.dim() - 1, b.dim() - 2))
+
+    # complex value matrix multiplication
+    #real = a.real @ b.real - a.imag @ b.imag
+    #imag = a.imag @ b.real + a.real @ b.imag
+    c = torch.matmul(a, b)
+    c = torch.movedim(c, c.dim() - 1, 2).squeeze(-1)
+    #real = torch.movedim(real, real.dim() - 1, 2).squeeze(-1)
+    #imag = torch.movedim(imag, imag.dim() - 1, 2).squeeze(-1)
+    #c = torch.zeros(real.shape, dtype=torch.complex64, device=a.device)
+    #c.real, c.imag = real, imag
+    return c.view(c.size(0), -1, *c.shape[3:])
+
+
+def to_ntuple(val: Union[int, Sequence[int]], n: int) -> Tuple[int, ...]:
+    """Casts to a tuple with length 'n'.  Useful for automatically computing the
+    padding and stride for convolutions, where users may only provide an integer.
+
+    Args:
+        val: (Union[int, Iterable[int]]) Value to cast into a tuple.
+        n: (int) Desired length of the tuple
+
+    Returns:
+        (Tuple[int, ...]) Tuple of length 'n'
+    """
+    if isinstance(val, Sequence):
+        out = tuple(val)
+        if len(out) == n:
+            return out
+        else:
+            raise ValueError(f"Cannot cast tuple of length {len(out)} to length {n}.")
+    else:
+        return n * (val,)
+
+
+def fft_conv(
+    signal: torch.Tensor,
+    kernel: torch.Tensor,
+    bias: torch.Tensor = None,
+    padding: Union[int, Sequence[int], str] = 0,
+    padding_mode: str = "constant",
+    stride: Union[int, Sequence[int]] = 1,
+    dilation: Union[int, Sequence[int]] = 1,
+    groups: int = 1,
+) -> torch.Tensor:
+    """Performs N-d convolution of Tensors using a fast fourier transform, which
+    is very fast for large kernel sizes. Also, optionally adds a bias Tensor after
+    the convolution (in order ot mimic the PyTorch direct convolution).
+
+    Args:
+        signal: (Tensor) Input tensor to be convolved with the kernel.
+        kernel: (Tensor) Convolution kernel.
+        bias: (Tensor) Bias tensor to add to the output.
+        padding: (Union[int, Iterable[int], str) If int, Number of zero samples to pad then
+            input on the last dimension. If str, "same" supported to pad input for size preservation.
+        padding_mode: (str) Padding mode to use from {constant, reflection, replication}.
+                      reflection not available for 3d.
+        stride: (Union[int, Iterable[int]) Stride size for computing output values.
+        dilation: (Union[int, Iterable[int]) Dilation rate for the kernel.
+        groups: (int) Number of groups for the convolution.
+
+    Returns:
+        (Tensor) Convolved tensor
+    """
+
+    # Cast padding, stride & dilation to tuples.
+    signal = signal.unsqueeze(0)
+    n = signal.ndim - 2
+    stride_ = to_ntuple(stride, n=n)
+    dilation_ = to_ntuple(dilation, n=n)
+    if isinstance(padding, str):
+        if padding == "same":
+            if stride != 1 or dilation != 1:
+                raise ValueError("stride must be 1 for padding='same'.")
+            padding_ = [(k - 1) / 2 for k in kernel.shape[2:]]
+        else:
+            raise ValueError(f"Padding mode {padding} not supported.")
+    else:
+        padding_ = to_ntuple(padding, n=n)
+
+    # internal dilation offsets
+    offset = torch.zeros(1, 1, *dilation_, device=signal.device, dtype=signal.dtype)
+    offset[(slice(None), slice(None), *((0,) * n))] = 1.0
+
+    # correct the kernel by cutting off unwanted dilation trailing zeros
+    cutoff = tuple(slice(None, -d + 1 if d != 1 else None) for d in dilation_)
+
+    # pad the kernel internally according to the dilation parameters
+    kernel = torch.kron(kernel, offset)[(slice(None), slice(None)) + cutoff]
+
+    # Pad the input signal & kernel tensors (round to support even sized convolutions)
+    signal_padding = [r(p) for p in padding_[::-1] for r in (math.floor, math.ceil)]
+    signal = F.pad(signal, signal_padding, mode=padding_mode)
+
+    # Because PyTorch computes a *one-sided* FFT, we need the final dimension to
+    # have *even* length.  Just pad with one more zero if the final dimension is odd.
+    signal_size = signal.size()  # original signal size without padding to even
+    if signal.size(-1) % 2 != 0:
+        signal = F.pad(signal, [0, 1])
+
+    kernel_padding = [
+        pad
+        for i in reversed(range(2, signal.ndim))
+        for pad in [0, signal.size(i) - kernel.size(i)]
+    ]
+    padded_kernel = F.pad(kernel, kernel_padding)
+
+    # Perform fourier convolution -- FFT, matrix multiply, then IFFT
+    signal_fr = torch.fft.rfftn(signal.float(), dim=tuple(range(2, signal.ndim)))
+    kernel_fr = torch.fft.rfftn(padded_kernel.float(), dim=tuple(range(2, signal.ndim)))
+
+    kernel_fr.imag *= -1
+    output_fr = complex_matmul(signal_fr, kernel_fr, groups=groups)
+    output = torch.fft.irfftn(output_fr, dim=tuple(range(2, signal.ndim)))
+
+    # Remove extra padded values
+    crop_slices = [slice(None), slice(None)] + [
+        slice(0, (signal_size[i] - kernel.size(i) + 1), stride_[i - 2])
+        for i in range(2, signal.ndim)
+    ]
+    output = output[crop_slices].contiguous()
+
+    # Optionally, add a bias term before returning.
+    if bias is not None:
+        bias_shape = tuple([1, -1] + (signal.ndim - 2) * [1])
+        output += bias.view(bias_shape)
+
+    return output.squeeze(0)
 
 class Conv2D(Layer):
     def __init__(self, in_channels: int, out_channels: int, k_size: Union[Sequence[int], int], bias: bool=True,  padding: Union[bool, int]=False, stride: Union[Sequence[int], int]=1, device: Optional[str]="cuda", dtype=torch.float32):
@@ -1118,6 +1295,7 @@ class Conv2D(Layer):
         self.inputs = []
         self.dL_dout = []
 
+
     def forward(self, x:torch.Tensor):
         """
         Preforms a forward pass through the Conv2D layer
@@ -1130,6 +1308,8 @@ class Conv2D(Layer):
         """
         self.inputs.append(x)
         return F.conv2d(x, self.kernel, self.bias, stride=self.stride, padding=self.padding)
+        print(dist.get_rank(), out.shape)
+        return out
     
     @multi_stage_wrapper
     def backward_p1(self, dL_dout: torch.Tensor):
@@ -1143,6 +1323,7 @@ class Conv2D(Layer):
             torch.Tensor: derivative of the loss with respect to the Conv2D Layer's input
         """
         self.dL_dout.append(dL_dout)
+        #dL_din_t = F.grad.conv2d_input(self.inputs[0].shape, self.kernel, dL_dout, stride=self.stride, padding=self.padding)
         dL_din = F.conv_transpose2d(dL_dout, self.kernel, stride=self.stride, padding=self.padding, output_padding=(self.stride[0]-1,self.stride[1]-1))
         return dL_din
     
@@ -1151,20 +1332,25 @@ class Conv2D(Layer):
         """
         Computes the gradients of the parameter within the Conv2D layer
         """
-        n = len(self.dL_dout) if not inter else 1
-        for _ in range(n):
+        #n = len(self.dL_dout) if not inter else 1
+        if self.multi_stage and not inter:
+            dL_dout = torch.cat(self.dL_dout, dim=0)
+            inputs = torch.cat(self.inputs, dim=0)
+        else:
             dL_dout = self.dL_dout.pop(0)
             inputs = self.inputs.pop(0)
 
-            if isinstance(self.bias, torch.Tensor):
-                self.bias_g[:] += torch.sum(dL_dout, dim=(0, 2, 3))
+        if isinstance(self.bias, torch.Tensor):
+            self.bias_g[:] += torch.sum(dL_dout, dim=(0, 2, 3))
+        
+        #newstride: Tuple[int, int] = (self.stride[0]*dL_dout.shape[2], self.stride[1]*dL_dout.shape[3])
+        #if dist.get_rank() == -1:
+        #    fn = fft_conv
+        #else:
+        #    fn = F.conv2d
 
-            def _dL_dk_fn(feature, kernal, stride, padding):
-                new_stride = (stride[0]*kernal.shape[2], stride[1]*kernal.shape[3])
-                out = F.conv2d(feature, kernal, stride=new_stride, padding=padding).squeeze(0)
-                return out
-            # witchcraft (apply a conv between each input and output channel and sum)
-            self.kernel_g[:] += torch.sum(vmap(vmap(vmap(_dL_dk_fn, in_dims=(0, None)), in_dims=(None, 0)))(inputs.unsqueeze(-3), dL_dout.unsqueeze(-3).unsqueeze(-3), stride=self.stride, padding=self.padding),dim=0)
+        #self.kernel_g[:] += fn(inputs.transpose(0, 1), dL_dout.transpose(0, 1), stride=newstride, padding=self.padding).transpose(0, 1)
+        self.kernel_g[:] += F.grad.conv2d_weight(inputs, self.kernel_g.shape, dL_dout, stride=self.stride, padding=self.padding) #fn(inputs.transpose(0, 1), dL_dout.transpose(0, 1), stride=newstride, padding=self.padding).transpose(0, 1)
 
 
 class Conv2DTranspose(Layer):
@@ -1214,6 +1400,7 @@ class MaxPool2D(Layer):
         Returns:
             torch.Tensor: Output tensor
         """
+        self.in_shape = x.shape
         out, indices = F.max_pool2d(x, kernel_size=self.k_size, stride=self.stride, padding=self.padding, return_indices=True)
         self.indices.append(indices)
         return out
@@ -1228,7 +1415,7 @@ class MaxPool2D(Layer):
         Returns:
             torch.Tensor: derivative of the loss with respect to the MaxPool2D Layer's input
         """
-        out = F.max_unpool2d(dL_dout, self.indices.pop(0), kernel_size=self.k_size, stride=self.stride, padding=self.padding)
+        out = F.max_unpool2d(dL_dout, self.indices.pop(0), kernel_size=self.k_size, stride=self.stride, padding=self.padding, output_size=self.in_shape)
         return out
 
 
@@ -1461,11 +1648,10 @@ class ResNetBottleneck(Layer):
         out = self.relus[1](out)
         out = self.convs[2](out)
         out = self.batchnorms[2](out)
-        
+    
         if self.shortcut:
             for layer in self.shortcut:
                 x = layer(x)
-                
         return self.relus[2](out + x)
     
     @multi_stage_wrapper
@@ -1488,7 +1674,6 @@ class ResNetBottleneck(Layer):
         dL_dbn0 = self.relus[0].backward_p1(dL_drelu0)
         dL_dconv0 = self.batchnorms[0].backward_p1(dL_dbn0)
         dL_din1 = self.convs[0].backward_p1(dL_dconv0)
-        
         dL_din2 = dL_dshortcut
         for layer in self.shortcut[::-1]:
             dL_din2 = layer.backward_p1(dL_din2)
@@ -2454,25 +2639,23 @@ class MambaBlock(Layer):
 if __name__ == "__main__":
     def test(layer: Layer, x, dL_dout):
         import random
-        print(layer.__class__.__name__, "\n")
+        print(layer.__class__.__name__)
         layer.clear_acts()
         layer.init_params()
         with torch.no_grad():
             layer.forward(x)
-            torch.manual_seed(0)
-            layer.forward(x)
-            layer.backward_p1(dL_dout)
             my_back = layer.backward_p1(dL_dout)
-            layer.backward_p2()
+            #layer.backward_p2(inter=False)
         torch.manual_seed(0)
         true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
         idxs = [random.randint(0, true_back.flatten().shape[0]) for _ in range(20)]
- 
+        print("-"*40)
         print("Predicted Grads")
         print(my_back.flatten()[idxs])
         print("-"*40)
         print("True Grads")
         print(true_back.flatten()[idxs])
+        print("-"*40)
         print("        Predicted          True")
         print("Means: ", my_back.mean().item(), true_back.mean().item())
         print("Stds : ", my_back.std().item(), true_back.std().item())
@@ -2505,13 +2688,19 @@ if __name__ == "__main__":
         with torch.no_grad():
             layer.forward(x)
             my_back = layer.backward_p1(dL_dout)
-            #layer.backward_p2()
+            layer.backward_p2()
         true_back = torch.autograd.functional.vjp(layer.forward, x, dL_dout)[1]
         print(my_back[0,0])
         print(true_back[0,0])
         num_correct = (torch.isclose(my_back, true_back, rtol=0.00001)).sum()
         print(f"Num correct: {num_correct}/{my_back.numel()} ({100*num_correct/my_back.numel():.2f}%)")
         print(torch.allclose(my_back, true_back))
+    
+    def test_relu():
+        x = torch.randn(16, 24, 80)
+        dL_dout = torch.ones(16, 24, 80)
+        layer = ReLU()
+        test(layer, x, dL_dout)
     
     def test_layernorm():
         m = torch.distributions.Uniform(1, 3)
@@ -2532,8 +2721,8 @@ if __name__ == "__main__":
     
     def test_batchnorm():
         m = torch.distributions.Uniform(1, 3)
-        image = m.sample((16, 3, 80, 80))
-        test(BatchNorm2D(3), image, torch.ones(16,3,80,80))
+        image = m.sample((16, 3, 80, 80)).to("cuda").to(torch.float64)
+        test(BatchNorm2D(3, dtype=torch.float64), image, torch.ones(16,3,80,80, device="cuda", dtype=torch.float64))
 
     def test_dense():
         x = torch.randn(16, 80, device="cuda")
@@ -2587,6 +2776,12 @@ if __name__ == "__main__":
         layer = AvgPool2D(28)
         test(layer, x, dL_dout)
 
+    def test_max_pool():
+        x = torch.randn(16, 512, 28, 28)
+        dL_dout = torch.randn(16, 512, 1, 1)
+        layer = MaxPool2D(28)
+        test(layer, x, dL_dout)
+
     def test_mamba():
         torch.manual_seed(1)
         x = torch.randn(4, 32 , 64, device="cuda")
@@ -2595,4 +2790,4 @@ if __name__ == "__main__":
         test(layer, x, dL_dout)
 
 if __name__ == "__main__":
-    test_transformer_pp()
+    test_max_pool()

@@ -14,14 +14,16 @@ spec:
     - none 
     - -o 
     - /mnt/ceph_rbd/nsight_report_TRuE
-    - -f
+    - -f 
     - "true"
     - -x 
     - "true"
     - torchrun
     - --nproc_per_node=4
     - resnet_main.py
-    #- --msbp
+    - --algo 
+    - none
+    - --msbp
     command:
     - nsys
     image: bigballoon8/custom-backprop
@@ -33,8 +35,8 @@ spec:
     #  value: "INFO"
     resources:
       limits:
-        cpu: 64
-        memory: 512Gi
+        cpu: 32
+        memory: 64Gi
         nvidia.com/gpu: 4
     volumeMounts:
     - mountPath: /mnt/ceph_rbd
