@@ -1,5 +1,6 @@
 from typing import Sequence
 from contextlib import contextmanager
+import time
 
 import torch
 import torch.distributed as dist
@@ -9,7 +10,7 @@ from loss import Loss
 
 @contextmanager
 def nvtx_profile(name):
-    yield 
+    yield
     return
     torch.cuda.synchronize()
     #print(name)
@@ -34,6 +35,10 @@ class Model:
         self.b_recv_buffer = ...
         self.sub_layers: list[layers.Layer] = []
         self.streams: list[torch.cuda.Stream] = []
+        self.t0 = []
+        self.t1 = []
+        self.t2 = []
+        self.bwd_p2_times = []
     
     def _rank_0_fwd(self, x:torch.Tensor):
         with nvtx_profile(f"Rank {dist.get_rank()} fwd"):
@@ -94,13 +99,19 @@ class Model:
                     #with torch.cuda.stream(self.streams[i]):
                     #if layer.__class__.__name__ == "Conv2D":
                     #   extra_info = f" {layer.}"
-                    with nvtx_profile(layer.__class__.__name__):
-                        layer.backward_p2(inter=inter)
+                    #with nvtx_profile(layer.__class__.__name__):
+                    layer.backward_p2(inter=inter)
             else:
                 for layer in self.layers:
                     layer.backward_p2()
             torch.cuda.synchronize()
                 
+    def chunk_data(self, x, n):
+        if isinstance(x, Sequence):
+            map_gen = map(lambda _x: torch.chunk(_x, n), x)
+            return type(x)(zip(*map_gen))
+        else:
+            return torch.chunk(x, n)
 
     def train_step(self, x, y):
         if dist.get_world_size() == 1:
@@ -117,23 +128,33 @@ class Model:
         losses = []
         if self.pipe_algo == "none":
             if self.rank == 0:
+                #self.t0.append(time.time_ns())
                 self._rank_0_fwd(x)
                 self._rank_0_bwd_p1()
+                #torch.cuda.synchronize()
+                #self.t2.append(time.time_ns())
             elif self.rank == self.size - 1:
                 loss = self._rank_N_fwd(y)
+                #torch.cuda.synchronize()
+                #self.t1.append(time.time_ns())
                 self._rank_N_bwd_p1()
                 losses.append(loss)
             else:
                 self._rank_n_fwd()
                 self._rank_n_bwd_p1()
             if self._2bp:
+                #torch.cuda.synchronize()
+                #bp2_t0 = time.time_ns()
                 self._backward_p2()
+                #torch.cuda.synchronize()
+                #self.bwd_p2_times.append(time.time_ns()-bp2_t0)
+
         
         elif self.pipe_algo == "gpipe":
             if self.rank == 0:
-                micro_batches = torch.chunk(x, self.size)
+                micro_batches = self.chunk_data(x, self.size)
             if self.rank == self.size - 1:
-                micro_batches = torch.chunk(y, self.size)
+                micro_batches = self.chunk_data(y, self.size)
             step = range(self.size)
             
             if self.rank == 0:
@@ -161,9 +182,9 @@ class Model:
         
         elif self.pipe_algo == "1f1b-2":
             if self.rank == 0:
-                micro_batches = list(torch.chunk(x, self.size*2))
+                micro_batches = list(self.chunk_data(x, self.size*2))
             elif self.rank == self.size - 1:
-                micro_batches = list(torch.chunk(y, self.size*2))
+                micro_batches = list(self.chunk_data(y, self.size*2))
             else:
                 micro_batches = list(range(self.size*2))
             # Warmup
@@ -211,9 +232,9 @@ class Model:
 
         elif self.pipe_algo == "1f1b-1":
             if self.rank == 0:
-                micro_batches = list(torch.chunk(x, self.size))
+                micro_batches = list(self.chunk_data(x, self.size))
             elif self.rank == self.size - 1:
-                micro_batches = list(torch.chunk(y, self.size))
+                micro_batches = list(self.chunk_data(y, self.size))
             else:
                 micro_batches = list(range(self.size))
             # Warmup
@@ -533,29 +554,74 @@ class BertBase(Model):
         torch.cuda.synchronize()
 
 class BertLarge(Model):
-    def __init__(self, device):
+    def __init__(self,  criterion=lambda:0, pipe_algo="none", device='cuda', dtype=torch.float32):
+        super().__init__()
         self.device = device
+        self.dtype = dtype
+        self.criterion = criterion
+        self.pipe_algo = pipe_algo
+        
 
-    def init_params(self, input_shape):
+    def init_params(self, gbs, input_shape):
         self.layers = []
         num_local_blocks = 24 // dist.get_world_size()
         for _ in range(num_local_blocks):
-            layer = layers.BertBlock(1024, 16, 4096, layers.GeLU, device=self.device)
+            layer = layers.BertBlock(1024, 16, 4096, layers.GeLU, device=self.device, dtype=self.dtype)
             layer.init_params()
             self.layers.append(layer)
         if dist.get_rank() == 0:
-            self.layers.insert(0, layers.BertEmbeddings(1024, 30522, 512, device=self.device))
+            self.layers.insert(0, layers.BertEmbeddings(1024, 30522, 512, device=self.device, dtype=self.dtype))
             self.layers[0].init_params()
+        if dist.get_rank() == dist.get_world_size()-1:
+            self.layers.append(layers.BertOutputLoss(1024, 30522, device=self.device, dtype=self.dtype))
+            self.layers[-1].init_params()
         
-        self.f_recv_buffer = torch.zeros(input_shape, device=self.device)
+        if self.pipe_algo in ("gpipe", "1f1b-1"):
+            mb_size = (gbs // dist.get_world_size(),)
+        elif self.pipe_algo == "1f1b-2":
+            mb_size = (gbs // (dist.get_world_size() * 2),)
+        else:
+            mb_size = (gbs,)
+
+        self.f_recv_buffer = torch.zeros(mb_size + input_shape, device=self.device, dtype=self.dtype)
         self.b_recv_buffer = self.f_recv_buffer
         
         self.sub_layers = []
         for layer in self.layers:
             layer._get_model_sub_layers(self.sub_layers)  
+    
+    def _rank_0_fwd(self, x: torch.Tensor):
+        x, sm = x
+        x = self.layers[0](x, sm)
+        with nvtx_profile(f"Rank {dist.get_rank()} fwd"):
+            for layer in self.layers[1:]:
+                #with nvtx_profile(layer.__class__.__name__):
+                x = layer(x)
+            dist.isend(x.contiguous(), self.rank+1)
+    
+    def _rank_N_fwd(self, y):
+        dist.recv(self.f_recv_buffer, self.rank-1)
+        with nvtx_profile(f"Rank {dist.get_rank()} fwd"):
+            x = self.f_recv_buffer.clone()
+            for layer in self.layers[:-1]:
+                #with nvtx_profile(layer.__class__.__name__):
+                x = layer(x)
+            y_ns, y_mask, m = y
+            loss = self.layers[-1](x, (y_ns, y_mask), m)
+            return loss
+    
+    def _rank_N_bwd_p1(self):
+        with nvtx_profile(f"Rank {dist.get_rank()} bwd"):
+            dL_dout = self.layers[-1].backward_p1()
+            for layer in self.layers[::-1][1:]:
+                #with nvtx_profile(layer.__class__.__name__):
+                dL_dout = layer.backward_p1(dL_dout)
+            if not self._2bp and isinstance(self, Transformer): # needed for memory
+                torch.cuda.empty_cache()
+            dist.isend(dL_dout.contiguous(), self.rank-1)
+    
         
-        self.streams = [torch.cuda.Stream() for _ in self.sub_layers]
-        torch.cuda.synchronize()
+        
             
             
         

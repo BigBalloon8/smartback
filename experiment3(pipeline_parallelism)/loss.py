@@ -2,7 +2,6 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 
 import torch
-from sympy.abc import y
 
 @contextmanager
 def nvtx_profile(name):
@@ -44,6 +43,10 @@ class CrossEntropyLoss(Loss):
     def backward(self):
         return self.logits.pop(0) - self.y.pop(0)
 
+def softmax(x, dim=-1):
+    ex = torch.exp(x)
+    return ex/torch.sum(ex, dim=dim)
+
 @torch.jit.script
 def _nlp_loss_op(logits, y):
     y_hat = torch.softmax(logits, dim=-1)
@@ -56,7 +59,7 @@ class NLPCrossEntropyLoss(Loss):
         self.y = []
 
     def forward(self, logits, y):
-        y = torch.nn.functional.one_hot(y, logits.shape[-1])    
+        y = torch.nn.functional.one_hot(y, logits.shape[-1])   
         loss , y_hat = _nlp_loss_op(logits, y)
         self.y_hat.append(y_hat)
         self.y.append(y)
@@ -66,3 +69,10 @@ class NLPCrossEntropyLoss(Loss):
         y = self.y.pop(0)
         y_hat = self.y_hat.pop(0)
         return y_hat - y
+
+class NoneLoss(Loss):
+    def forward(self, y_hat, y):
+        return y_hat
+
+    def backward(self):
+        pass

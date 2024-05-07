@@ -10,7 +10,7 @@ from models import Mamba
 from data.dummy import get_train_dataloader, get_val_dataloader
 import loss
 import optimizers
-from utils import benchmark, share_var
+from utils import benchmark, share_var, calc_times
 
 @click.command()
 @click.option("--msbp", is_flag=True, default=False)
@@ -49,7 +49,7 @@ def main(msbp, algo):
     model.init_params(gbs, (max_seqlen, dim))
     model.multi_stage(msbp)
 
-    train_data = get_train_dataloader(4096, (max_seqlen,), gbs, vocab_size=vocab_size)
+    train_data = get_train_dataloader(128, (max_seqlen,), gbs, vocab_size=vocab_size)
     
     n_params = model.get_num_params()
     
@@ -66,24 +66,23 @@ def main(msbp, algo):
         print(f"Memory Parameters: {param_mem/1024**3:.4f}GB")
         print(f"Dtype: {model.layers[0].weights.dtype}")
 
-    torch.cuda.cudart().cudaProfilerStart()
-
     for x,y in train_data:
         x, y = x.to(device), y.to(device)
         losses = model.train_step(x, y)
         model.update()
         model.zero_grad()
-        torch.cuda.empty_cache()
         break
-    
-    with benchmark("Time For Epoch", 4096*max_seqlen):
+
+    torch.cuda.reset_peak_memory_stats()
+    with benchmark("Time For Epoch", 128*max_seqlen):
         for x,y in train_data:
             x, y = x.to(device), y.to(device)
             losses = model.train_step(x, y)
             model.update()
             model.zero_grad()
     
-    max_mem = share_var(torch.cuda.max_memory_allocated(), op=dist.ReduceOp.MAX)
+    max_mem = share_var(torch.cuda.max_memory_reserved(), op=dist.ReduceOp.MAX)
+    #calc_times(torch.tensor(model.t0,device="cuda"), torch.tensor(model.t1,device="cuda"), torch.tensor(model.t2,device="cuda"), torch.tensor(model.bwd_p2_times,device="cuda"))
 
     if dist.get_rank() == 0:
         print(f"Memory Required: {max_mem/1024**3:.4f}GB")

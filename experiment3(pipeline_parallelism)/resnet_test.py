@@ -1,7 +1,9 @@
 import torch
+torch.backends.cudnn.benchmark = True
 import torchvision
 import torchvision.transforms as transforms
 from torch import nn, optim
+
 from torchsummary import summary
 from torchvision.models import resnet152
 
@@ -19,7 +21,7 @@ num_epochs = 5
 gbs = 32
 learning_rate = 0.0001
 
-train_loader = get_train_dataloader(1024, (3,224,224), gbs, vocab_size=1000, dtype="image")
+train_loader = get_train_dataloader(256, (3,224,224), gbs, vocab_size=1000, dtype="image")
 
 # Initialize the model
 model = resnet152()
@@ -42,11 +44,9 @@ total_params = count_parameters(model)
 print(f"No. Params: {total_params:,}")
 print(f"GPU Mem: {param_mem/1e9:.4f} GB")
 
-print(len(train_loader.dataset), len(train_loader))
-
 # Train the model
 for epoch in range(num_epochs):
-    with benchmark("Epoch %d" % epoch, 1024):
+    with benchmark("Epoch %d" % epoch, 256):
         for i, (images, labels) in enumerate(train_loader):
             # Move tensors to the configured device
             images = images.to(device)

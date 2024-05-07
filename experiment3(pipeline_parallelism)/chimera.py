@@ -1,6 +1,5 @@
 from contextlib import contextmanager
 from typing import Self
-from termcolor import colored
 
 import torch
 import torch.distributed as dist
@@ -18,10 +17,8 @@ def nvtx_profile(name:str):
     
     #torch.cuda.synchronize()
     torch.cuda.nvtx.range_push(name)
-    print(colored(name, COLOURS[dist.get_rank()]))
     yield
     #torch.cuda.synchronize()
-    print(colored(name.upper(), COLOURS[dist.get_rank()]))
     torch.cuda.nvtx.range_pop()
 
 

@@ -3,17 +3,12 @@ kind: Pod
 metadata:
   generateName: resnet-custom-backprop-
 spec:
+  nodeName: gpu8-vm19
   containers: 
   - args:
     - |
-      torchrun --nproc_per_node=4 resnet_main.py --algo none ;
-      torchrun --nproc_per_node=4 resnet_main.py --algo none --msbp ;
-      torchrun --nproc_per_node=4 resnet_main.py --algo gpipe ;
-      torchrun --nproc_per_node=4 resnet_main.py --algo gpipe --msbp ;
-      torchrun --nproc_per_node=4 resnet_main.py --algo 1f1b-1 ;
-      torchrun --nproc_per_node=4 resnet_main.py --algo 1f1b-1 --msbp ;
-      torchrun --nproc_per_node=4 resnet_main.py --algo 1f1b-2 ;
-      torchrun --nproc_per_node=4 resnet_main.py --algo 1f1b-2 --msbp ;
+      torchrun --nproc_per_node=4 mamba_main.py --algo 1f1b-2 ;
+      torchrun --nproc_per_node=4 mamba_main.py --algo 1f1b-2 --msbp ;
     command: [/bin/bash, -c, --]
     image: bigballoon8/custom-backprop
     name: custom-backprop

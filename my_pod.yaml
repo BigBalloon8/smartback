@@ -20,7 +20,7 @@ spec:
     - "true"
     - torchrun
     - --nproc_per_node=4
-    - resnet_main.py
+    - transformer_main.py
     - --algo 
     - none
     - --msbp

@@ -16,15 +16,16 @@ from einops import rearrange, repeat
 
 from wrappers import cleanup_act, multi_stage_wrapper, expose_params
 import init_params
+import loss
 
 @contextmanager
 def nvtx_profile(name):
     yield
     return
-    #torch.cuda.synchronize()
+    torch.cuda.synchronize()
     torch.cuda.nvtx.range_push(name)
     yield
-    #torch.cuda.synchronize()
+    torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
 
 class Layer(ABC):
@@ -342,16 +343,31 @@ class GeLU(Activation):
     def __init__(self):
         super().__init__()
         self.inputs = []
+        self.sqrt_pi = torch.pi**0.5
+
+        @torch.jit.script
+        def _fwd_op(x):
+            return x * 0.5 * (1 + torch.erf(x/((2)**(0.5))))
+        
+        self.fwd_op = _fwd_op
+
+        @torch.jit.script
+        def _bwd_op(dL_dout, x):
+            return dL_dout * (0.5 * (1 + torch.erf(x/((2)**(0.5)))) + (x)/torch.pi**0.5 * torch.exp(-torch.pow(x, 2)))
+
+        self.bwd_op = _bwd_op
     
     def forward(self, x):
         self.inputs.append(x)
-        return x * 0.5 * (1 + torch.erf(x/((2)**(0.5))))
+        return F.gelu(x)
+        return self.fwd_op(x)
 
     @multi_stage_wrapper
     def backward_p1(self, dL_dout):
         #TODO clean this up 
         input_at_ps = self.inputs.pop(0)
-        return dL_dout * (0.5 * (1 + torch.erf(input_at_ps/((2)**(0.5)))) + (input_at_ps)/torch.sqrt(torch.pi) * torch.exp(-torch.pow(input_at_ps, 2)))
+        return self.bwd_op(dL_dout, input_at_ps)
+        return dL_dout * (0.5 * (1 + torch.erf(input_at_ps/((2)**(0.5)))) + (input_at_ps)/self.sqrt_pi * torch.exp(-torch.pow(input_at_ps, 2)))
 
 class Dropout(Layer):
     @expose_params(acts=["p_mask"])
@@ -546,13 +562,18 @@ class MultiHeadAttention(Layer):
             torch.Tensor: Output tensor of multihead attention
         """
         
-        lQ = self.dropouts["Q"](self.linears["Q"](Q))
+        lQ:torch.Tensor = self.dropouts["Q"](self.linears["Q"](Q))
         lK = self.dropouts["K"](self.linears["K"](K))
         lV = self.dropouts["V"](self.linears["V"](V))
         
-        lQ = torch.cat(lQ.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
-        lK = torch.cat(lK.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
-        lV = torch.cat(lV.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        b, s, d = lQ.shape
+
+        #lQ = torch.cat(lQ.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        #lK = torch.cat(lK.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        #lV = torch.cat(lV.unsqueeze(-2).chunk(self.num_heads, dim=-1), dim=-2)
+        lQ = lQ.view(b, s, self.num_heads, -1) 
+        lK = lK.view(b, s, self.num_heads, -1)
+        lV = lV.view(b, s, self.num_heads, -1)
 
         self.lQ.append(lQ)
         self.lK.append(lK)
@@ -689,7 +710,6 @@ class BatchNorm2D(Layer):
             torch.Tensor: The output of the BAtchNorm2D Layer
         """
         #out = self.fwd_op(x, self.gamma, self.beta, self.eps)
-        
         with torch.enable_grad():
             # NOTE This is the fastest way to do it
             x.requires_grad = True
@@ -734,6 +754,7 @@ class BatchNorm2D(Layer):
 
         #x_s_m = self.x_sub_mean.pop(0)
         #std_inv = self.std_inv.pop(0)
+        
         return self.bwd_op(dL_dout, self.gamma, x_s_m, std_inv, 1/B)
         
         dL_dxnorm = dL_dout * self.gamma.view(1, -1, 1, 1)
@@ -978,10 +999,13 @@ class BertEmbeddings(Layer):
         
         self.pos_emb = self.pos_emb.unsqueeze(0)
         
-        self.norm = NLPRMSNorm(-1, 768, device=self.device)
+        self.norm = NLPRMSNorm(-1, self.dim, device=self.device, dtype=self.dtype)
+        self.token_emb.init_params()
+        self.segmnet_emb.init_params()
+        self.norm.init_params()
     
     def forward(self, x, seg_mask):
-        x = self.token_emb(x) + self.segmnet_emb(seg_mask) + self.pos_emb[:,:x.size(-1)]
+        x = self.token_emb(x) + self.segmnet_emb(seg_mask) + self.pos_emb
         return self.norm(x)
 
     def backward_p1(self, dL_dout):
@@ -1083,6 +1107,53 @@ class BertBlock(Layer):
         dL_dmhout = self.dropouts["multi_head"].backward_p1(dL_dmhout_d)
         dL_din = torch.sum(torch.stack(self.multihead.backward_p1(dL_dmhout)),dim=0)
         return dL_din + dL_dmhout_d
+
+class BertLoss(Layer):
+    def __init__(self):
+        super().__init__()
+        self.ns_loss = loss.NLPCrossEntropyLoss()
+        self.mask_loss = loss.NLPCrossEntropyLoss()
+
+    def forward(self, x, y):
+        ns_x, mask_x = x
+        ns_y, mask_y = y
+        return self.ns_loss(ns_x, ns_y) + self.mask_loss(mask_x, mask_y)
+
+    def backward_p1(self, dL_dout):
+        return self.ns_loss.backward(), self.mask_loss.backward()
+        
+
+class BertOutputLoss(Layer):
+    def __init__(self, dim, vocab_size, device = "cuda", dtype=torch.float32):
+        super().__init__()
+        self.dim = dim
+        self.vocab_size = vocab_size
+        self.mask_linear = Dense(dim, vocab_size, device=device, dtype=dtype)
+        self.ns_linear = Dense(dim, 2, device=device, dtype=dtype)
+        self.loss_fn = BertLoss()
+        self.device = device
+        self.dtype = dtype
+    
+    @expose_params(acts=["mask"])
+    def init_params(self):
+        self.mask_linear.init_params()
+        self.ns_linear.init_params()
+        self.mask = []
+
+    def forward(self, x, y, mask):
+        self.in_shape = x.shape
+        self.mask.append(mask)
+        ns_x = self.ns_linear(x[:,0].unsqueeze(1))
+        mask_x = self.mask_linear(x[:, mask])
+        return self.loss_fn((ns_x, mask_x), y)
+    
+    def backward_p1(self, dL_dout=None):
+        dL_dnsout, dL_dmaskout = self.loss_fn.backward_p1(dL_dout)
+        dL_din = torch.zeros(self.in_shape, device = self.device, dtype=self.dtype)
+        dL_din[:, 0] = self.ns_linear.backward_p1(dL_dnsout).squeeze(1)
+        dL_din[:, self.mask.pop(0)] = self.mask_linear.backward_p1(dL_dmaskout)
+        return dL_din
+    
 
 
 class Flatten(Activation):
