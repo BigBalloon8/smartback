@@ -271,6 +271,7 @@ class Dense(Layer):
         """
         Calculates the gradients of the dense layer's parameters
         """
+        #n = len(self.inputs) if not inter else 1
         if self.multi_stage and not inter:
             dL_dout = torch.cat(self.dL_dout, dim=0)
             inputs = torch.cat(self.inputs, dim=0)
@@ -1394,7 +1395,7 @@ class Conv2D(Layer):
             torch.Tensor: derivative of the loss with respect to the Conv2D Layer's input
         """
         self.dL_dout.append(dL_dout)
-        #dL_din_t = F.grad.conv2d_input(self.inputs[0].shape, self.kernel, dL_dout, stride=self.stride, padding=self.padding)
+        #dL_din = F.grad.conv2d_input(self.inputs[0].shape, self.kernel, dL_dout, stride=self.stride, padding=self.padding)
         dL_din = F.conv_transpose2d(dL_dout, self.kernel, stride=self.stride, padding=self.padding, output_padding=(self.stride[0]-1,self.stride[1]-1))
         return dL_din
     
@@ -1414,14 +1415,8 @@ class Conv2D(Layer):
         if isinstance(self.bias, torch.Tensor):
             self.bias_g[:] += torch.sum(dL_dout, dim=(0, 2, 3))
         
-        #newstride: Tuple[int, int] = (self.stride[0]*dL_dout.shape[2], self.stride[1]*dL_dout.shape[3])
-        #if dist.get_rank() == -1:
-        #    fn = fft_conv
-        #else:
-        #    fn = F.conv2d
-
-        #self.kernel_g[:] += fn(inputs.transpose(0, 1), dL_dout.transpose(0, 1), stride=newstride, padding=self.padding).transpose(0, 1)
-        self.kernel_g[:] += F.grad.conv2d_weight(inputs, self.kernel_g.shape, dL_dout, stride=self.stride, padding=self.padding) #fn(inputs.transpose(0, 1), dL_dout.transpose(0, 1), stride=newstride, padding=self.padding).transpose(0, 1)
+        
+        self.kernel_g[:] += F.grad.conv2d_weight(inputs, self.kernel_g.shape, dL_dout, stride=self.stride, padding=self.padding)
 
 
 class Conv2DTranspose(Layer):
@@ -2639,7 +2634,8 @@ class Mamba(Layer):
 
     @cleanup_act("dL_dxz", "x", "conv_in", "dL_dact", "dL_dtt", "dt_t", "dA")
     def backward_p2(self, inter=False):
-        #for _ in range(len(self.dL_dxz)):
+        #n = len(self.dL_dxz) if not inter else 1
+        #for _ in range(n):
         if self.multi_stage and not inter:
             dL_dxz = torch.stack(self.dL_dxz)
             x = torch.stack(self.x)

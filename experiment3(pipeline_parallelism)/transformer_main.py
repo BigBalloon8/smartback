@@ -42,7 +42,7 @@ def main(msbp, algo):
         dim_size=dim,
         num_heads=32,
         num_kv_heads=32,
-        num_blocks=32,
+        num_blocks=16,
         max_seqlen=max_seqlen,
         vocab_size=vocab_size,
         criterion=loss.NLPCrossEntropyLoss(),

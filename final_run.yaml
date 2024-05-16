@@ -3,25 +3,26 @@ kind: Pod
 metadata:
   generateName: resnet-custom-backprop-
 spec:
-  nodeName: gpu8-vm19
+  #nodeName: gpu8-vm13 #9
   containers: 
   - args:
     - |
-      torchrun --nproc_per_node=4 mamba_main.py --algo 1f1b-2 ;
-      torchrun --nproc_per_node=4 mamba_main.py --algo 1f1b-2 --msbp ;
+      torchrun --nproc_per_node=2 transformer_main.py --algo 1f1b-1 --msbp ;
+      torchrun --nproc_per_node=4 transformer_main.py --algo 1f1b-1 --msbp ;
+      torchrun --nproc_per_node=8 transformer_main.py --algo 1f1b-1 --msbp ;
     command: [/bin/bash, -c, --]
     image: bigballoon8/custom-backprop
     name: custom-backprop
     env:
     - name: OMP_NUM_THREADS
-      value: "8"
+      value: "4"
     #- name: NCCL_DEBUG
     #  value: "INFO"
     resources:
       limits:
         cpu: 32
         memory: 64Gi
-        nvidia.com/gpu: 4
+        nvidia.com/gpu: 8
     volumeMounts:
     - mountPath: /dev/shm
       name: devshm
