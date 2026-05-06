@@ -26,7 +26,7 @@ spec:
     volumeMounts:
     - mountPath: /dev/shm
       name: devshm
-    workingDir: /workspace/experiment3(pipeline_parallelism)/
+    workingDir: /workspace/src/
   nodeSelector:
     nvidia.com/gpu.product: NVIDIA-A100-SXM4-40GB
   restartPolicy: Never
